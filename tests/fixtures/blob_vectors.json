@@ -1,0 +1,50 @@
+[
+  {
+    "keyMaterial": "91Eo5apN6EgMIJ+sBnjLSgSXmMC2zWJl5BZl5uO6pcg=",
+    "len": 0,
+    "chunked": false,
+    "blobSha256": "fb025cdb94b29a63b9cf10341707e84a0cf6a11862a7241bf1a6c4dd731f7ace",
+    "blobLen": 32,
+    "hashesSha256": null
+  },
+  {
+    "keyMaterial": "rqnOZZk/ixeKV0mibFnLLbcUlRzXRApicsKfVb6N7DI=",
+    "len": 1,
+    "chunked": false,
+    "blobSha256": "b590407059cf9eed4ce548fd496a2630d18227f1d91d78326d1c41dde7f1c519",
+    "blobLen": 33,
+    "hashesSha256": null
+  },
+  {
+    "keyMaterial": "CKXfrmHzxFJoWY93rRSqjPnbdghgSChUNWhHJlj0xEo=",
+    "len": 1000,
+    "chunked": false,
+    "blobSha256": "66b36b603cf7b1377d1f43ada9dc98c0b3a4a4b06bfbcb2a6590b46a265a6c6e",
+    "blobLen": 1032,
+    "hashesSha256": null
+  },
+  {
+    "keyMaterial": "2o0/8Y6jy/ec7Ufp50eq8vFrCjliOeTdGKrHSug+GO0=",
+    "len": 300000,
+    "chunked": false,
+    "blobSha256": "716d33fa92013c56cc2b8eee4234184031c0273ea5248544924c2bb839fa731b",
+    "blobLen": 300032,
+    "hashesSha256": null
+  },
+  {
+    "keyMaterial": "9okEsElZYeUddozA2Q4+uGhhYaB7Iyh4n764dMXQlWw=",
+    "len": 300000,
+    "chunked": true,
+    "blobSha256": "8a486677620d22325751261a24068979c43d7b2a5bc739ecc1e0042fb7ce76a7",
+    "blobLen": 300032,
+    "hashesSha256": "117bdfb913b7e42bdeac30b1b8fc52c2a8cf4dada6df130c05e620bed831226a"
+  },
+  {
+    "keyMaterial": "8XHR8nsKrdzv+lg76U/Ij2jefJ9VZtdgcyQXtzbVMAM=",
+    "len": 131072,
+    "chunked": true,
+    "blobSha256": "76175f806447d4d9a7f5498428c8c7ed04afaea7f8e95a96c4d9ed32e8398874",
+    "blobLen": 131104,
+    "hashesSha256": "3fe5d81275a531398d01310c17aa6e74d7a99447be0788c09f5255d1927ecb50"
+  }
+]

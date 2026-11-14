@@ -1,0 +1,56 @@
+[package]
+name = "rune"
+version = "0.1.0"
+edition = "2024"
+description = "Unofficial Rust client for the LINE Chrome-extension gateway protocol"
+publish = false
+
+[dependencies]
+aes = "0.9.4"
+base64 = "0.23.1"
+bytes = "1.12.1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"], optional = true }
+crossterm = { version = "0.29.0", features = ["event-stream"], optional = true }
+ctr = "0.10.1"
+futures-util = "0.3.34"
+getrandom = "0.4.3"
+hkdf = "0.13.0"
+hmac = "0.13.0"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+qrcode = { version = "0.14.1", default-features = false, optional = true }
+ratatui = { version = "0.30.2", optional = true }
+ratatui-image = { version = "11.1.0", optional = true, default-features = false, features = ["crossterm"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "stream", "http2"] }
+rqrr = { version = "0.11.0", optional = true }
+rusqlite = { version = "0.42.0", features = ["bundled"], optional = true }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "sync", "fs"] }
+tracing = "0.1.44"
+unicode-width = { version = "0.2.3", optional = true }
+url = "2.5.8"
+wasmtime = { version = "50.0.1", default-features = false, features = ["cranelift", "runtime", "std", "parallel-compilation"] }
+
+# Cranelift compiling the 2.3 MB ltsm.wasm is very slow unoptimized; build
+# dependencies with optimizations even in dev profiles.
+[profile.dev.package."*"]
+opt-level = 2
+
+[dev-dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+qrcode = { version = "0.14.1", default-features = false }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+wiremock = "0.6.5"
+
+[features]
+# Local SQLite message store (`rune::store`); SQLite is compiled in (needs a C compiler).
+store = ["dep:rusqlite"]
+# The terminal chat app (`cargo run --release --features tui --bin rune-tui`).
+tui = ["store", "dep:rqrr", "dep:ratatui", "dep:crossterm", "dep:chrono", "dep:unicode-width", "dep:qrcode", "dep:ratatui-image"]
+
+[[bin]]
+name = "rune-tui"
+path = "src/bin/rune-tui.rs"
+required-features = ["tui"]

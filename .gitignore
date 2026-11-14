@@ -1,0 +1,9 @@
+/target
+session.json
+*.tmp
+session.json.*.tmp
+session.db
+session.db-*
+*.db
+*.db-wal
+*.db-shm

@@ -1,0 +1,1598 @@
+//! Overlays: menus, forms, pickers, confirmations and info boxes, and the
+//! actions they run (reactions, unsend, group management, other message types).
+
+use super::*;
+use rune::Reaction;
+
+/// An overlay on top of the main screen; it gets every key while open.
+pub enum Modal {
+    Menu(Menu),
+    Form(Form),
+    Pick(Pick),
+    Confirm(Confirm),
+    /// Read-only text; `scroll` is the first line shown.
+    Info {
+        title: String,
+        lines: Vec<String>,
+        scroll: usize,
+    },
+    /// The people and emoji on a message, refreshed from message state each draw.
+    Reactions {
+        msg: String,
+        scroll: usize,
+    },
+    Help {
+        ctx: keymap::Ctx,
+        under: Option<Box<Modal>>,
+        scroll: usize,
+    },
+    Attach(attach::Attach),
+    Stickers(stickers::Stickers),
+    Settings(settings::SettingsPage),
+}
+
+/// Something the user can ask for from a menu, key or form.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Action {
+    /// React to a message (`None` takes our reaction back).
+    React(String, Option<Reaction>),
+    ReactMenu(String),
+    Reactions(String),
+    ConfirmUnsend(String),
+    Unsend(String),
+    Reply(String),
+    ReadBy(String),
+    ViewMedia,
+    Save,
+    Open,
+    GotoQuoted,
+    Profile(String),
+    Attach,
+    Stickers,
+    Location,
+    ShareContact,
+    NewGroup,
+    Invite(String),
+    Rename(String),
+    ConfirmLeave(String),
+    Leave(String),
+    Mute(String, bool),
+    Pin(String, bool),
+    MovePin(String, i32),
+    /// The account's pin lists: switch, create, rename, delete.
+    PinLists,
+    SwitchPinList(i64),
+    NewPinList,
+    RenamePinList(i64),
+    ConfirmDeletePinList(i64),
+    DeletePinList(i64),
+    Accept(String),
+    ConfirmDecline(String),
+    Decline(String),
+    ClearCache,
+    /// The albums a group's history mentions.
+    Albums(String),
+    /// The posts of one album: `(chat, album id)`.
+    AlbumPhotos(String, String),
+    /// Show a message's media in the viewer: `(chat, message id)`.
+    ViewMessage(String, String),
+    /// Pick a picture for your profile cover.
+    ChangeCover,
+    ConfirmCover(std::path::PathBuf),
+    SetCover(std::path::PathBuf),
+    /// Pick a LINE chat export to import into a chat.
+    ImportHistory(String),
+    /// A file was picked: show what it holds and ask.
+    PreviewImport(String, std::path::PathBuf),
+    Import(String, std::path::PathBuf),
+    ConfirmDeleteImported(String),
+    DeleteImported(String),
+}
+
+pub struct Menu {
+    pub title: String,
+    pub items: Vec<(String, Action)>,
+    pub sel: usize,
+}
+
+/// A question with two labelled buttons. Destructive actions start on
+/// "Cancel", so a stray `Enter` never does them.
+pub struct Confirm {
+    pub text: String,
+    pub action: Action,
+    /// The highlighted button is the one that runs `action`.
+    pub yes: bool,
+}
+
+impl Action {
+    /// The label of the button that runs the action.
+    fn verb(&self) -> &'static str {
+        match self {
+            Action::Unsend(_) => "Unsend",
+            Action::Leave(_) => "Leave",
+            Action::Decline(_) => "Decline",
+            Action::DeletePinList(_) => "Delete",
+            Action::ClearCache => "Clear",
+            Action::DeleteImported(_) => "Remove",
+            Action::SetCover(_) => "Replace cover",
+            Action::Import(..) => "Import",
+            _ => "OK",
+        }
+    }
+
+    /// Hard to take back: the confirmation starts on "Cancel".
+    fn destructive(&self) -> bool {
+        !matches!(self, Action::Import(..))
+    }
+}
+
+/// LINE's limit on a group name, in characters.
+pub const GROUP_NAME_MAX: usize = 50;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FormKind {
+    NewGroup,
+    Rename(String),
+    Location,
+    DisplayName,
+    StatusMessage,
+    NewPinList,
+    RenamePinList(i64),
+}
+
+pub struct Field {
+    pub label: &'static str,
+    pub value: TextInput,
+    pub hint: &'static str,
+}
+
+pub struct Form {
+    pub title: String,
+    pub kind: FormKind,
+    pub fields: Vec<Field>,
+    pub sel: usize,
+    pub error: Option<String>,
+}
+
+impl Form {
+    fn new(
+        title: impl Into<String>,
+        kind: FormKind,
+        fields: Vec<(&'static str, String, &'static str)>,
+    ) -> Self {
+        Form {
+            title: title.into(),
+            kind,
+            fields: fields
+                .into_iter()
+                .map(|(label, value, hint)| Field {
+                    label,
+                    value: value.into(),
+                    hint,
+                })
+                .collect(),
+            sel: 0,
+            error: None,
+        }
+    }
+    fn value(&self, i: usize) -> &str {
+        self.fields[i].value.as_str().trim()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PickKind {
+    /// Members for a new group with this name.
+    NewGroup(String),
+    Invite(String),
+    ShareContact,
+}
+
+/// Choose people from the contact list (type to filter).
+pub struct Pick {
+    pub title: String,
+    pub kind: PickKind,
+    /// `(mid, name)`.
+    pub options: Vec<(String, String)>,
+    pub chosen: Vec<String>,
+    pub filter: String,
+    pub sel: usize,
+    pub single: bool,
+}
+
+impl Pick {
+    pub fn visible(&self) -> Vec<usize> {
+        let f = self.filter.to_lowercase();
+        (0..self.options.len())
+            .filter(|&i| f.is_empty() || self.options[i].1.to_lowercase().contains(&f))
+            .collect()
+    }
+}
+
+/// A centred box of at most `w`×`h` inside `area`.
+pub fn popup(area: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(area.width.saturating_sub(2)).max(10.min(area.width));
+    let h = h.min(area.height.saturating_sub(2)).max(3.min(area.height));
+    Rect::new(
+        area.x + (area.width - w) / 2,
+        area.y + (area.height - h) / 2,
+        w,
+        h,
+    )
+}
+
+/// Parse "13.75, 100.50" (as copied from a map) into a coordinate pair.
+pub fn parse_lat_lon(s: &str) -> Option<(f64, f64)> {
+    let (a, b) = s.split_once(',')?;
+    Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+}
+
+/// Why there is no "send a Flex message" (`/flex`).
+pub const FLEX_UNSUPPORTED: &str = "LINE does not accept Flex messages from the Chrome app \
+     (TalkException 11, \"Incompatible app version\"); only bots can send them";
+
+impl App {
+    pub fn open_menu(&mut self, title: impl Into<String>, items: Vec<(String, Action)>) {
+        self.modal = Some(Modal::Menu(Menu {
+            title: title.into(),
+            items,
+            sel: 0,
+        }));
+    }
+
+    pub fn confirm(&mut self, text: impl Into<String>, action: Action) {
+        let yes = !action.destructive();
+        self.modal = Some(Modal::Confirm(Confirm {
+            text: text.into(),
+            action,
+            yes,
+        }));
+    }
+
+    /// `Enter` on an invitation (or its menu): join, decline or look first.
+    pub fn invitation_menu(&mut self, mid: &str) {
+        let items = vec![
+            ("✅ Join the group".to_owned(), Action::Accept(mid.into())),
+            ("✖ Decline…".to_owned(), Action::ConfirmDecline(mid.into())),
+            ("👥 Group profile".to_owned(), Action::Profile(mid.into())),
+        ];
+        self.open_menu(format!(" Invitation to {} ", self.name(mid)), items);
+    }
+
+    /// `m` in the chat list / `Ctrl-G` in a chat: what can be done with it.
+    pub fn chat_menu(&mut self, mid: &str) {
+        let name = self.name(mid);
+        let entry = self.chats.iter().find(|c| c.mid == mid);
+        if entry.is_some_and(|c| c.invited) {
+            return self.invitation_menu(mid);
+        }
+        let muted = entry.is_some_and(|c| c.muted);
+        let mut items = Vec::new();
+        if MidType::of(mid) == MidType::User {
+            items.push(("👤 Profile".to_owned(), Action::Profile(mid.into())));
+            items.push(mute_item(mid, muted));
+            items.push(pin_item(mid, self.is_pinned(mid)));
+        } else {
+            items.push(("➕ Invite friends…".to_owned(), Action::Invite(mid.into())));
+            items.push(("✏ Rename group…".to_owned(), Action::Rename(mid.into())));
+            items.push(("👥 Members & profile".to_owned(), Action::Profile(mid.into())));
+            items.push(("🖼 Albums".to_owned(), Action::Albums(mid.into())));
+            items.push(mute_item(mid, muted));
+            items.push(pin_item(mid, self.is_pinned(mid)));
+            items.push(("🚪 Leave group…".to_owned(), Action::ConfirmLeave(mid.into())));
+        }
+        if let Some(position) = self.pinned.iter().position(|pinned| pinned == mid) {
+            if position > 0 {
+                items.push(("⬆ Move pin up".to_owned(), Action::MovePin(mid.into(), -1)));
+            }
+            if position + 1 < self.pinned.len() {
+                items.push(("⬇ Move pin down".to_owned(), Action::MovePin(mid.into(), 1)));
+            }
+        }
+        items.push(("📌 Pin lists…".to_owned(), Action::PinLists));
+        items.push((
+            "📥 Import chat history from LINE…".to_owned(),
+            Action::ImportHistory(mid.into()),
+        ));
+        if self.store.imported_count(mid).unwrap_or(0) > 0 {
+            items.push((
+                "🗑 Remove imported history…".to_owned(),
+                Action::ConfirmDeleteImported(mid.into()),
+            ));
+        }
+        self.open_menu(format!(" {name} "), items);
+    }
+
+    /// "📌 Pin lists…" in a chat's menu: the account's pin lists, the active one selected.
+    pub fn pin_lists_menu(&mut self) {
+        let lists = match self.store.pin_profiles() {
+            Ok(lists) => lists,
+            Err(e) => {
+                self.status = format!("could not load pin lists: {e}");
+                return;
+            }
+        };
+        let mut items: Vec<(String, Action)> = lists
+            .iter()
+            .map(|p| {
+                let pins = match p.pins {
+                    1 => "1 pin".to_owned(),
+                    n => format!("{n} pins"),
+                };
+                let mark = if p.active { "●" } else { "○" };
+                (format!("{mark} {} · {pins}", p.name), Action::SwitchPinList(p.id))
+            })
+            .collect();
+        let sel = lists.iter().position(|p| p.active).unwrap_or(0);
+        items.push(("➕ New pin list…".to_owned(), Action::NewPinList));
+        if let Some(active) = lists.iter().find(|p| p.active) {
+            items.push((
+                format!("✏ Rename “{}”…", active.name),
+                Action::RenamePinList(active.id),
+            ));
+            if lists.len() > 1 {
+                items.push((
+                    format!("🗑 Delete “{}”…", active.name),
+                    Action::ConfirmDeletePinList(active.id),
+                ));
+            }
+        }
+        self.open_menu(" 📌 Pin lists ", items);
+        if let Some(Modal::Menu(menu)) = &mut self.modal {
+            menu.sel = sel;
+        }
+    }
+
+    fn pin_list(&self, id: i64) -> Option<rune::PinProfile> {
+        self.store
+            .pin_profiles()
+            .ok()
+            .and_then(|lists| lists.into_iter().find(|p| p.id == id))
+    }
+
+    /// Why `name` cannot name a pin list (other than `except`), if it cannot.
+    fn pin_list_name_error(&self, name: &str, except: Option<i64>) -> Option<String> {
+        if name.is_empty() {
+            return Some("give the pin list a name".into());
+        }
+        if name.chars().count() > rune::store::PIN_PROFILE_NAME_MAX {
+            return Some(format!(
+                "pin list names are at most {} characters",
+                rune::store::PIN_PROFILE_NAME_MAX
+            ));
+        }
+        let lower = name.to_lowercase();
+        let taken = self
+            .store
+            .pin_profiles()
+            .unwrap_or_default()
+            .into_iter()
+            .any(|p| Some(p.id) != except && p.name.to_lowercase() == lower);
+        taken.then(|| format!("there is already a pin list named “{name}”"))
+    }
+
+    /// Show the active pin list (after switching, creating or deleting).
+    fn pin_list_changed(&mut self, status: String) {
+        let selected = self.selected_mid();
+        if self.reload_pins() {
+            self.status = status;
+        }
+        self.sort_chats(selected);
+    }
+
+    /// `m` on a selected message.
+    pub fn message_menu(&mut self) {
+        let Some(m) = self.selected_msg().cloned() else {
+            return;
+        };
+        if m.id.is_empty() {
+            return;
+        }
+        if m.imported {
+            self.status = IMPORTED_ONLY_LOCAL.into();
+            return;
+        }
+        let mut items = vec![
+            ("↩ Reply".to_owned(), Action::Reply(m.id.clone())),
+            ("😀 React…".to_owned(), Action::ReactMenu(m.id.clone())),
+        ];
+        if !m.unsent && !m.reactions.is_empty() {
+            items.push(("👥 Reactions…".to_owned(), Action::Reactions(m.id.clone())));
+        }
+        if m.from == self.me && !m.unsent {
+            items.push(("👁 Read by…".to_owned(), Action::ReadBy(m.id.clone())));
+            items.push(("🚫 Unsend…".to_owned(), Action::ConfirmUnsend(m.id.clone())));
+        }
+        if m.media_kind().is_some() && !m.unsent {
+            items.push(("🖼 View".to_owned(), Action::ViewMedia));
+            items.push(("💾 Save to ~/Downloads/rune".to_owned(), Action::Save));
+            items.push(("↗ Open with system app".to_owned(), Action::Open));
+        }
+        if m.reply_to.is_some() {
+            items.push(("⤴ Go to quoted message".to_owned(), Action::GotoQuoted));
+        }
+        items.push(("👤 Sender's profile".to_owned(), Action::Profile(m.from.clone())));
+        self.open_menu(" Message ", items);
+    }
+
+    /// `Ctrl-O`: things to send besides text.
+    pub fn compose_menu(&mut self) {
+        if self.open.is_none() {
+            self.status = "open a chat first".into();
+            return;
+        }
+        self.open_menu(
+            " Send ",
+            vec![
+                ("📎 Photo, video or file…".to_owned(), Action::Attach),
+                ("😀 Sticker…".to_owned(), Action::Stickers),
+                ("📍 Location…".to_owned(), Action::Location),
+                ("👤 Contact card…".to_owned(), Action::ShareContact),
+            ],
+        );
+    }
+
+    fn react_menu(&mut self, id: &str) {
+        let mine = self.find_msg(id).and_then(|m| {
+            m.reactions
+                .iter()
+                .find(|r| r.from == self.me)
+                .map(|r| r.kind.clone())
+        });
+        let mut items: Vec<(String, Action)> = Reaction::ALL
+            .iter()
+            .map(|r| {
+                let on = mine == Some(ReactionKind::Predefined(*r as i64));
+                let label = format!("{} {}{}", r.emoji(), r.label(), if on { "  ✓" } else { "" });
+                (label, Action::React(id.into(), Some(*r)))
+            })
+            .collect();
+        if mine.is_some() {
+            items.push(("✖ Remove my reaction".into(), Action::React(id.into(), None)));
+        }
+        self.open_menu(" React ", items);
+    }
+
+    fn contact_options(&self, exclude: &HashSet<String>) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = self
+            .contacts
+            .iter()
+            .filter(|(mid, _)| !exclude.contains(*mid) && *mid != &self.me)
+            .map(|(mid, name)| (mid.clone(), name.clone()))
+            .collect();
+        v.sort_by_key(|(_, n)| n.to_lowercase());
+        v
+    }
+
+    fn open_pick(&mut self, title: &str, kind: PickKind, exclude: HashSet<String>, single: bool) {
+        let options = self.contact_options(&exclude);
+        if options.is_empty() {
+            self.status = if self.contacts.is_empty() {
+                "your friend list is still loading…".into()
+            } else {
+                "no one else to choose".into()
+            };
+            return;
+        }
+        self.modal = Some(Modal::Pick(Pick {
+            title: title.into(),
+            kind,
+            options,
+            chosen: Vec::new(),
+            filter: String::new(),
+            sel: 0,
+            single,
+        }));
+    }
+
+    /// Run an action (closing the overlay it came from first).
+    pub fn run_action(&mut self, action: Action) {
+        let (client, tx) = (self.client.clone(), self.tx.clone());
+        match action {
+            Action::React(id, r) => self.react(&id, r),
+            Action::ReactMenu(id) => self.react_menu(&id),
+            Action::Reactions(id) => self.modal = Some(Modal::Reactions { msg: id, scroll: 0 }),
+            Action::ConfirmUnsend(id) => self.confirm(
+                "Unsend this message? It disappears for everyone in the chat \
+                 (LINE only allows it for 24 hours).",
+                Action::Unsend(id),
+            ),
+            Action::Unsend(id) => {
+                let Some(chat) = self.open.clone() else { return };
+                self.status = "unsending…".into();
+                tokio::spawn(async move {
+                    let res = client.unsend_message(&id).await.map_err(|e| e.to_string());
+                    let _ = tx.send(AppEvent::Unsent(chat, id, res));
+                });
+            }
+            Action::Reply(id) => {
+                if let Some(i) = self.open_messages().iter().position(|m| m.id == id) {
+                    self.sel = Some(i);
+                }
+                self.start_reply();
+            }
+            Action::ReadBy(id) => self.show_read_by(&id),
+            Action::ViewMedia => self.open_viewer(),
+            Action::Save => self.act_on_selected(After::Save),
+            Action::Open => self.act_on_selected(After::Open),
+            Action::GotoQuoted => self.goto_quoted(),
+            Action::Profile(mid) => self.open_profile(mid),
+            Action::Attach => self.open_attach(None),
+            Action::Stickers => self.open_stickers(),
+            Action::Location => {
+                self.modal = Some(Modal::Form(Form::new(
+                    " 📍 Send a location ",
+                    FormKind::Location,
+                    vec![
+                        ("Title", String::new(), "e.g. Siam Paragon"),
+                        ("Address", String::new(), "optional"),
+                        (
+                            "Latitude",
+                            String::new(),
+                            "e.g. 13.7466 — or paste \"13.7466, 100.5347\"",
+                        ),
+                        ("Longitude", String::new(), "e.g. 100.5347"),
+                    ],
+                )))
+            }
+            Action::ShareContact => self.open_pick(
+                " 👤 Share a contact ",
+                PickKind::ShareContact,
+                HashSet::new(),
+                true,
+            ),
+            Action::NewGroup => {
+                self.modal = Some(Modal::Form(Form::new(
+                    " 👥 New group ",
+                    FormKind::NewGroup,
+                    vec![("Group name", String::new(), "next you pick who to invite")],
+                )))
+            }
+            Action::Invite(chat) => {
+                let mut exclude: HashSet<String> = self
+                    .members
+                    .get(&chat)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                exclude.extend(self.invitees.get(&chat).cloned().unwrap_or_default());
+                let title = format!(" ➕ Invite to {} ", self.name(&chat));
+                self.open_pick(&title, PickKind::Invite(chat), exclude, false);
+            }
+            Action::Rename(chat) => {
+                let name = self.names.get(&chat).cloned().unwrap_or_default();
+                self.modal = Some(Modal::Form(Form::new(
+                    " ✏ Rename group ",
+                    FormKind::Rename(chat),
+                    vec![("Group name", name, "members see the new name")],
+                )));
+            }
+            Action::ConfirmLeave(chat) => {
+                let text = format!(
+                    "Leave {}? Its members will see that you left, and its history disappears here.",
+                    self.name(&chat)
+                );
+                self.confirm(text, Action::Leave(chat));
+            }
+            Action::Leave(chat) => {
+                self.status = format!("leaving {}…", self.name(&chat));
+                tokio::spawn(async move {
+                    let res = client.leave_chat(&chat).await.map_err(|e| e.to_string());
+                    let _ = tx.send(AppEvent::Left(chat, res));
+                });
+            }
+            Action::Mute(chat, muted) => {
+                self.status = if muted { "muting…" } else { "unmuting…" }.into();
+                tokio::spawn(async move {
+                    let res = client
+                        .set_chat_muted(&chat, muted)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(AppEvent::Muted(chat, muted, res));
+                });
+            }
+            Action::Pin(chat, pinned) => self.set_pinned(&chat, pinned),
+            Action::MovePin(chat, delta) => self.move_pin(&chat, delta),
+            Action::PinLists => self.pin_lists_menu(),
+            Action::SwitchPinList(id) => match self.store.switch_pin_profile(id) {
+                Ok(()) => {
+                    let name = self.pin_list(id).map(|p| p.name).unwrap_or_default();
+                    self.pin_list_changed(format!("pin list: {name}"));
+                }
+                Err(e) => self.status = format!("could not switch pin list: {e}"),
+            },
+            Action::NewPinList => {
+                self.modal = Some(Modal::Form(Form::new(
+                    " 📌 New pin list ",
+                    FormKind::NewPinList,
+                    vec![("Name", String::new(), "a new, empty list of pinned chats")],
+                )));
+            }
+            Action::RenamePinList(id) => {
+                let name = self.pin_list(id).map(|p| p.name).unwrap_or_default();
+                self.modal = Some(Modal::Form(Form::new(
+                    " ✏ Rename pin list ",
+                    FormKind::RenamePinList(id),
+                    vec![("Name", name, "only stored on this computer")],
+                )));
+            }
+            Action::ConfirmDeletePinList(id) => {
+                let Some(list) = self.pin_list(id) else { return };
+                let text = format!(
+                    "Delete the pin list “{}” ({} pinned)? The chats themselves and your other \
+                     pin lists are not affected.",
+                    list.name, list.pins
+                );
+                self.confirm(text, Action::DeletePinList(id));
+            }
+            Action::DeletePinList(id) => {
+                let name = self.pin_list(id).map(|p| p.name).unwrap_or_default();
+                match self.store.delete_pin_profile(id) {
+                    Ok(()) => {
+                        let now = self
+                            .store
+                            .active_pin_profile()
+                            .map(|p| p.name)
+                            .unwrap_or_default();
+                        self.pin_list_changed(format!("deleted pin list {name} · now {now}"));
+                    }
+                    Err(e) => self.status = format!("could not delete pin list: {e}"),
+                }
+            }
+            Action::Accept(chat) => self.answer_invite_for(chat, true),
+            Action::ConfirmDecline(chat) => {
+                let text = format!("Decline the invitation to {}?", self.name(&chat));
+                self.confirm(text, Action::Decline(chat));
+            }
+            Action::Decline(chat) => self.answer_invite_for(chat, false),
+            Action::ClearCache => self.clear_cache(),
+            Action::ImportHistory(chat) => self.open_import_picker(chat),
+            Action::PreviewImport(chat, path) => self.preview_import(chat, path),
+            Action::Import(chat, path) => self.run_import(chat, path),
+            Action::ConfirmDeleteImported(chat) => {
+                let n = self.store.imported_count(&chat).unwrap_or(0);
+                self.confirm(
+                    format!(
+                        "Remove the {n} messages imported into {} from a chat export? \
+                         Messages from LINE stay.",
+                        self.name(&chat)
+                    ),
+                    Action::DeleteImported(chat),
+                );
+            }
+            Action::DeleteImported(chat) => self.delete_imported(chat),
+            Action::Albums(chat) => self.albums_menu(&chat),
+            Action::AlbumPhotos(chat, album) => self.album_photos_menu(&chat, &album),
+            Action::ViewMessage(chat, id) => self.view_message(&chat, &id),
+            Action::ChangeCover => self.open_cover_picker(),
+            Action::ConfirmCover(path) => self.confirm(
+                "Replace your profile cover with this picture? Everyone who can see \
+                 your profile will see it.",
+                Action::SetCover(path),
+            ),
+            Action::SetCover(path) => {
+                self.status = "uploading the new cover…".into();
+                tokio::spawn(async move {
+                    let res = async {
+                        let data = tokio::fs::read(&path)
+                            .await
+                            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+                        let name = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("cover.jpg")
+                            .to_owned();
+                        client
+                            .set_profile_cover(&data, &name)
+                            .await
+                            .map(drop)
+                            .map_err(|e| e.to_string())
+                    }
+                    .await;
+                    let _ = tx.send(AppEvent::CoverSet(res));
+                });
+            }
+        }
+    }
+
+    /// React (or take a reaction back), showing it at once.
+    fn react(&mut self, id: &str, r: Option<Reaction>) {
+        let kind = r.map(|r| ReactionKind::Predefined(r as i64));
+        let me = self.me.clone();
+        if let Some(m) = self.find_msg_mut(id) {
+            rune::models::apply_reaction(&mut m.reactions, &me, kind.clone(), now_ms());
+        }
+        let _ = self.store.set_reaction(id, &me, kind, now_ms());
+        let (client, tx, id) = (self.client.clone(), self.tx.clone(), id.to_owned());
+        self.status = match r {
+            Some(r) => format!("reacted {}", r.emoji()),
+            None => "reaction removed".into(),
+        };
+        tokio::spawn(async move {
+            let res = match r {
+                Some(r) => client.react(&id, r).await,
+                None => client.cancel_reaction(&id).await,
+            };
+            if let Err(e) = res {
+                let _ = tx.send(AppEvent::Status(format!("reaction failed: {e}")));
+            }
+        });
+    }
+
+    fn show_read_by(&mut self, id: &str) {
+        let Some(chat) = self.open.clone() else { return };
+        let readers = self.readers(&chat, id);
+        let mut lines: Vec<String> = readers.iter().map(|m| format!("✓ {}", self.name(m))).collect();
+        if lines.is_empty() {
+            lines.push("No one has read it yet (that rune has seen).".into());
+        }
+        if MidType::of(&chat) != MidType::User
+            && let Some(members) = self.members.get(&chat)
+        {
+            let unread: Vec<String> = members
+                .iter()
+                .filter(|m| **m != self.me && !readers.contains(m))
+                .map(|m| self.name(m))
+                .collect();
+            if !unread.is_empty() {
+                lines.push(String::new());
+                lines.push(format!("Not yet: {}", unread.join(", ")));
+            }
+        }
+        lines.push(String::new());
+        lines.push("Read marks arrive live; reads from before rune was running".into());
+        lines.push("are unknown (LINE's Chrome protocol returns no read history).".into());
+        self.modal = Some(Modal::Info {
+            title: format!(" Read by {} ", readers.len()),
+            lines,
+            scroll: 0,
+        });
+    }
+
+    pub(super) fn reaction_lines(&self, id: &str) -> (String, Vec<String>) {
+        let Some(msg) = self.find_msg(id).filter(|m| !m.unsent) else {
+            return (" Reactions ".into(), vec!["No reactions".into()]);
+        };
+        let lines: Vec<String> = msg
+            .reactions
+            .iter()
+            .map(|r| {
+                let emoji = match &r.kind {
+                    ReactionKind::Predefined(n) => {
+                        Reaction::from_i64(*n).map_or("•", Reaction::emoji).to_owned()
+                    }
+                    ReactionKind::Paid { .. } => "✨".into(),
+                };
+                format!("{emoji}  {}", self.name(&r.from))
+            })
+            .collect();
+        if lines.is_empty() {
+            return (" Reactions ".into(), vec!["No reactions".into()]);
+        }
+        (format!(" Reactions ({}) ", lines.len()), lines)
+    }
+
+    fn submit_form(&mut self, mut form: Form) {
+        let chat = self.open.clone();
+        let (client, tx) = (self.client.clone(), self.tx.clone());
+        let fail = |app: &mut App, mut form: Form, e: String| {
+            form.error = Some(e);
+            app.modal = Some(Modal::Form(form));
+        };
+        match form.kind.clone() {
+            FormKind::NewGroup => {
+                let name = form.value(0).trim().to_owned();
+                if name.is_empty() {
+                    return fail(self, form, "give the group a name".into());
+                }
+                if name.chars().count() > GROUP_NAME_MAX {
+                    return fail(
+                        self,
+                        form,
+                        format!("group names are at most {GROUP_NAME_MAX} characters"),
+                    );
+                }
+                self.open_pick(
+                    &format!(" 👥 Invite to “{name}” "),
+                    PickKind::NewGroup(name),
+                    HashSet::new(),
+                    false,
+                );
+                // No one to invite (yet): keep the typed name instead of losing it.
+                if self.modal.is_none() {
+                    let e = self.status.clone();
+                    fail(self, form, e);
+                }
+            }
+            FormKind::Rename(chat) => {
+                let name = form.value(0).trim().to_owned();
+                if name.is_empty() {
+                    return fail(self, form, "the name cannot be empty".into());
+                }
+                if name.chars().count() > GROUP_NAME_MAX {
+                    return fail(
+                        self,
+                        form,
+                        format!("group names are at most {GROUP_NAME_MAX} characters"),
+                    );
+                }
+                self.status = "renaming…".into();
+                tokio::spawn(async move {
+                    let res = client.rename_chat(&chat, &name).await.map_err(|e| e.to_string());
+                    let _ = tx.send(AppEvent::Renamed(chat, name, res));
+                });
+            }
+            FormKind::Location => {
+                let Some(chat) = chat else { return };
+                // "lat, lon" pasted into the latitude field fills both.
+                if let Some((lat, lon)) = parse_lat_lon(form.value(2)) {
+                    form.fields[2].value.set(lat.to_string());
+                    form.fields[3].value.set(lon.to_string());
+                }
+                let (lat, lon) = match (form.value(2).parse::<f64>(), form.value(3).parse::<f64>()) {
+                    (Ok(a), Ok(b)) if (-90.0..=90.0).contains(&a) && (-180.0..=180.0).contains(&b) => (a, b),
+                    _ => {
+                        return fail(
+                            self,
+                            form,
+                            "latitude/longitude must be numbers (−90…90, −180…180)".into(),
+                        );
+                    }
+                };
+                let title = match form.value(0) {
+                    "" => "Location".to_owned(),
+                    t => t.to_owned(),
+                };
+                let out = OutgoingMessage::location(&chat, lat, lon, &title, form.value(1));
+                self.send_outgoing(chat, out, format!("📍 [location {title}]"));
+            }
+            FormKind::NewPinList => {
+                let name = form.value(0).to_owned();
+                if let Some(e) = self.pin_list_name_error(&name, None) {
+                    return fail(self, form, e);
+                }
+                let created = self.store.create_pin_profile(&name);
+                match created.and_then(|p| self.store.switch_pin_profile(p.id).map(|()| p)) {
+                    Ok(p) => self.pin_list_changed(format!("pin list: {} (new, empty)", p.name)),
+                    Err(e) => fail(self, form, e.to_string()),
+                }
+            }
+            FormKind::RenamePinList(id) => {
+                let name = form.value(0).to_owned();
+                if let Some(e) = self.pin_list_name_error(&name, Some(id)) {
+                    return fail(self, form, e);
+                }
+                match self.store.rename_pin_profile(id, &name) {
+                    Ok(()) => self.pin_list_changed(format!("pin list renamed to {name}")),
+                    Err(e) => fail(self, form, e.to_string()),
+                }
+            }
+            FormKind::DisplayName | FormKind::StatusMessage => {
+                let value = form.value(0).to_owned();
+                let is_name = form.kind == FormKind::DisplayName;
+                if is_name && value.is_empty() {
+                    return fail(self, form, "the name cannot be empty".into());
+                }
+                self.status = "saving…".into();
+                tokio::spawn(async move {
+                    let res = if is_name {
+                        client.set_display_name(&value).await
+                    } else {
+                        client.set_status_message(&value).await
+                    };
+                    let s = match res {
+                        Ok(()) if is_name => format!("display name is now {value}"),
+                        Ok(()) => "status message saved".into(),
+                        Err(e) => format!("could not save: {e}"),
+                    };
+                    let _ = tx.send(AppEvent::Status(s));
+                    let _ = tx.send(AppEvent::ProfileChanged);
+                });
+                self.open_settings_at(3);
+            }
+        }
+    }
+
+    fn submit_pick(&mut self, pick: Pick) {
+        let (client, tx) = (self.client.clone(), self.tx.clone());
+        match pick.kind.clone() {
+            PickKind::NewGroup(name) => {
+                if pick.chosen.is_empty() {
+                    self.status = "pick at least one friend (Space)".into();
+                    self.modal = Some(Modal::Pick(pick));
+                    return;
+                }
+                self.status = format!("creating {name}…");
+                let members = pick.chosen;
+                tokio::spawn(async move {
+                    let res = client
+                        .create_group(&name, &members)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(AppEvent::GroupCreated(res, members));
+                });
+            }
+            PickKind::Invite(chat) => {
+                if pick.chosen.is_empty() {
+                    self.status = "nobody selected".into();
+                    return;
+                }
+                let mids = pick.chosen;
+                self.status = format!("inviting {}…", mids.len());
+                tokio::spawn(async move {
+                    let res = client
+                        .invite_into_chat(&chat, &mids)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(AppEvent::Invited(chat, mids, res));
+                });
+            }
+            PickKind::ShareContact => {
+                let Some(chat) = self.open.clone() else { return };
+                let Some(mid) = pick.chosen.first().cloned() else {
+                    return;
+                };
+                let name = pick
+                    .options
+                    .iter()
+                    .find(|o| o.0 == mid)
+                    .map(|o| o.1.clone())
+                    .unwrap_or_default();
+                let out = OutgoingMessage::contact(&chat, &mid, &name);
+                self.send_outgoing(chat, out, format!("👤 [contact {name}]"));
+            }
+        }
+    }
+
+    // -- keys ----------------------------------------------------------------------------
+
+    fn close_modal(&mut self) {
+        self.modal = match self.modal.take() {
+            Some(Modal::Help { under, .. }) => under.map(|modal| *modal),
+            _ => None,
+        };
+    }
+
+    pub fn modal_key(&mut self, k: KeyEvent) {
+        use keymap::{Cmd, Ctx};
+        let Some(modal) = self.modal.take() else { return };
+        let keep = |app: &mut App, m: Modal| app.modal = Some(m);
+        match modal {
+            Modal::Menu(mut m) => match keymap::resolve(Ctx::Menu, &k) {
+                Some(Cmd::Back) => {}
+                Some(Cmd::Up) => {
+                    m.sel = m.sel.checked_sub(1).unwrap_or(m.items.len().saturating_sub(1));
+                    keep(self, Modal::Menu(m));
+                }
+                Some(Cmd::Down) => {
+                    m.sel = (m.sel + 1) % m.items.len().max(1);
+                    keep(self, Modal::Menu(m));
+                }
+                Some(Cmd::Confirm) => {
+                    if let Some((_, a)) = m.items.into_iter().nth(m.sel) {
+                        self.run_action(a);
+                    }
+                }
+                Some(Cmd::Digit(i @ 1..=9)) => {
+                    let i = i as usize - 1;
+                    if i < m.items.len() {
+                        let a = m.items.swap_remove(i).1;
+                        self.run_action(a);
+                    } else {
+                        keep(self, Modal::Menu(m));
+                    }
+                }
+                _ => keep(self, Modal::Menu(m)),
+            },
+            Modal::Confirm(mut c) => match keymap::resolve(Ctx::Confirm, &k) {
+                Some(Cmd::Yes) => self.run_action(c.action),
+                Some(Cmd::Confirm) if c.yes => self.run_action(c.action),
+                Some(Cmd::Back | Cmd::No | Cmd::Confirm) => self.status = "cancelled".into(),
+                Some(Cmd::Left) => {
+                    c.yes = true;
+                    keep(self, Modal::Confirm(c));
+                }
+                Some(Cmd::Right) => {
+                    c.yes = false;
+                    keep(self, Modal::Confirm(c));
+                }
+                Some(Cmd::SwitchFocus) => {
+                    c.yes = !c.yes;
+                    keep(self, Modal::Confirm(c));
+                }
+                _ => keep(self, Modal::Confirm(c)),
+            },
+            Modal::Info { title, lines, scroll } => {
+                if let Some(scroll) = text_scroll(&k, scroll) {
+                    keep(self, Modal::Info { title, lines, scroll });
+                }
+            }
+            Modal::Reactions { msg, scroll } => {
+                if let Some(scroll) = text_scroll(&k, scroll) {
+                    keep(self, Modal::Reactions { msg, scroll });
+                }
+            }
+            Modal::Help { ctx, under, scroll } => match keymap::resolve(Ctx::Help, &k) {
+                Some(Cmd::Back | Cmd::Help) => self.modal = under.map(|modal| *modal),
+                cmd => {
+                    let scroll = scrolled(cmd, scroll);
+                    keep(self, Modal::Help { ctx, under, scroll });
+                }
+            },
+            Modal::Form(mut f) => match keymap::resolve(Ctx::Form, &k) {
+                Some(Cmd::Back) => self.status = "cancelled".into(),
+                Some(Cmd::Down) => {
+                    f.sel = (f.sel + 1) % f.fields.len();
+                    keep(self, Modal::Form(f));
+                }
+                Some(Cmd::Up) => {
+                    f.sel = f.sel.checked_sub(1).unwrap_or(f.fields.len() - 1);
+                    keep(self, Modal::Form(f));
+                }
+                Some(Cmd::Confirm) if f.sel + 1 < f.fields.len() => {
+                    // A pasted "lat, lon" can be submitted right away.
+                    if f.kind == FormKind::Location && f.sel == 2 && parse_lat_lon(f.value(2)).is_some() {
+                        return self.submit_form(f);
+                    }
+                    f.sel += 1;
+                    keep(self, Modal::Form(f));
+                }
+                Some(Cmd::Confirm) => self.submit_form(f),
+                cmd => {
+                    let field = &mut f.fields[f.sel].value;
+                    let before = field.clone();
+                    match cmd {
+                        Some(Cmd::CursorLeft) => field.left(),
+                        Some(Cmd::CursorRight) => field.right(),
+                        Some(Cmd::LineStart) => field.home(),
+                        Some(Cmd::LineEnd) => field.end(),
+                        Some(Cmd::DeleteBackward) => field.backspace(),
+                        Some(Cmd::DeleteForward) => field.delete(),
+                        None => {
+                            if let Some(c) = typed_char(&k) {
+                                field.insert(c);
+                            }
+                        }
+                        _ => {}
+                    }
+                    if field.as_str() != before.as_str() {
+                        f.error = None;
+                    }
+                    keep(self, Modal::Form(f));
+                }
+            },
+            Modal::Pick(mut p) => {
+                let vis = p.visible();
+                match keymap::resolve(Ctx::Pick, &k) {
+                    Some(Cmd::Back) => self.status = "cancelled".into(),
+                    Some(Cmd::Up) => {
+                        p.sel = p.sel.saturating_sub(1);
+                        keep(self, Modal::Pick(p));
+                    }
+                    Some(Cmd::Down) => {
+                        p.sel = (p.sel + 1).min(vis.len().saturating_sub(1));
+                        keep(self, Modal::Pick(p));
+                    }
+                    Some(Cmd::Toggle) if p.single => {
+                        if let Some(&i) = vis.get(p.sel) {
+                            p.chosen = vec![p.options[i].0.clone()];
+                            self.submit_pick(p);
+                        } else {
+                            keep(self, Modal::Pick(p));
+                        }
+                    }
+                    Some(Cmd::Toggle) => {
+                        if let Some(&i) = vis.get(p.sel) {
+                            let mid = p.options[i].0.clone();
+                            match p.chosen.iter().position(|m| *m == mid) {
+                                Some(j) => drop(p.chosen.remove(j)),
+                                None => p.chosen.push(mid),
+                            }
+                        }
+                        keep(self, Modal::Pick(p));
+                    }
+                    Some(Cmd::Confirm) => {
+                        // Enter with nothing ticked picks the highlighted person.
+                        if p.chosen.is_empty()
+                            && let Some(&i) = vis.get(p.sel)
+                        {
+                            p.chosen.push(p.options[i].0.clone());
+                        }
+                        self.submit_pick(p);
+                    }
+                    Some(Cmd::DeleteBackward) => {
+                        p.filter.pop();
+                        p.sel = 0;
+                        keep(self, Modal::Pick(p));
+                    }
+                    None => {
+                        if let Some(c) = typed_char(&k) {
+                            p.filter.push(c);
+                            p.sel = 0;
+                        }
+                        keep(self, Modal::Pick(p));
+                    }
+                    _ => keep(self, Modal::Pick(p)),
+                }
+            }
+            Modal::Attach(a) => self.attach_key(a, k),
+            Modal::Stickers(s) => self.stickers_key(s, k),
+            Modal::Settings(s) => self.settings_key(s, k),
+        }
+    }
+
+    /// Pasted text goes to the overlay's text field, if it has one.
+    pub fn modal_paste(&mut self, text: &str) {
+        match self.modal.as_mut() {
+            Some(Modal::Form(f)) => {
+                let line = text.trim_end_matches(['\r', '\n']).replace(['\r', '\n'], " ");
+                f.fields[f.sel].value.insert_str(&line);
+                f.error = None;
+            }
+            Some(Modal::Pick(p)) => {
+                p.filter.push_str(text.trim());
+                p.sel = 0;
+            }
+            Some(Modal::Attach(_)) => {
+                if let Some(Modal::Attach(a)) = self.modal.take() {
+                    self.attach_paste(a, text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn modal_mouse(&mut self, m: MouseEvent) {
+        let at = Position::new(m.column, m.row);
+        let inside = self.hit.modal.is_some_and(|r| r.contains(at));
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Right) => self.close_modal(),
+            MouseEventKind::Down(MouseButton::Left) if !inside => self.close_modal(),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let row = self.hit.modal_rows.iter().find(|(y, _)| *y == m.row).map(|r| r.1);
+                if matches!(self.modal, Some(Modal::Stickers(_))) {
+                    return self.stickers_click(at);
+                }
+                if let Some(&(_, yes)) = self.hit.confirm_buttons.iter().find(|(r, _)| r.contains(at))
+                    && let Some(Modal::Confirm(c)) = self.modal.as_mut()
+                {
+                    c.yes = yes;
+                    return self.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                }
+                let Some(i) = row else { return };
+                match self.modal.as_mut() {
+                    Some(Modal::Menu(menu)) => {
+                        menu.sel = i;
+                        self.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                    }
+                    Some(Modal::Pick(p)) => {
+                        p.sel = i;
+                        self.modal_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+                    }
+                    Some(Modal::Form(f)) => f.sel = i.min(f.fields.len() - 1),
+                    Some(Modal::Attach(a)) => {
+                        if a.sel == i {
+                            self.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                        } else {
+                            a.sel = i;
+                        }
+                    }
+                    Some(Modal::Settings(s)) => {
+                        if s.sel == i {
+                            self.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                        } else {
+                            s.sel = i;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // The wheel stops at the ends of a menu instead of wrapping around.
+            MouseEventKind::ScrollUp => match self.modal.as_mut() {
+                Some(Modal::Menu(menu)) => menu.sel = menu.sel.saturating_sub(1),
+                _ => self.modal_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            },
+            MouseEventKind::ScrollDown => match self.modal.as_mut() {
+                Some(Modal::Menu(menu)) => menu.sel = (menu.sel + 1).min(menu.items.len().saturating_sub(1)),
+                _ => self.modal_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            },
+            _ => {}
+        }
+    }
+
+    // -- drawing ------------------------------------------------------------------------
+
+    fn modal_frame(&mut self, f: &mut Frame, area: Rect, title: &str, help: &str) -> Rect {
+        f.render_widget(Clear, area);
+        self.hit.modal = Some(area);
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(Color::Green))
+            .title(Span::styled(title.to_owned(), Style::new().bold()))
+            .title_bottom(Span::styled(help.to_owned(), Style::new().dim()));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        inner
+    }
+
+    fn draw_text_modal(
+        &mut self,
+        f: &mut Frame,
+        area: Rect,
+        title: &str,
+        lines: &[String],
+        scroll: &mut usize,
+        hint: String,
+    ) {
+        let want = lines.iter().map(|l| l.width()).max().unwrap_or(20).clamp(24, 70) + 4;
+        let text_w = popup(area, want as u16, 1).width.saturating_sub(2) as usize;
+        let body: Vec<String> = lines.iter().flat_map(|l| wrap(l, text_w)).collect();
+        let r = popup(area, want as u16, body.len() as u16 + 2);
+        let h = r.height.saturating_sub(2) as usize;
+        *scroll = (*scroll).min(body.len().saturating_sub(h));
+        let help = if body.len() > h {
+            format!(" {}/{} · {hint} ", *scroll + h, body.len())
+        } else {
+            hint
+        };
+        let inner = self.modal_frame(f, r, title, &help);
+        let shown: Vec<Line> = body.into_iter().skip(*scroll).take(h).map(Line::raw).collect();
+        f.render_widget(Paragraph::new(shown), inner);
+    }
+
+    pub fn draw_modal(&mut self, f: &mut Frame, area: Rect) {
+        self.hit.modal = None;
+        self.hit.modal_rows.clear();
+        self.hit.confirm_buttons.clear();
+        // Nothing behind the overlay is clickable.
+        self.hit.links.clear();
+        // Worked out while the overlay is still in place: it says what is available.
+        let hint = self.hint();
+        let Some(mut modal) = self.modal.take() else {
+            return;
+        };
+        match &mut modal {
+            Modal::Menu(m) => {
+                let w = m
+                    .items
+                    .iter()
+                    .map(|(l, _)| l.width())
+                    .max()
+                    .unwrap_or(10)
+                    .max(m.title.width())
+                    + 8;
+                let r = popup(area, w as u16, m.items.len() as u16 + 2);
+                let inner = self.modal_frame(f, r, &m.title, &hint);
+                let first = scroll_first(m.sel, inner.height as usize);
+                let label_w = inner.width.saturating_sub(2) as usize;
+                for (row, (label, _)) in m.items.iter().skip(first).take(inner.height as usize).enumerate() {
+                    let i = first + row;
+                    let y = inner.y + row as u16;
+                    self.hit.modal_rows.push((y, i));
+                    let sel = i == m.sel;
+                    let style = if sel {
+                        Style::new().bg(Color::Green).fg(Color::Black).bold()
+                    } else {
+                        Style::new()
+                    };
+                    let key = if i < 9 { format!("{} ", i + 1) } else { "  ".into() };
+                    let line = Line::from(vec![
+                        Span::styled(key, Style::new().dim()),
+                        Span::styled(pad_to(&ellipsize(label, label_w), label_w), style),
+                    ]);
+                    f.render_widget(Paragraph::new(line), Rect::new(inner.x, y, inner.width, 1));
+                }
+            }
+            Modal::Confirm(c) => {
+                // Wrap to the box as it fits on screen, not as it would like to be.
+                let text_w = popup(area, 58, 1).width.saturating_sub(4) as usize;
+                let lines = wrap(&c.text, text_w);
+                let r = popup(area, 58, lines.len() as u16 + 4);
+                let inner = self.modal_frame(f, r, " Are you sure? ", &hint);
+                // Keep the buttons visible even when the text has to be cut.
+                let room = (inner.height as usize).saturating_sub(2);
+                let shown = lines.len().min(room);
+                let body: Vec<Line> = lines.into_iter().take(room).map(Line::raw).collect();
+                f.render_widget(Paragraph::new(body), inner);
+                let y = inner.y + shown as u16 + u16::from(inner.height as usize > shown + 1);
+                if y < inner.y + inner.height {
+                    let buttons = [
+                        (format!(" {} (y) ", c.action.verb()), true),
+                        (" Cancel (n) ".to_owned(), false),
+                    ];
+                    let mut x = inner.x;
+                    for (label, yes) in buttons {
+                        let focused = c.yes == yes;
+                        let style = match (focused, yes && c.action.destructive()) {
+                            (true, true) => Style::new().bg(Color::Red).fg(Color::White).bold(),
+                            (true, false) => Style::new().bg(Color::Green).fg(Color::Black).bold(),
+                            (false, _) => Style::new().bg(Color::DarkGray),
+                        };
+                        let w = (label.width() as u16).min((inner.x + inner.width).saturating_sub(x));
+                        let rect = Rect::new(x, y, w, 1);
+                        f.render_widget(Paragraph::new(Span::styled(label, style)), rect);
+                        self.hit.confirm_buttons.push((rect, yes));
+                        x = (x + w + 3).min(inner.x + inner.width);
+                    }
+                }
+            }
+            Modal::Info { title, lines, scroll } => {
+                self.draw_text_modal(f, area, title, lines, scroll, hint.clone());
+            }
+            Modal::Reactions { msg, scroll } => {
+                let (title, lines) = self.reaction_lines(msg);
+                self.draw_text_modal(f, area, &title, &lines, scroll, hint.clone());
+            }
+            Modal::Help { ctx, scroll, .. } => {
+                let lines = keymap::help_lines(*ctx);
+                let want = lines
+                    .iter()
+                    .map(|(key, description)| key.width() + description.width() + 3)
+                    .max()
+                    .unwrap_or(40)
+                    .clamp(36, 100);
+                let r = popup(area, want as u16, lines.len() as u16 + 2);
+                let h = r.height.saturating_sub(2) as usize;
+                *scroll = (*scroll).min(lines.len().saturating_sub(h));
+                let title = format!(" {} shortcuts ", ctx.title());
+                let inner = self.modal_frame(f, r, &title, &hint);
+                let key_width = lines
+                    .iter()
+                    .map(|(key, _)| key.width())
+                    .max()
+                    .unwrap_or(1)
+                    .min((inner.width as usize).saturating_sub(2).min(24))
+                    .max(1);
+                let description_width = (inner.width as usize).saturating_sub(key_width + 1);
+                let shown: Vec<Line> = lines
+                    .iter()
+                    .skip(*scroll)
+                    .take(h)
+                    .map(|(key, description)| {
+                        Line::from(vec![
+                            Span::styled(
+                                pad_to(&ellipsize(key, key_width), key_width),
+                                Style::new().fg(Color::Green).bold(),
+                            ),
+                            Span::raw(" "),
+                            Span::raw(ellipsize(description, description_width)),
+                        ])
+                    })
+                    .collect();
+                f.render_widget(Paragraph::new(shown), inner);
+            }
+            Modal::Form(form) => {
+                let h = form.fields.len() as u16 * 3 + 2 + u16::from(form.error.is_some()) * 2;
+                let r = popup(area, 72, h);
+                let inner = self.modal_frame(f, r, &form.title, &hint);
+                let mut y = inner.y;
+                for (i, field) in form.fields.iter().enumerate() {
+                    if y + 2 > inner.y + inner.height {
+                        break;
+                    }
+                    let sel = i == form.sel;
+                    let label_style = if sel {
+                        Style::new().fg(Color::Green).bold()
+                    } else {
+                        Style::new().bold()
+                    };
+                    f.render_widget(
+                        Paragraph::new(Line::from(vec![
+                            Span::styled(field.label, label_style),
+                            Span::styled(format!("  {}", field.hint), Style::new().dim()),
+                        ])),
+                        Rect::new(inner.x, y, inner.width, 1),
+                    );
+                    self.hit.modal_rows.push((y, i));
+                    self.hit.modal_rows.push((y + 1, i));
+                    let (shown, cursor) = field.value.view(inner.width.saturating_sub(2) as usize);
+                    let bg = if sel {
+                        Color::Indexed(237)
+                    } else {
+                        Color::Indexed(235)
+                    };
+                    f.render_widget(
+                        Paragraph::new(format!(" {shown}")).style(Style::new().bg(bg)),
+                        Rect::new(inner.x, y + 1, inner.width, 1),
+                    );
+                    if sel && inner.width > 1 {
+                        let x = inner.x + 1 + cursor.min(inner.width - 2);
+                        f.set_cursor_position(Position::new(x, y + 1));
+                    }
+                    y += 3;
+                }
+                if let Some(e) = &form.error {
+                    f.render_widget(
+                        Paragraph::new(e.as_str())
+                            .style(Style::new().fg(Color::LightRed))
+                            .wrap(Wrap { trim: true }),
+                        Rect::new(
+                            inner.x,
+                            y,
+                            inner.width,
+                            inner.y + inner.height - y.min(inner.y + inner.height),
+                        ),
+                    );
+                }
+            }
+            Modal::Pick(p) => {
+                let r = popup(area, 60, (area.height * 4 / 5).max(10));
+                let inner = self.modal_frame(f, r, &p.title, &hint);
+                let [search, count, list] =
+                    Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)])
+                        .areas(inner);
+                f.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled("🔍 ", Style::new()),
+                        Span::raw(p.filter.clone()),
+                    ]))
+                    .style(Style::new().bg(Color::Indexed(236))),
+                    search,
+                );
+                f.set_cursor_position(Position::new(search.x + 3 + p.filter.width() as u16, search.y));
+                if !p.single {
+                    let names: Vec<String> = p
+                        .chosen
+                        .iter()
+                        .filter_map(|m| p.options.iter().find(|o| &o.0 == m).map(|o| o.1.clone()))
+                        .collect();
+                    let txt = if names.is_empty() {
+                        "nobody selected yet".to_owned()
+                    } else {
+                        format!("{} selected: {}", names.len(), names.join(", "))
+                    };
+                    f.render_widget(
+                        Paragraph::new(ellipsize(&txt, count.width as usize))
+                            .style(Style::new().fg(Color::Green)),
+                        count,
+                    );
+                }
+                let vis = p.visible();
+                let h = list.height as usize;
+                let first = p.sel.saturating_sub(h.saturating_sub(1));
+                for (row, &i) in vis.iter().skip(first).take(h).enumerate() {
+                    let (mid, name) = &p.options[i];
+                    let y = list.y + row as u16;
+                    self.hit.modal_rows.push((y, first + row));
+                    let ticked = p.chosen.contains(mid);
+                    let mark = match (p.single, ticked) {
+                        (true, _) => "  ",
+                        (false, true) => "☑ ",
+                        (false, false) => "☐ ",
+                    };
+                    let style = if first + row == p.sel {
+                        Style::new().bg(Color::Green).fg(Color::Black)
+                    } else if ticked {
+                        Style::new().fg(Color::Green)
+                    } else {
+                        Style::new()
+                    };
+                    f.render_widget(
+                        Paragraph::new(Line::from(vec![
+                            Span::raw(mark),
+                            Span::styled(name.clone(), style),
+                        ])),
+                        Rect::new(list.x, y, list.width, 1),
+                    );
+                }
+                if vis.is_empty() {
+                    f.render_widget(Paragraph::new("no match").style(Style::new().dim()), list);
+                }
+            }
+            Modal::Attach(_) | Modal::Stickers(_) | Modal::Settings(_) => {}
+        }
+        self.modal = Some(modal);
+        match self.modal.take() {
+            Some(Modal::Attach(mut a)) => {
+                self.draw_attach(f, area, &mut a, hint);
+                self.modal = Some(Modal::Attach(a));
+            }
+            Some(Modal::Stickers(mut s)) => {
+                self.draw_stickers(f, area, &mut s, hint);
+                self.modal = Some(Modal::Stickers(s));
+            }
+            Some(Modal::Settings(mut s)) => {
+                self.draw_settings(f, area, &mut s, hint);
+                self.modal = Some(Modal::Settings(s));
+            }
+            other => self.modal = other,
+        }
+    }
+}
+
+/// Where a scrollable box's first line is after `cmd` (clamped when drawn).
+fn scrolled(cmd: Option<keymap::Cmd>, scroll: usize) -> usize {
+    use keymap::Cmd;
+    match cmd {
+        Some(Cmd::Up) => scroll.saturating_sub(1),
+        Some(Cmd::Down) => scroll + 1,
+        Some(Cmd::PageUp) => scroll.saturating_sub(10),
+        Some(Cmd::PageDown) => scroll + 10,
+        Some(Cmd::Home) => 0,
+        Some(Cmd::End) => usize::MAX / 2,
+        _ => scroll,
+    }
+}
+
+/// A key in a read-only text box: the new scroll position, `None` to close.
+fn text_scroll(k: &KeyEvent, scroll: usize) -> Option<usize> {
+    match keymap::resolve(keymap::Ctx::Info, k) {
+        Some(keymap::Cmd::Back) => None,
+        cmd => Some(scrolled(cmd, scroll)),
+    }
+}
+
+/// The first row to draw of a list `h` rows high so that row `sel` is visible.
+pub fn scroll_first(sel: usize, h: usize) -> usize {
+    sel.saturating_sub(h.saturating_sub(1))
+}
+
+/// Pad `s` with spaces to `w` display columns (`format!` pads by chars, which
+/// is wrong for emoji, CJK and Thai).
+fn pad_to(s: &str, w: usize) -> String {
+    format!("{s}{}", " ".repeat(w.saturating_sub(s.width())))
+}
+
+fn mute_item(mid: &str, muted: bool) -> (String, Action) {
+    if muted {
+        (
+            "🔔 Turn notifications on".to_owned(),
+            Action::Mute(mid.into(), false),
+        )
+    } else {
+        ("🔕 Mute notifications".to_owned(), Action::Mute(mid.into(), true))
+    }
+}
+
+fn pin_item(mid: &str, pinned: bool) -> (String, Action) {
+    (
+        if pinned {
+            "📌 Unpin chat"
+        } else {
+            "📌 Pin chat"
+        }
+        .to_owned(),
+        Action::Pin(mid.into(), !pinned),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_lists_scroll_to_the_selection() {
+        assert_eq!(scroll_first(0, 5), 0);
+        assert_eq!(scroll_first(4, 5), 0);
+        assert_eq!(scroll_first(9, 5), 5);
+        assert_eq!(scroll_first(3, 0), 3);
+        // Padding counts display columns: 🔔 is two wide.
+        assert_eq!(pad_to("🔔 a", 6).width(), 6);
+        assert_eq!(pad_to("toolong", 3), "toolong");
+    }
+
+    #[test]
+    fn coordinates() {
+        assert_eq!(parse_lat_lon("13.7466, 100.5347"), Some((13.7466, 100.5347)));
+        assert_eq!(parse_lat_lon("abc"), None);
+    }
+
+    #[test]
+    fn pick_filters_by_name() {
+        let p = Pick {
+            title: String::new(),
+            kind: PickKind::ShareContact,
+            options: vec![
+                ("U1".into(), "Alice".into()),
+                ("U2".into(), "Bob".into()),
+                ("U3".into(), "alicia".into()),
+            ],
+            chosen: vec![],
+            filter: "ali".into(),
+            sel: 0,
+            single: true,
+        };
+        assert_eq!(p.visible(), [0, 2]);
+    }
+}

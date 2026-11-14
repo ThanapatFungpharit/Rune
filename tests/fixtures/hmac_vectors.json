@@ -1,0 +1,50 @@
+[
+  {
+    "accessToken": "",
+    "path": "/api/talk/thrift/Talk/TalkService/getProfile",
+    "body": "[2]",
+    "hmac": "yAzjNe/gJgK+GOa0mh6/SV42/zIqaXPjHEgrPuLk7TE="
+  },
+  {
+    "accessToken": "",
+    "path": "/api/talk/thrift/LoginQrCode/SecondaryQrCodeLoginService/createSession",
+    "body": "[{}]",
+    "hmac": "xc7hTRfwaauLuMpoXQRt2DDZE+nu+8e4auOw1F/UQZo="
+  },
+  {
+    "accessToken": "eyJhbGciOiJIUzI1NiJ9.test.token",
+    "path": "/api/operation/receive?version=3.7.2&localRev=5",
+    "body": "",
+    "hmac": "x5F8bn67bnF8wsPjq4JPS7ofRGG4W7I/7dVHAg4bRQc="
+  },
+  {
+    "accessToken": "eyJhbGciOiJIUzI1NiJ9.test.token",
+    "path": "/api/talk/thrift/Talk/TalkService/sendMessage",
+    "body": "[0,{\"to\":\"u0123456789abcdef0123456789abcdef\",\"toType\":0,\"text\":\"hi\",\"contentType\":0,\"contentMetadata\":{}}]",
+    "hmac": "2Nltv9D9vDm9GPysbrBWl1jn/2J6sSjYGvZ9S/Rm/Ok="
+  },
+  {
+    "accessToken": "another-token",
+    "path": "/api/talk/thrift/Talk/TalkService/sendMessage",
+    "body": "[1,{\"to\":\"c0\",\"text\":\"สวัสดี 👋 日本語\",\"contentMetadata\":{}}]",
+    "hmac": "scqhgHL4jvd3VcNUpGgwssNrR6+jQGe+ls04jE1MesE="
+  },
+  {
+    "accessToken": "another-token",
+    "path": "/api/operation/receive?version=3.7.2&language=en_US&lastPartialFullSyncs=%7B%7D&localRev=123456789",
+    "body": "",
+    "hmac": "Mc+UJY8uuYEKc1mUj/FitZbj7daQxgDRMwAFF1fpxpM="
+  },
+  {
+    "accessToken": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "path": "/api/auth/tokenRefresh",
+    "body": "{\"refreshToken\":\"rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr\"}",
+    "hmac": "aHh9rGva7p9KdT8wyPt2RgZ3SOcxpjCUfiQqb2SLXOI="
+  },
+  {
+    "accessToken": "another-token",
+    "path": "/api/talk/thrift/Talk/TalkService/getContactsV2",
+    "body": "[{\"targetUserMids\":[\"u00000000000000000000000000000000\",\"u00000000000000000000000000000001\",\"u00000000000000000000000000000002\",\"u00000000000000000000000000000003\",\"u00000000000000000000000000000004\",\"u00000000000000000000000000000005\",\"u00000000000000000000000000000006\",\"u00000000000000000000000000000007\",\"u00000000000000000000000000000008\",\"u00000000000000000000000000000009\",\"u00000000000000000000000000000010\",\"u00000000000000000000000000000011\",\"u00000000000000000000000000000012\",\"u00000000000000000000000000000013\",\"u00000000000000000000000000000014\",\"u00000000000000000000000000000015\",\"u00000000000000000000000000000016\",\"u00000000000000000000000000000017\",\"u00000000000000000000000000000018\",\"u00000000000000000000000000000019\",\"u00000000000000000000000000000020\",\"u00000000000000000000000000000021\",\"u00000000000000000000000000000022\",\"u00000000000000000000000000000023\",\"u00000000000000000000000000000024\",\"u00000000000000000000000000000025\",\"u00000000000000000000000000000026\",\"u00000000000000000000000000000027\",\"u00000000000000000000000000000028\",\"u00000000000000000000000000000029\",\"u00000000000000000000000000000030\",\"u00000000000000000000000000000031\",\"u00000000000000000000000000000032\",\"u00000000000000000000000000000033\",\"u00000000000000000000000000000034\",\"u00000000000000000000000000000035\",\"u00000000000000000000000000000036\",\"u00000000000000000000000000000037\",\"u00000000000000000000000000000038\",\"u00000000000000000000000000000039\"]}]",
+    "hmac": "eURNqr9NamdlSrodauKxX6iWQMJtcyIFkmr6MSQWznU="
+  }
+]
