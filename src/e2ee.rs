@@ -455,13 +455,26 @@ impl Client {
             allowed_types: int_list(neg.get("allowedTypes")),
             channel,
         };
-        let mut st = self.e2ee();
-        st.public_keys.insert((mid.to_owned(), key_id), key);
-        if let Some(old) = st.peers.insert(mid.to_owned(), peer.clone()) {
-            drop(st);
-            self.with_ltsm(|l| l.release_channel(old.channel))?;
+        let existing = {
+            let mut st = self.e2ee();
+            st.public_keys.insert((mid.to_owned(), key_id), key);
+            // Another task may have negotiated meanwhile and be sealing with
+            // its channel: keep that one and free ours.
+            match st.peers.get(mid) {
+                Some(p) => Some(p.clone()),
+                None => {
+                    st.peers.insert(mid.to_owned(), peer.clone());
+                    None
+                }
+            }
+        };
+        match existing {
+            Some(p) => {
+                self.with_ltsm(|l| l.release_channel(channel))?;
+                Ok(p)
+            }
+            None => Ok(peer),
         }
-        Ok(peer)
     }
 
     /// Drop cached negotiation/group keys for a chat (the extension's `resetE2eeInfo`).
@@ -481,7 +494,10 @@ impl Client {
         });
     }
 
-    async fn unwrap_group_key(&self, group: &str, gsk: &Value) -> Result<(KeyHandle, i64)> {
+    /// Unwrap a `E2EEGroupSharedKey` and cache it. Only the group's latest
+    /// key (`latest`) becomes the one sends use: an older key fetched to
+    /// decrypt history must not replace it.
+    async fn unwrap_group_key(&self, group: &str, gsk: &Value, latest: bool) -> Result<(KeyHandle, i64)> {
         let gkid = int_field(gsk, "groupKeyId")?;
         let mine = self.my_key(gsk.get("receiverKeyId").and_then(value_i64))?;
         // creator may be us: user_public_key serves our own keys locally.
@@ -495,17 +511,35 @@ impl Client {
             l.release_channel(ch)?;
             k
         })?;
-        let mut st = self.e2ee();
-        st.group_keys.insert((group.to_owned(), gkid), handle);
-        st.groups.insert(
-            group.to_owned(),
-            GroupInfo {
-                key_id: gkid,
-                spec_version: gsk.get("specVersion").and_then(value_i64).unwrap_or(2),
-                allowed_types: int_list(gsk.get("allowedTypes")),
-            },
-        );
-        Ok((handle, gkid))
+        let replaced = {
+            let mut st = self.e2ee();
+            if latest {
+                st.groups.insert(
+                    group.to_owned(),
+                    GroupInfo {
+                        key_id: gkid,
+                        spec_version: gsk.get("specVersion").and_then(value_i64).unwrap_or(2),
+                        allowed_types: int_list(gsk.get("allowedTypes")),
+                    },
+                );
+            }
+            // A concurrent fetch may have cached this key already: keep that
+            // handle (another task may be using it) and free ours.
+            match st.group_keys.get(&(group.to_owned(), gkid)) {
+                Some(&existing) => Some(existing),
+                None => {
+                    st.group_keys.insert((group.to_owned(), gkid), handle);
+                    None
+                }
+            }
+        };
+        match replaced {
+            Some(existing) => {
+                self.with_ltsm(|l| l.release_key(handle))?;
+                Ok((existing, gkid))
+            }
+            None => Ok((handle, gkid)),
+        }
     }
 
     /// The group key `key_id`, or the latest one (creating it if the group
@@ -535,7 +569,7 @@ impl Client {
                 r => r?,
             },
         };
-        self.unwrap_group_key(group, &gsk).await
+        self.unwrap_group_key(group, &gsk, key_id.is_none()).await
     }
 
     /// Create and upload a new shared key for a group (`registerE2EEGroupKey`).
@@ -575,7 +609,7 @@ impl Client {
             .talk_e2ee("registerE2EEGroupKey", json!([1, group, mids, key_ids, wrapped]))
             .await?;
         tracing::info!(%group, members = mids.len(), "registered a new E2EE group key");
-        self.unwrap_group_key(group, &result).await
+        self.unwrap_group_key(group, &result, true).await
     }
 
     async fn talk_e2ee(&self, method: &str, args: Value) -> Result<Value> {
@@ -635,15 +669,18 @@ impl Client {
                         &plaintext,
                     )
                     .map(|ct| (2u8, ct)),
-                v => {
-                    return Err(Error::e2ee(
-                        Kind::UnsupportedVersion(v),
-                        format!("specVersion {v}"),
-                    ));
-                }
+                // Rejected below, once the channel is freed.
+                _ => Ok((0, Vec::new())),
             };
+            // The temporary group channel is freed whatever happened.
             if temp_channel {
                 l.release_channel(channel)?;
+            }
+            if !matches!(spec, 1 | 2) {
+                return Err(Error::e2ee(
+                    Kind::UnsupportedVersion(spec),
+                    format!("specVersion {spec}"),
+                ));
             }
             let (version, ct) = r?;
             Ok(seal_message(
@@ -944,5 +981,136 @@ mod tests {
         assert_eq!(out.text.as_deref(), Some("hello"));
         assert_eq!(out.content_metadata["REPLACE"], r#"{"a":1}"#);
         assert!(!out.is_e2ee());
+    }
+}
+
+/// Key caching against a mock gateway. Synthetic keys stand in for a
+/// keychain: ECDH, group-key wrapping and V1 work with them (V2 needs real mids).
+#[cfg(test)]
+mod key_cache_tests {
+    use std::time::Duration;
+
+    use wiremock::matchers::path;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+    use crate::transport::{Config, Tokens};
+
+    const ME: &str = "u0123456789abcdef0123456789abcdef";
+    const GROUP: &str = "C0123456789abcdef0123456789abcdef";
+
+    fn ok(data: Value) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({"message": "OK", "data": data}))
+    }
+
+    /// A client against `server` holding one synthetic E2EE key (id 10).
+    fn client(server: &MockServer) -> Client {
+        let config = Config {
+            gateway: server.uri(),
+            obs: server.uri(),
+            max_retries: 0,
+            ..Default::default()
+        };
+        let tokens = Tokens {
+            access_token: Some("A".into()),
+            mid: Some(ME.into()),
+            ..Default::default()
+        };
+        let c = Client::with_tokens(config, tokens).unwrap();
+        let key = c
+            .with_ltsm(|l| {
+                let curve = l.generate_curve_key()?;
+                l.make_e2ee_key(curve, 1, 10)
+            })
+            .unwrap();
+        c.e2ee().my_keys.insert(10, key);
+        c
+    }
+
+    /// A fresh group shared key `id`, created by us and wrapped for our key.
+    fn group_shared_key(c: &Client, id: i64, spec: i64) -> Value {
+        let mine = c.e2ee().my_keys[&10];
+        let wrapped = c
+            .with_ltsm(|l| -> crate::ltsm::Result<Vec<u8>> {
+                let shared = l.generate_curve_key()?;
+                let my_pub = l.public_key(mine)?;
+                let ch = l.create_channel(mine, &my_pub)?;
+                let w = l.wrap_group_shared_key(ch, shared)?;
+                l.release_channel(ch)?;
+                l.release_key(shared)?;
+                Ok(w)
+            })
+            .unwrap();
+        json!({"groupKeyId": id, "creator": ME, "creatorKeyId": 10, "receiver": ME, "receiverKeyId": 10,
+               "encryptedSharedKey": B64.encode(wrapped), "specVersion": spec, "allowedTypes": []})
+    }
+
+    #[tokio::test]
+    async fn an_old_group_key_for_history_does_not_become_the_sending_key() {
+        let server = MockServer::start().await;
+        let c = client(&server);
+        let (old, latest) = (group_shared_key(&c, 5, 2), group_shared_key(&c, 7, 2));
+        Mock::given(path("/api/talk/thrift/Talk/TalkService/getE2EEGroupSharedKey"))
+            .respond_with(ok(old))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path(
+            "/api/talk/thrift/Talk/TalkService/getLastE2EEGroupSharedKey",
+        ))
+        .respond_with(ok(latest))
+        .expect(1)
+        .mount(&server)
+        .await;
+        // Decrypting an older message fetches key 5 first...
+        assert_eq!(c.group_key(GROUP, Some(5)).await.unwrap().1, 5);
+        // ...yet sending asks for (and then keeps using) the latest key.
+        assert_eq!(c.group_key(GROUP, None).await.unwrap().1, 7);
+        assert_eq!(c.group_key(GROUP, Some(5)).await.unwrap().1, 5);
+        assert_eq!(c.group_key(GROUP, None).await.unwrap().1, 7);
+    }
+
+    #[tokio::test]
+    async fn concurrent_negotiations_leave_every_channel_usable() {
+        let server = MockServer::start().await;
+        let c = client(&server);
+        let peer_pub = c
+            .with_ltsm(|l| {
+                let k = l.generate_curve_key()?;
+                l.public_key(k)
+            })
+            .unwrap();
+        let negotiated = json!({"publicKey": {"keyId": 3, "keyData": B64.encode(&peer_pub)},
+                                "specVersion": 1, "allowedTypes": [0]});
+        Mock::given(path("/api/talk/thrift/Talk/TalkService/negotiateE2EEPublicKey"))
+            .respond_with(ok(negotiated).set_delay(Duration::from_millis(200)))
+            .mount(&server)
+            .await;
+        // Two sends to the same new chat negotiate at the same time.
+        let (a, b) = tokio::join!(c.peer("u1"), c.peer("u1"));
+        for p in [a.unwrap(), b.unwrap()] {
+            c.with_ltsm(|l| l.encrypt_v1(p.channel, b"hi"))
+                .expect("the channel was freed under a sender");
+        }
+        assert!(c.with_ltsm(|l| format!("{l:?}")).contains("channels: 1"));
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_group_spec_frees_its_channel() {
+        let server = MockServer::start().await;
+        let c = client(&server);
+        let gsk = group_shared_key(&c, 7, 3);
+        Mock::given(path(
+            "/api/talk/thrift/Talk/TalkService/getLastE2EEGroupSharedKey",
+        ))
+        .respond_with(ok(gsk))
+        .mount(&server)
+        .await;
+        let e = c
+            .seal_message(&OutgoingMessage::text(GROUP, "hi"))
+            .await
+            .unwrap_err();
+        assert_eq!(e.e2ee_kind(), Some(&Kind::UnsupportedVersion(3)));
+        assert!(c.with_ltsm(|l| format!("{l:?}")).contains("channels: 0"));
     }
 }
