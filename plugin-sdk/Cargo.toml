@@ -2,6 +2,7 @@
 name = "rune-plugin"
 version = "1.0.0"
 edition = "2024"
+license = "MIT"
 description = "Plugin API for rune-tui: wire types, manifest checks and the WebAssembly glue"
 publish = false
 
