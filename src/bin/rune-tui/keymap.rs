@@ -4,16 +4,21 @@
 //!
 //! The rules the tables follow:
 //! - Global chords work in every view where they make sense, also while
-//!   typing: `Ctrl-C` quits, `F1` shows help, `Ctrl-S` opens settings, and
-//!   with a chat open `Ctrl-O` (send something), `Ctrl-G` (chat menu) and
-//!   `Ctrl-P` (chat profile).
+//!   typing: `Ctrl-c` quits, `F1` shows help, `Ctrl-s` opens settings, and
+//!   with a chat open `Ctrl-o` (send something), `Ctrl-g` (chat menu) and
+//!   `Ctrl-p` (chat profile).
 //! - `?` shows help wherever printable keys are not text.
 //! - Plain letters are only bound where nothing is typed, and only for
 //!   things done often to the selected item. Everything else lives in the
 //!   item's menu (`m`), which lists it by name.
 //! - `Enter` confirms or opens, `Esc` goes back; consequential actions ask
 //!   with labelled buttons.
-//! - Text fields edit at a cursor (`←` `→` `Home` `End` `Delete`).
+//! - Text fields edit at a cursor (`←` `→` `Home` `End` `Delete`), and by
+//!   word the way shells do (`Ctrl-←` `Ctrl-→` `Ctrl-w` `Ctrl-u` `Ctrl-k`).
+//! - Lists jump to their first and last item with `Home` and `End`.
+//! - On the message line `Enter` sends and `Shift-Enter` (or `Alt-Enter`,
+//!   or `Ctrl-j` where the terminal cannot tell `Shift-Enter` apart) starts
+//!   a new line; `↑` `↓` move between its lines.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -32,6 +37,8 @@ pub enum Ctx {
     Form,
     Pick,
     AttachBrowse,
+    /// The file browser while a filter is typed: keys edit it.
+    AttachFilter,
     AttachSend,
     Stickers,
     Settings,
@@ -39,7 +46,7 @@ pub enum Ctx {
 
 impl Ctx {
     #[cfg(test)]
-    pub const ALL: [Ctx; 16] = [
+    pub const ALL: [Ctx; 17] = [
         Ctx::ChatList,
         Ctx::ChatSearch,
         Ctx::Compose,
@@ -53,6 +60,7 @@ impl Ctx {
         Ctx::Form,
         Ctx::Pick,
         Ctx::AttachBrowse,
+        Ctx::AttachFilter,
         Ctx::AttachSend,
         Ctx::Stickers,
         Ctx::Settings,
@@ -74,6 +82,7 @@ impl Ctx {
             Ctx::Form => "Form",
             Ctx::Pick => "People picker",
             Ctx::AttachBrowse => "File browser",
+            Ctx::AttachFilter => "File filter",
             Ctx::AttachSend => "Send dialog",
             Ctx::Stickers => "Stickers",
             Ctx::Settings => "Settings",
@@ -103,6 +112,12 @@ pub enum Cmd {
     LineEnd,
     DeleteBackward,
     DeleteForward,
+    WordLeft,
+    WordRight,
+    DeleteWordBackward,
+    DeleteToLineStart,
+    DeleteToLineEnd,
+    NewLine,
     // Global.
     Help,
     Settings,
@@ -162,6 +177,27 @@ const fn ch(c: char) -> Key {
     key(KeyCode::Char(c))
 }
 
+const fn shift(code: KeyCode) -> Key {
+    Key {
+        code,
+        mods: KeyModifiers::SHIFT,
+    }
+}
+
+const fn alt(code: KeyCode) -> Key {
+    Key {
+        code,
+        mods: KeyModifiers::ALT,
+    }
+}
+
+const fn ctrl_key(code: KeyCode) -> Key {
+    Key {
+        code,
+        mods: KeyModifiers::CONTROL,
+    }
+}
+
 const fn ctrl(c: char) -> Key {
     Key {
         code: KeyCode::Char(c),
@@ -199,6 +235,12 @@ static TEXT_EDIT: &[Binding] = &[
     binding!(Cmd::LineEnd, "end of the line", false; key(End)),
     binding!(Cmd::DeleteBackward, "delete before the cursor", false; key(Backspace)),
     binding!(Cmd::DeleteForward, "delete after the cursor", false; key(Delete)),
+    // Alt-← / Alt-→ is what macOS terminals send for Option-arrows.
+    binding!(Cmd::WordLeft, "previous word", false; ctrl_key(Left), alt(Left)),
+    binding!(Cmd::WordRight, "next word", false; ctrl_key(Right), alt(Right)),
+    binding!(Cmd::DeleteWordBackward, "delete the word before the cursor", false; ctrl('w'), alt(Backspace)),
+    binding!(Cmd::DeleteToLineStart, "delete to the start of the line", false; ctrl('u')),
+    binding!(Cmd::DeleteToLineEnd, "delete to the end of the line", false; ctrl('k')),
 ];
 
 static CHAT_LIST: &[Binding] = &[
@@ -206,6 +248,8 @@ static CHAT_LIST: &[Binding] = &[
     binding!(Cmd::Down, "next chat (at the end: load more)", false; key(Down), ch('j')),
     binding!(Cmd::PageUp, "page up", false; key(PageUp)),
     binding!(Cmd::PageDown, "page down", false; key(PageDown)),
+    binding!(Cmd::Home, "first chat", false; key(Home)),
+    binding!(Cmd::End, "last chat", false; key(End)),
     binding!(Cmd::Confirm, "open (invitations: join or decline)", true; key(Enter), key(Right)),
     binding!(Cmd::SwitchFocus, "go to the open chat", false; key(Tab), key(BackTab)),
     binding!(Cmd::Search, "search", true; ch('/')),
@@ -222,13 +266,16 @@ static CHAT_SEARCH: &[Binding] = &[
     binding!(Cmd::Up, "previous match", true; key(Up)),
     binding!(Cmd::Down, "next match", true; key(Down)),
     binding!(Cmd::SwitchFocus, "go to the open chat", false; key(Tab), key(BackTab)),
-    binding!(Cmd::DeleteBackward, "delete a character", false; key(Backspace)),
 ];
 
 static COMPOSE: &[Binding] = &[
     binding!(Cmd::Confirm, "send", true; key(Enter)),
+    // Ctrl-j is the line feed every terminal sends; Shift-Enter needs the
+    // keyboard protocol, and some terminals keep Alt-Enter for themselves.
+    binding!(Cmd::NewLine, "new line", true; shift(Enter), alt(Enter), ctrl('j')),
     binding!(Cmd::Back, "back (a reply is cancelled first)", true; key(Esc)),
-    binding!(Cmd::Up, "select messages", true; key(Up)),
+    binding!(Cmd::Up, "previous line (on the first: select messages)", true; key(Up)),
+    binding!(Cmd::Down, "next line", false; key(Down)),
     binding!(Cmd::PageUp, "scroll up", false; key(PageUp)),
     binding!(Cmd::PageDown, "scroll down", false; key(PageDown)),
     binding!(Cmd::SwitchFocus, "go to the chat list", false; key(Tab), key(BackTab)),
@@ -241,6 +288,8 @@ static MESSAGES: &[Binding] = &[
     binding!(Cmd::Right, "go to the message line", false; key(Right)),
     binding!(Cmd::PageUp, "scroll up", false; key(PageUp)),
     binding!(Cmd::PageDown, "scroll down", false; key(PageDown)),
+    binding!(Cmd::Home, "oldest loaded message", false; key(Home)),
+    binding!(Cmd::End, "newest message", false; key(End)),
     binding!(Cmd::SwitchFocus, "go to the chat list", false; key(Tab), key(BackTab)),
     binding!(Cmd::Confirm, "view / play / open the link", true; key(Enter)),
     binding!(Cmd::Reply, "reply", true; ch('r')),
@@ -278,6 +327,8 @@ static MENU: &[Binding] = &[
     binding!(Cmd::Back, "close", true; key(Esc)),
     binding!(Cmd::Up, "previous item", false; key(Up), ch('k')),
     binding!(Cmd::Down, "next item", false; key(Down), ch('j')),
+    binding!(Cmd::Home, "first item", false; key(Home)),
+    binding!(Cmd::End, "last item", false; key(End)),
     binding!(Cmd::Confirm, "choose", true; key(Enter)),
     binding!(Cmd::Digit(1), "choose by number", true; ch('1')),
     binding!(Cmd::Digit(2), "choose item 2", false; ch('2')),
@@ -334,7 +385,6 @@ static PICK: &[Binding] = &[
     binding!(Cmd::Down, "next person", false; key(Down)),
     binding!(Cmd::Toggle, "tick / untick", true; ch(' ')),
     binding!(Cmd::Confirm, "done (nobody ticked: the highlighted one)", true; key(Enter)),
-    binding!(Cmd::DeleteBackward, "delete a filter character", false; key(Backspace)),
 ];
 
 static ATTACH_BROWSE: &[Binding] = &[
@@ -347,10 +397,19 @@ static ATTACH_BROWSE: &[Binding] = &[
     binding!(Cmd::End, "last file", false; key(End)),
     binding!(Cmd::Confirm, "open the folder / choose the file", true; key(Enter)),
     binding!(Cmd::Right, "open the folder", false; key(Right)),
-    binding!(Cmd::ParentDir, "parent folder", true; key(Left)),
-    binding!(Cmd::ParentDir, "delete a filter character, else parent folder", false; key(Backspace)),
-    binding!(Cmd::ShowHidden, "show / hide hidden files (empty filter)", true; ch('.')),
-    binding!(Cmd::HomeDir, "home folder (empty filter)", true; ch('~')),
+    binding!(Cmd::ParentDir, "parent folder", true; key(Left), key(Backspace)),
+    binding!(Cmd::ShowHidden, "show / hide hidden files", true; ch('.')),
+    binding!(Cmd::HomeDir, "home folder", true; ch('~')),
+];
+
+/// The file browser with a filter typed: arrows and Home/End edit it.
+static ATTACH_FILTER: &[Binding] = &[
+    binding!(Cmd::Back, "close", true; key(Esc)),
+    binding!(Cmd::Up, "previous file", false; key(Up)),
+    binding!(Cmd::Down, "next file", false; key(Down)),
+    binding!(Cmd::PageUp, "page up", false; key(PageUp)),
+    binding!(Cmd::PageDown, "page down", false; key(PageDown)),
+    binding!(Cmd::Confirm, "open the folder / choose the file / go to the typed path", true; key(Enter)),
 ];
 
 static ATTACH_SEND: &[Binding] = &[
@@ -377,6 +436,8 @@ static SETTINGS: &[Binding] = &[
     binding!(Cmd::PrevTab, "previous tab", false; key(Left), key(BackTab)),
     binding!(Cmd::Up, "previous setting", false; key(Up), ch('k')),
     binding!(Cmd::Down, "next setting", false; key(Down), ch('j')),
+    binding!(Cmd::Home, "first setting", false; key(Home)),
+    binding!(Cmd::End, "last setting", false; key(End)),
     binding!(Cmd::Confirm, "change", true; key(Enter), ch(' ')),
 ];
 
@@ -396,11 +457,15 @@ fn tables(ctx: Ctx) -> [&'static [Binding]; 3] {
         Ctx::Form => FORM,
         Ctx::Pick => PICK,
         Ctx::AttachBrowse => ATTACH_BROWSE,
+        Ctx::AttachFilter => ATTACH_FILTER,
         Ctx::AttachSend => ATTACH_SEND,
         Ctx::Stickers => STICKERS,
         Ctx::Settings => SETTINGS,
     };
-    let edit = if matches!(ctx, Ctx::Compose | Ctx::Form) {
+    let edit = if matches!(
+        ctx,
+        Ctx::Compose | Ctx::Form | Ctx::ChatSearch | Ctx::Pick | Ctx::AttachFilter
+    ) {
         TEXT_EDIT
     } else {
         &[]
@@ -453,7 +518,7 @@ fn matches_key(key: Key, event: &KeyEvent) -> bool {
 pub fn is_typing(ctx: Ctx) -> bool {
     matches!(
         ctx,
-        Ctx::ChatSearch | Ctx::Compose | Ctx::Form | Ctx::Pick | Ctx::AttachBrowse
+        Ctx::ChatSearch | Ctx::Compose | Ctx::Form | Ctx::Pick | Ctx::AttachBrowse | Ctx::AttachFilter
     )
 }
 
@@ -469,6 +534,8 @@ pub fn hint(ctx: Ctx, available: impl Fn(Cmd) -> bool) -> String {
         .map(|b| {
             let keys = match b.cmd {
                 Cmd::Digit(_) => "1…9".to_owned(),
+                // The full list (with Ctrl-j) is on the help screen.
+                Cmd::NewLine => "Shift/Alt-Enter".to_owned(),
                 _ => display_keys(b.keys),
             };
             format!("{keys} {}", b.help)
@@ -476,6 +543,27 @@ pub fn hint(ctx: Ctx, available: impl Fn(Cmd) -> bool) -> String {
         .collect::<Vec<_>>()
         .join(" · ")
 }
+
+/// The message line's commands (typed and sent with `Enter`), listed after
+/// its keys on the help screen.
+const COMMANDS: &[(&str, &str)] = &[
+    (
+        "/attach [PATH]",
+        "send a photo, video or file (also /image, /file)",
+    ),
+    ("/sticker", "send a sticker"),
+    ("/location", "send a location"),
+    ("/contact", "share a contact"),
+    ("/save PATH", "save the chat's newest media to PATH"),
+    ("/menu", "the chat's menu"),
+    ("/mute, /unmute", "turn the chat's notifications off / on"),
+    ("/invite, /rename", "invite to / rename the group"),
+    ("/albums, /leave", "the group's albums / leave the group"),
+    ("/group", "new group"),
+    ("/settings, /help", "settings / these shortcuts"),
+    ("/quit", "quit"),
+    ("//text", "send \"/text\" as it is"),
+];
 
 /// Every binding of `ctx`, for the help screen.
 pub fn help_lines(ctx: Ctx) -> Vec<(String, &'static str)> {
@@ -490,6 +578,9 @@ pub fn help_lines(ctx: Ctx) -> Vec<(String, &'static str)> {
             _ => display_keys(b.keys),
         };
         lines.push((keys, b.help));
+    }
+    if ctx == Ctx::Compose {
+        lines.extend(COMMANDS.iter().map(|&(cmd, what)| (cmd.to_owned(), what)));
     }
     lines
 }
@@ -511,12 +602,16 @@ fn display_key(key: Key) -> String {
     if key.mods.contains(KeyModifiers::CONTROL) {
         label.push_str("Ctrl-");
         if let KeyCode::Char(c) = key.code {
-            label.push(c.to_ascii_uppercase());
+            label.push(c.to_ascii_lowercase());
             return label;
         }
     }
     if key.mods.contains(KeyModifiers::ALT) {
         label.push_str("Alt-");
+    }
+    // A character says Shift itself (`K`, `?`).
+    if key.mods.contains(KeyModifiers::SHIFT) && !matches!(key.code, KeyCode::Char(_)) {
+        label.push_str("Shift-");
     }
     label.push_str(&match key.code {
         Backspace => "Backspace".into(),
@@ -626,14 +721,63 @@ mod tests {
 
     #[test]
     fn text_fields_edit_at_the_cursor() {
-        for ctx in [Ctx::Compose, Ctx::Form] {
+        // Every text field edits with the same keys.
+        for ctx in [
+            Ctx::Compose,
+            Ctx::Form,
+            Ctx::ChatSearch,
+            Ctx::Pick,
+            Ctx::AttachFilter,
+        ] {
             assert_eq!(resolve(ctx, &plain(KeyCode::Left)), Some(Cmd::CursorLeft));
             assert_eq!(resolve(ctx, &plain(KeyCode::Right)), Some(Cmd::CursorRight));
             assert_eq!(resolve(ctx, &plain(KeyCode::Home)), Some(Cmd::LineStart));
+            assert_eq!(resolve(ctx, &plain(KeyCode::End)), Some(Cmd::LineEnd));
+            assert_eq!(
+                resolve(ctx, &plain(KeyCode::Backspace)),
+                Some(Cmd::DeleteBackward)
+            );
             assert_eq!(resolve(ctx, &plain(KeyCode::Delete)), Some(Cmd::DeleteForward));
         }
+        // An empty file filter leaves the arrows and Backspace to browsing.
+        assert_eq!(
+            resolve(Ctx::AttachBrowse, &plain(KeyCode::Left)),
+            Some(Cmd::ParentDir)
+        );
+        assert_eq!(
+            resolve(Ctx::AttachBrowse, &plain(KeyCode::Backspace)),
+            Some(Cmd::ParentDir)
+        );
+        assert_eq!(resolve(Ctx::AttachBrowse, &plain(KeyCode::Home)), Some(Cmd::Home));
         // Outside text, ← and → move between panes.
         assert_eq!(resolve(Ctx::Messages, &plain(KeyCode::Left)), Some(Cmd::Left));
+    }
+
+    #[test]
+    fn enter_sends_and_modified_enter_starts_a_line() {
+        let enter = |mods| resolve(Ctx::Compose, &event(KeyCode::Enter, mods));
+        assert_eq!(enter(KeyModifiers::NONE), Some(Cmd::Confirm));
+        assert_eq!(enter(KeyModifiers::SHIFT), Some(Cmd::NewLine));
+        assert_eq!(enter(KeyModifiers::ALT), Some(Cmd::NewLine));
+        assert_eq!(
+            resolve(Ctx::Compose, &event(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            Some(Cmd::NewLine)
+        );
+        assert_eq!(resolve(Ctx::Compose, &plain(KeyCode::Down)), Some(Cmd::Down));
+        // Only the message line takes several lines.
+        assert_eq!(
+            resolve(Ctx::Form, &event(KeyCode::Enter, KeyModifiers::SHIFT)),
+            None
+        );
+        let hint = hint(Ctx::Compose, |_| true);
+        assert!(hint.contains("Enter send · Shift/Alt-Enter new line"), "{hint}");
+        assert!(
+            help_lines(Ctx::Compose)
+                .iter()
+                .any(|(k, _)| k == "Shift-Enter/Alt-Enter/Ctrl-j"),
+            "{:?}",
+            help_lines(Ctx::Compose)
+        );
     }
 
     #[test]
@@ -688,7 +832,7 @@ mod tests {
         assert!(hint(Ctx::Menu, |_| true).contains("1…9 choose by number"));
         assert_eq!(help_key(Ctx::Compose), "F1 help");
         assert_eq!(help_key(Ctx::Messages), "? help");
-        assert_eq!(display_key(ctrl('o')), "Ctrl-O");
+        assert_eq!(display_key(ctrl('o')), "Ctrl-o");
     }
 
     #[test]

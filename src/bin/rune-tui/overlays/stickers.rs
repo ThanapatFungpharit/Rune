@@ -3,7 +3,7 @@
 //! packages: LINE rejects sending one you do not own (HTTP 400, reported
 //! live), and stickers you merely received are in the history too.
 
-use super::*;
+use crate::*;
 use rune::StickerPackage;
 use rune::store::StickerRef;
 
@@ -225,7 +225,7 @@ impl App {
 
     pub fn draw_stickers(&mut self, f: &mut Frame, area: Rect, s: &mut Stickers, hint: String) {
         let r = modal::popup(area, 100, area.height.saturating_sub(2).max(14));
-        f.render_widget(Clear, r);
+        crate::picture::cover(f, r);
         self.hit.modal = Some(r);
         let title = match &self.open {
             Some(chat) => format!(" 😀 Sticker to {} ", self.name(chat)),

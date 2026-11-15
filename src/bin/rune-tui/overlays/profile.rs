@@ -3,7 +3,7 @@
 //! blurred and darkened instead), a round avatar, the name and status
 //! message, Chat / Photo / Cover buttons, and members for groups.
 
-use super::*;
+use crate::*;
 use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
 use rune::PictureSize;
 
@@ -269,7 +269,7 @@ pub fn spawn_profile(
 impl App {
     /// Show a profile (on top of any profile already open).
     pub fn open_profile(&mut self, mid: String) {
-        if mid.is_empty() || imported_sender_name(&mid).is_some() {
+        if mid.is_empty() {
             self.status = "no profile for this message".into();
             return;
         }
@@ -521,7 +521,7 @@ impl App {
         let [area] = Layout::vertical([Constraint::Percentage(94)])
             .flex(Flex::Center)
             .areas(area);
-        f.render_widget(Clear, area);
+        crate::picture::cover(f, area);
         self.hit.profile = Some(area);
         let kind = if mid == self.me {
             " My profile "

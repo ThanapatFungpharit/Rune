@@ -18,9 +18,9 @@
 //! works while typing); the status line hints at the common ones. Arrows
 //! navigate (`j`/`k` are aliases in lists), `Enter` confirms or opens, `Esc`
 //! goes back and `m` opens the selected item's menu, which lists everything
-//! that can be done with it. `Ctrl-C` quits, `Ctrl-S` opens settings; with a
-//! chat open, `Ctrl-O` sends a photo/file/sticker/location/contact, `Ctrl-G`
-//! opens the chat's menu and `Ctrl-P` its profile — these work while typing.
+//! that can be done with it. `Ctrl-c` quits, `Ctrl-s` opens settings; with a
+//! chat open, `Ctrl-o` sends a photo/file/sticker/location/contact, `Ctrl-g`
+//! opens the chat's menu and `Ctrl-p` its profile — these work while typing.
 //!
 //! In a chat you type straight away (the line edits at a cursor: `←` `→`
 //! `Home` `End` `Delete`); `↑` steps up into the messages, `↓` past the
@@ -36,9 +36,10 @@
 //! The chat list starts with the active chats; moving to the last one loads
 //! older and hidden chats, a page at a time. Group invitations are listed
 //! first, in yellow: `Enter` on one asks whether to join or decline. Pins are
-//! kept in order per pin list (`K`/`J` move the selected pin). In the chat
+//! kept in order per pin list (`K`/`J` move the selected pin); unread pins
+//! sit at the top of the pinned section until read. In the chat
 //! list `/` searches chats, `m` opens the chat's menu (pin, pin lists,
-//! invite, rename, mute, leave, albums, import), `n` creates a group and `p`
+//! invite, rename, mute, leave, albums), `n` creates a group and `p`
 //! shows the chat's profile.
 //!
 //! Mouse: click a reaction line to see who reacted; click a chat to open it,
@@ -49,7 +50,7 @@
 //! scanned for QR codes, shown under the picture and in the viewer (`u`
 //! or a click opens a QR link).
 //!
-//! Profiles: `p` on a chat or message, `Ctrl-P` for the open chat, your own
+//! Profiles: `p` on a chat or message, `Ctrl-p` for the open chat, your own
 //! from Settings › Profile, or click the chat title or a sender's name. The
 //! page shows the picture, name, status message, buttons (`←`/`→` and
 //! `Enter`, or click) and, for groups, members; a member opens their profile,
@@ -57,7 +58,8 @@
 //!
 //! Commands in the input line: `/attach [PATH]` (also `/image`, `/file`),
 //! `/sticker`, `/location`, `/contact`, `/group`, `/invite`,
-//! `/leave`, `/settings`, `/save PATH` (latest media in this chat), `/quit`.
+//! `/leave`, `/settings`, `/help`, `/save PATH` (latest media in this chat), `/quit`
+//! (the message line's help screen lists them all, from `keymap::COMMANDS`).
 //! Pasting (or dropping) a file path into the input line offers to send it.
 //!
 //! GIFs, animated stickers (APNG) and animated WebPs play, looping, in the
@@ -74,7 +76,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange,
@@ -87,48 +89,27 @@ use qrcode::render::unicode::Dense1x2;
 use ratatui::layout::{Constraint, Flex, Layout, Position, Rect, Size};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use ratatui_image::FilterType;
 use ratatui_image::picker::Picker;
 use ratatui_image::picker::ProtocolType;
 
-#[path = "rune-tui/albums.rs"]
-mod albums;
-#[path = "rune-tui/anim.rs"]
-mod anim;
-#[path = "rune-tui/attach.rs"]
-mod attach;
-#[path = "rune-tui/avatar.rs"]
-mod avatar;
-#[path = "rune-tui/cells.rs"]
-mod cells;
-#[path = "rune-tui/history_import.rs"]
-mod history_import;
-#[path = "rune-tui/input.rs"]
+mod graphics;
 mod input;
-#[path = "rune-tui/keymap.rs"]
 mod keymap;
-#[path = "rune-tui/links.rs"]
 mod links;
-#[path = "rune-tui/modal.rs"]
-mod modal;
-#[path = "rune-tui/picture.rs"]
-mod picture;
-#[path = "rune-tui/profile.rs"]
-mod profile;
-#[path = "rune-tui/settings.rs"]
-mod settings;
-#[path = "rune-tui/stickers.rs"]
-mod stickers;
+mod overlays;
 use albums::media_type;
 use avatar::{Avatar, HEAD_AVATAR, LIST_AVATAR};
 use cells::CellMode;
-use input::TextInput;
+use graphics::{anim, avatar, cells, piccache, picture};
+use input::{Edit, TextInput};
 use modal::{Action, Modal};
-use picture::Picture;
+use overlays::{albums, attach, modal, profile, settings, stickers};
+use piccache::PicCache;
+use picture::{Layer, Picture};
 use profile::{ProfileAction, ProfileData, ProfileLoaded};
-use rune::import::{imported_sender_name, is_imported_id};
 use rune::models::{Operation, content_type as ct, op_type};
 use rune::ops::message_id_cmp;
 use rune::store::{ChatRow, UserRow};
@@ -206,8 +187,6 @@ struct UiMsg {
     unsent: bool,
     /// `deliveredTime`, the cursor for older history.
     delivered: i64,
-    /// Read from a LINE chat export: only stored locally, the server does not know it.
-    imported: bool,
 }
 
 impl UiMsg {
@@ -316,6 +295,20 @@ struct Downloaded {
 }
 
 /// Look for QR codes in a picture off the UI thread.
+/// `img` scaled down (never up) to fit `cap` pixels, off the UI thread.
+async fn shrink(img: image::DynamicImage, cap: (u32, u32)) -> image::DynamicImage {
+    tokio::task::spawn_blocking(move || shrink_now(img, cap))
+        .await
+        .unwrap_or_else(|_| image::DynamicImage::new_rgb8(1, 1))
+}
+
+fn shrink_now(img: image::DynamicImage, cap: (u32, u32)) -> image::DynamicImage {
+    if img.width() <= cap.0 && img.height() <= cap.1 {
+        return img;
+    }
+    img.resize(cap.0.max(1), cap.1.max(1), FilterType::CatmullRom)
+}
+
 async fn scan_qr(img: image::DynamicImage) -> (image::DynamicImage, Vec<String>) {
     tokio::task::spawn_blocking(move || {
         let qr = links::scan_qr(&img);
@@ -337,6 +330,13 @@ enum After {
 
 /// Inline thumbnail sizes (columns × rows), picked in Settings › Chats.
 const THUMB_SIZES: [(u16, u16); 4] = [(32, 8), (48, 14), (64, 20), (96, 30)];
+/// Memory for decoded inline thumbnails; past it the least recently drawn
+/// go (and are fetched again if scrolled back to). See `piccache`.
+const THUMB_CACHE_BYTES: usize = 128 * 1024 * 1024;
+/// Memory for the sticker picker's pictures.
+const STICKER_CACHE_BYTES: usize = 32 * 1024 * 1024;
+/// Memory for the file browser's previews (≤1600 px each).
+const PREVIEW_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// Scaling for inline thumbnails: Lanczos keeps block-glyph pictures sharp
 /// (nearest-neighbour makes them noisy).
 const THUMB_FILTER: FilterType = FilterType::Lanczos3;
@@ -425,8 +425,10 @@ struct App {
     typing: HashMap<String, (String, std::time::Instant)>,
     /// Uploads in progress: chat, label.
     uploads: Vec<(String, String)>,
-    sticker_pics: HashMap<String, Load<Picture>>,
-    file_previews: HashMap<String, Load<Picture>>,
+    /// The sticker picker's pictures (see `STICKER_CACHE_BYTES`).
+    sticker_pics: PicCache<Picture>,
+    /// The file browser's previews (see `PREVIEW_CACHE_BYTES`).
+    file_previews: PicCache<Picture>,
     server_settings: Option<Load<serde_json::Value>>,
     /// Our name and status message, for the settings page.
     my_profile: Option<Load<(String, String)>>,
@@ -437,8 +439,6 @@ struct App {
     older_loading: HashSet<String>,
     /// Chats whose whole history is loaded.
     no_older: HashSet<String>,
-    /// Chats whose server history is loaded to its start (imported messages may be older).
-    server_done: HashSet<String>,
     /// The conversation is scrolled to its oldest loaded row.
     at_top: bool,
     /// Boundary between read and unread messages in one chat.
@@ -451,7 +451,7 @@ struct App {
     /// The chat list is filtering its entries.
     searching: bool,
     /// Name or participant query shown in the chat-list search field.
-    chat_query: String,
+    chat_query: TextInput,
     /// Chat mids pinned in the active pin list, in display order.
     pinned: Vec<String>,
     /// The active pin list's name, when the account has more than one
@@ -480,7 +480,8 @@ struct App {
     quit: bool,
     /// Selected message (index into the open chat's messages).
     sel: Option<usize>,
-    thumbs: HashMap<String, Load<Picture>>,
+    /// Inline pictures, per message id (see `THUMB_CACHE_BYTES`).
+    thumbs: PicCache<Picture>,
     full: HashMap<String, Load<FullMedia>>,
     /// Downloaded originals in `full`, least recently used first (see `FULL_CACHE_BYTES`).
     full_lru: Vec<String>,
@@ -513,7 +514,25 @@ struct App {
     hit: HitAreas,
     /// Message id the next text message replies to.
     replying: Option<String>,
+    /// The message lines of chats other than the open one: switching chats
+    /// puts the line away with its chat, so a draft never goes to another.
+    drafts: HashMap<String, Draft>,
+    /// The key being handled came in a burst of keys: a paste typed out by a
+    /// terminal without bracketed paste. Its Enters are line breaks, not sends.
+    pasting: bool,
 }
+
+/// An unsent message line, kept per chat.
+struct Draft {
+    input: TextInput,
+    replying: Option<String>,
+}
+
+/// Store key prefix of draft texts (a `cache.` key: wiped with the chats).
+const DRAFT_KEY: &str = "cache.draft.";
+
+/// The composer grows with its text up to this many rows (and a third of the screen).
+const INPUT_MAX_ROWS: u16 = 10;
 
 /// Screen areas from the last frame.
 #[derive(Default)]
@@ -719,9 +738,6 @@ fn call_line(m: &Message) -> String {
     format!("{icon} {call}{}", if missed { " ✗" } else { "" })
 }
 
-/// Why imported messages cannot be replied to, reacted to, unsent…
-const IMPORTED_ONLY_LOCAL: &str = "imported from a chat export: this message exists only on this computer";
-
 /// What an unsent message turns into.
 const UNSENT_TEXT: &str = "🚫 message unsent";
 
@@ -742,7 +758,6 @@ fn to_ui(m: &Message, e2ee_error: Option<&str>) -> Option<UiMsg> {
         reactions: m.reactions(),
         unsent: false,
         delivered: m.delivered_time().or(m.created_time).unwrap_or(0),
-        imported: is_imported_id(&m.id),
     })
 }
 
@@ -1068,7 +1083,9 @@ fn open_external(path: &std::path::Path) -> std::io::Result<()> {
 /// Fetch the picture shown inline for a message. LINE's previews are tiny
 /// (≤384 px, JPEG quality 0.3), so images use the main picture (≤1280 px)
 /// and fall back to the preview; videos only have the preview frame.
-fn spawn_thumb(client: Client, tx: mpsc::UnboundedSender<AppEvent>, m: Message) {
+/// The picture is shrunk to `cap` pixels (what the largest thumbnail can
+/// show) once QR codes have been looked for at full size.
+fn spawn_thumb(client: Client, tx: mpsc::UnboundedSender<AppEvent>, m: Message, cap: (u32, u32)) {
     tokio::spawn(async move {
         let bytes = match media_type(&m) {
             ct::STICKER => {
@@ -1083,8 +1100,14 @@ fn spawn_thumb(client: Client, tx: mpsc::UnboundedSender<AppEvent>, m: Message) 
         };
         let res = match bytes {
             Ok(b) => match decode_picture(b).await {
-                Ok(img) if media_type(&m) == ct::IMAGE => Ok(scan_qr(img).await),
-                Ok(img) => Ok((img, Vec::new())),
+                Ok(img) => {
+                    let (img, qr) = if media_type(&m) == ct::IMAGE {
+                        scan_qr(img).await
+                    } else {
+                        (img, Vec::new())
+                    };
+                    Ok((shrink(img, cap).await, qr))
+                }
                 Err(e) => Err(e),
             },
             Err(e) => Err(e.to_string()),
@@ -1195,6 +1218,22 @@ fn spawn_full(client: Client, tx: mpsc::UnboundedSender<AppEvent>, m: Message) {
 }
 
 /// The character a key types, if it types one (no Ctrl/Alt chords).
+/// A status saying something went wrong (shown in red).
+fn status_is_error(status: &str) -> bool {
+    let s = status.to_lowercase();
+    [
+        "could not",
+        "couldn't",
+        "cannot",
+        "can't",
+        "failed",
+        "error",
+        "no such",
+    ]
+    .iter()
+    .any(|w| s.contains(w))
+}
+
 fn typed_char(k: &KeyEvent) -> Option<char> {
     match k.code {
         KeyCode::Char(c)
@@ -1552,8 +1591,7 @@ fn spawn_history(client: Client, tx: mpsc::UnboundedSender<AppEvent>, store: Sto
         let res = async {
             let mut msgs = client.recent_messages(&chat, 60).await?;
             msgs.reverse();
-            // Imported messages are not on the server; join up with what came from it.
-            let newest_stored = store.newest_fetched_message(&chat).ok().flatten();
+            let newest_stored = store.newest_message(&chat).ok().flatten();
             if let Some(stored) = newest_stored.map(|s| s.message) {
                 let mut joined = msgs.iter().any(|m| message_id_cmp(&m.id, &stored.id).is_le());
                 let mut pages = 0;
@@ -1576,7 +1614,7 @@ fn spawn_history(client: Client, tx: mpsc::UnboundedSender<AppEvent>, store: Sto
                 }
                 if !joined {
                     tracing::info!(%chat, "history gap too large; dropping stored messages");
-                    let _ = store.clear_fetched_messages(&chat);
+                    let _ = store.clear_messages(&chat);
                 }
             }
             let mut out = Vec::with_capacity(msgs.len());
@@ -1696,22 +1734,21 @@ impl App {
             read_marks: HashMap::new(),
             typing: HashMap::new(),
             uploads: Vec::new(),
-            sticker_pics: HashMap::new(),
-            file_previews: HashMap::new(),
+            sticker_pics: PicCache::new(STICKER_CACHE_BYTES),
+            file_previews: PicCache::new(PREVIEW_CACHE_BYTES),
             server_settings: None,
             my_profile: None,
             stale: HashSet::new(),
             resync: HashSet::new(),
             older_loading: HashSet::new(),
             no_older: HashSet::new(),
-            server_done: HashSet::new(),
             at_top: false,
             unread_divider: None,
             jump_unread: false,
             focused: true,
             chats: Vec::new(),
             searching: false,
-            chat_query: String::new(),
+            chat_query: TextInput::default(),
             pinned: Vec::new(),
             pin_list: None,
             list: ListState::default(),
@@ -1730,7 +1767,7 @@ impl App {
             status: String::new(),
             quit: false,
             sel: None,
-            thumbs: HashMap::new(),
+            thumbs: PicCache::new(THUMB_CACHE_BYTES),
             full: HashMap::new(),
             full_lru: Vec::new(),
             pending: HashMap::new(),
@@ -1747,8 +1784,21 @@ impl App {
             follow_sel: false,
             hit: HitAreas::default(),
             replying: None,
+            drafts: HashMap::new(),
+            pasting: false,
         };
         app.reload_pins();
+        for (key, text) in app.store.values_with_prefix(DRAFT_KEY).unwrap_or_default() {
+            let input = TextInput::from(text);
+            let mid = key[DRAFT_KEY.len()..].to_owned();
+            app.drafts.insert(
+                mid,
+                Draft {
+                    input,
+                    replying: None,
+                },
+            );
+        }
         // Chat list, names and friends from the last run, before any request.
         for row in app.store.chats().unwrap_or_default() {
             if !row.name.is_empty() {
@@ -1789,9 +1839,6 @@ impl App {
     fn name(&self, mid: &str) -> String {
         if mid == self.me {
             return "You".into();
-        }
-        if let Some(n) = imported_sender_name(mid) {
-            return if n.is_empty() { "LINE".into() } else { n.to_owned() };
         }
         match self.names.get(mid).filter(|n| !n.is_empty()) {
             Some(n) => n.clone(),
@@ -1880,7 +1927,7 @@ impl App {
     }
 
     fn visible_chats(&self) -> Vec<usize> {
-        if !self.searching || self.chat_query.trim().is_empty() {
+        if !self.searching || self.chat_query.as_str().trim().is_empty() {
             return (0..self.chats.len()).collect();
         }
         self.chats
@@ -1892,7 +1939,7 @@ impl App {
     }
 
     fn chat_matches(&self, chat: &ChatEntry) -> bool {
-        let query = self.chat_query.trim().to_lowercase();
+        let query = self.chat_query.as_str().trim().to_lowercase();
         if query.is_empty() {
             return true;
         }
@@ -1919,7 +1966,13 @@ impl App {
 
     fn set_chat_query(&mut self, query: String) {
         let selected = self.selected_mid();
-        self.chat_query = query;
+        self.chat_query.set(query);
+        self.chat_query_changed(selected);
+    }
+
+    /// The query was edited: keep the selected chat if it still matches,
+    /// else select the first match.
+    fn chat_query_changed(&mut self, selected: Option<String>) {
         let visible = self.visible_chats();
         let selected = selected
             .as_deref()
@@ -1945,14 +1998,14 @@ impl App {
             return None;
         }
         match unread {
-            Unread::After(anchor) => msgs.iter().position(|m| {
-                !m.id.is_empty() && !m.imported && m.from != self.me && message_id_cmp(&m.id, anchor).is_gt()
-            }),
+            Unread::After(anchor) => msgs
+                .iter()
+                .position(|m| !m.id.is_empty() && m.from != self.me && message_id_cmp(&m.id, anchor).is_gt()),
             Unread::Last(n) => msgs
                 .iter()
                 .enumerate()
                 .rev()
-                .filter(|(_, m)| !m.id.is_empty() && !m.imported && m.from != self.me)
+                .filter(|(_, m)| !m.id.is_empty() && m.from != self.me)
                 .nth(n.saturating_sub(1) as usize)
                 .map(|(i, _)| i),
         }
@@ -2033,11 +2086,7 @@ impl App {
             let marks = self.store.read_marks(&mid).unwrap_or_default();
             self.read_marks.insert(mid.clone(), marks);
         }
-        // Only imported messages: LINE's own history still has to be fetched.
-        let empty = self
-            .messages
-            .get(&mid)
-            .is_none_or(|v| v.iter().all(|m| m.imported));
+        let empty = self.messages.get(&mid).is_none_or(Vec::is_empty);
         let suspect = self.stale.contains(&mid) || self.resync.contains(&mid);
         if (empty || suspect) && self.loading.insert(mid.clone()) {
             self.status = "loading…".into();
@@ -2057,9 +2106,11 @@ impl App {
             });
         }
         self.persist_chat(&mid);
-        if self.open.as_deref() != Some(mid.as_str()) {
-            self.replying = None;
+        if has_unread {
+            // A pinned chat that floated while unread returns to its pin position.
+            self.sort_chats(self.selected_mid());
         }
+        self.switch_draft(Some(&mid));
         self.open = Some(mid);
         self.scroll = 0;
         self.sel = None;
@@ -2085,6 +2136,43 @@ impl App {
         let _ = self.store.upsert_chat(&row);
     }
 
+    /// Put the message line away with the open chat and bring back `to`'s.
+    fn switch_draft(&mut self, to: Option<&str>) {
+        if self.open.as_deref() == to {
+            return;
+        }
+        let draft = Draft {
+            input: std::mem::take(&mut self.input),
+            replying: self.replying.take(),
+        };
+        if let Some(from) = self.open.clone() {
+            self.save_draft(&from, &draft.input);
+            if !draft.input.as_str().trim().is_empty() {
+                self.drafts.insert(from, draft);
+            }
+        }
+        if let Some(d) = to.and_then(|mid| self.drafts.remove(mid)) {
+            self.input = d.input;
+            self.replying = d.replying;
+        }
+    }
+
+    /// Keep a chat's draft text across restarts (or forget it once empty).
+    fn save_draft(&self, mid: &str, input: &TextInput) {
+        let key = format!("{DRAFT_KEY}{mid}");
+        let _ = match input.as_str().trim() {
+            "" => self.store.remove(&key),
+            _ => self.store.set(&key, input.as_str()),
+        };
+    }
+
+    /// The open chat's draft, at exit.
+    fn save_open_draft(&self) {
+        if let Some(mid) = &self.open {
+            self.save_draft(mid, &self.input);
+        }
+    }
+
     /// Forget a chat (left, declined, removed).
     fn remove_chat(&mut self, mid: &str) {
         let selected = self.selected_mid();
@@ -2100,17 +2188,19 @@ impl App {
             &mut self.resync,
             &mut self.older_loading,
             &mut self.no_older,
-            &mut self.server_done,
         ] {
             set.remove(mid);
         }
         self.read_marks.remove(mid);
         self.typing.remove(mid);
+        self.drafts.remove(mid);
+        let _ = self.store.remove(&format!("{DRAFT_KEY}{mid}"));
         let _ = self.store.delete_chat(mid);
         if self.open.as_deref() == Some(mid) {
             self.open = None;
             self.sel = None;
             self.replying = None;
+            self.input.clear();
             self.focus = Focus::Chats;
             // The viewer only ever shows the open chat's media.
             if self.viewer.is_some() {
@@ -2162,7 +2252,17 @@ impl App {
             return;
         }
         let selected = self.selected_mid();
-        self.sort_chats(selected);
+        if pinned && selected.as_deref() == Some(mid) {
+            // Pinning the selected chat moves it up; the selection stays at the
+            // same list position so the next chat down is selected.
+            let index = self.list.selected();
+            self.sort_chats(None);
+            let visible_len = self.visible_chats().len();
+            self.list
+                .select(index.map(|i| i.min(visible_len.saturating_sub(1))));
+        } else {
+            self.sort_chats(selected);
+        }
         self.status = format!(
             "{} {}",
             if pinned { "pinned" } else { "unpinned" },
@@ -2238,8 +2338,6 @@ impl App {
     }
 
     /// Scrolled past the oldest loaded message: load more (store first, then LINE).
-    /// Imported messages wait until LINE has nothing older, so server
-    /// history between them and the loaded messages is not skipped.
     fn load_older(&mut self) {
         let Some(chat) = self.open.clone() else { return };
         if self.older_loading.contains(&chat) || self.no_older.contains(&chat) || self.loading.contains(&chat)
@@ -2252,43 +2350,25 @@ impl App {
         let Some(oldest) = list.iter().find(|m| !m.id.is_empty()).cloned() else {
             return;
         };
-        let oldest_real = list.iter().find(|m| !m.id.is_empty() && !m.imported).cloned();
-        let server_open = !self.server_done.contains(&chat) && oldest_real.is_some();
-        let mut stored = self
+        let stored = self
             .store
             .messages(&chat, 100, Some(&oldest.id))
             .unwrap_or_default();
-        if server_open {
-            // Only the stored messages newer than the first imported one.
-            let keep_from = stored
-                .iter()
-                .rposition(|m| is_imported_id(&m.message.id))
-                .map_or(0, |i| i + 1);
-            stored.drain(..keep_from);
-        }
         if !stored.is_empty() {
             let ui = stored.iter().filter_map(stored_to_ui).collect();
             let n = self.prepend(&chat, ui);
             self.status = format!("{n} older messages");
             return;
         }
-        match oldest_real.filter(|_| server_open) {
-            Some(real) => {
-                self.older_loading.insert(chat.clone());
-                self.status = "loading older messages…".into();
-                spawn_older(
-                    self.client.clone(),
-                    self.tx.clone(),
-                    chat,
-                    real.id,
-                    real.delivered,
-                );
-            }
-            None => {
-                self.no_older.insert(chat);
-                self.status = "this is the beginning of the conversation".into();
-            }
-        }
+        self.older_loading.insert(chat.clone());
+        self.status = "loading older messages…".into();
+        spawn_older(
+            self.client.clone(),
+            self.tx.clone(),
+            chat,
+            oldest.id,
+            oldest.delivered,
+        );
     }
 
     /// Rebuild a chat's loaded messages from the store (time order), keeping
@@ -2313,6 +2393,10 @@ impl App {
     /// Send any message, showing it once LINE accepted it.
     fn send_outgoing(&mut self, chat: String, out: OutgoingMessage, label: String) {
         self.status = "sending…".into();
+        // What we send shows at the bottom: go there, as if scrolled back down.
+        if self.open.as_deref() == Some(chat.as_str()) {
+            self.scroll = 0;
+        }
         let (client, tx, me) = (self.client.clone(), self.tx.clone(), self.me.clone());
         tokio::spawn(async move {
             match client.send_message(&out).await {
@@ -2330,7 +2414,6 @@ impl App {
                         reactions: Vec::new(),
                         unsent: false,
                         delivered: 0,
-                        imported: false,
                     });
                     ui.from = me;
                     let _ = tx.send(AppEvent::Sent(chat, Box::new(ui), Some(Box::new(m))));
@@ -2398,6 +2481,7 @@ impl App {
                             c.unread = 0;
                             c.last_seen = Some(m.id.clone());
                         }
+                        self.sort_chats(self.selected_mid());
                     } else {
                         self.maybe_notify(&chat, m);
                         if self.read_receipts() && self.open.as_deref() == Some(chat.as_str()) {
@@ -2454,6 +2538,7 @@ impl App {
                     c.last_seen = Some(message_id.to_owned());
                 }
                 self.persist_chat(chat);
+                self.sort_chats(self.selected_mid());
             }
             OpEvent::Unsent { chat, message_id, .. } => {
                 let mut was_last = false;
@@ -2593,6 +2678,24 @@ impl App {
         }
     }
 
+    /// Pixels the largest inline thumbnail can show: thumbnails are kept no
+    /// bigger. Text-cell pictures get twice their sub-cell grid, for a
+    /// smoother downscale.
+    fn thumb_cap(&self) -> (u32, u32) {
+        let (cols, rows) = THUMB_SIZES[THUMB_SIZES.len() - 1];
+        let (fw, fh) = match &self.picker {
+            Some(p) => {
+                let font = p.font_size();
+                (u32::from(font.width), u32::from(font.height))
+            }
+            None => {
+                let (gw, gh) = self.cell_mode.grid();
+                (gw * 2, gh * 2)
+            }
+        };
+        (u32::from(cols) * fw.max(1), u32::from(rows) * fh.max(1))
+    }
+
     /// Keep a downloaded original, dropping the least recently used ones
     /// (never the one on screen) once they hold more than `FULL_CACHE_BYTES`.
     fn remember_full(&mut self, id: String, media: FullMedia) {
@@ -2727,15 +2830,40 @@ impl App {
     }
 
     /// Insert a message into a chat (deduplicated by id) and bump the chat.
+    /// A chat whose messages are not loaded only has its entry bumped: the
+    /// message is in the store already and shows, after the stored history,
+    /// once the chat is opened.
     fn push_message(&mut self, chat: &str, msg: UiMsg, unread: bool) {
-        let list = self.messages.entry(chat.to_owned()).or_default();
-        if list.iter().any(|m| m.id == msg.id && !msg.id.is_empty()) {
-            return;
-        }
         let preview = msg.text.clone();
         let time = msg.time;
         let id = (!msg.id.is_empty()).then(|| msg.id.clone());
-        list.push(msg);
+        match self.messages.get_mut(chat) {
+            Some(list) => {
+                if list.iter().any(|m| m.id == msg.id && !msg.id.is_empty()) {
+                    return;
+                }
+                list.push(msg);
+            }
+            None => {
+                // No list to deduplicate against: a message no newer than the
+                // chat's newest is not news (e.g. replayed).
+                let known = self
+                    .chats
+                    .iter()
+                    .find(|c| c.mid == chat)
+                    .and_then(|c| c.last_id.as_deref());
+                if let (Some(id), Some(newest)) = (id.as_deref(), known)
+                    && message_id_cmp(id, newest).is_le()
+                {
+                    return;
+                }
+                // The open chat is fetching its history (nothing was stored):
+                // show the message now, the history merges in when it lands.
+                if self.open.as_deref() == Some(chat) {
+                    self.messages.insert(chat.to_owned(), vec![msg]);
+                }
+            }
+        }
         let selected = self.selected_mid();
         match self.chats.iter_mut().find(|c| c.mid == chat) {
             Some(c) => {
@@ -2887,13 +3015,21 @@ impl App {
 
     fn sort_chats(&mut self, keep_selected: Option<String>) {
         // Invitations stay first, then pinned chats, then recent activity.
-        self.chats.sort_by_key(|c| {
+        // Pinned chats with unread messages float to the top of the pinned
+        // section (among themselves in pin order) until they are read, then
+        // drop back to their pin position: the pin order itself never changes.
+        self.chats.sort_by_cached_key(|c| {
             let pin_position = self.pinned.iter().position(|mid| mid == &c.mid);
+            let pinned = pin_position.is_some() && !c.invited;
             (
                 std::cmp::Reverse(c.invited),
-                std::cmp::Reverse(pin_position.is_some() && !c.invited),
+                std::cmp::Reverse(pinned),
+                std::cmp::Reverse(pinned && c.unread > 0),
                 pin_position.unwrap_or(usize::MAX),
                 std::cmp::Reverse(c.last_time),
+                // Never the name (display-only, may collide): the mid makes
+                // equal-time chats deterministic.
+                c.mid.clone(),
             )
         });
         if let Some(sel) = keep_selected {
@@ -2949,28 +3085,18 @@ impl App {
             }
             AppEvent::Older(chat, msgs, done) => {
                 self.older_loading.remove(&chat);
-                if done {
-                    self.server_done.insert(chat.clone());
-                }
                 let _ = self.store.put_messages(&chat, &msgs, None);
-                let n = if self.store.imported_count(&chat).unwrap_or(0) > 0 {
-                    // Fetched messages may land between imported ones (and replace copies of them).
-                    let before = self.messages.get(&chat).map_or(0, Vec::len);
-                    self.reload_from_store(&chat, before + msgs.len());
-                    self.messages
-                        .get(&chat)
-                        .map_or(0, Vec::len)
-                        .saturating_sub(before)
-                } else {
-                    let ui: Vec<UiMsg> = msgs.iter().filter_map(|m| to_ui(m, None)).collect();
-                    self.prepend(&chat, ui)
-                };
-                if n == 0 && done {
-                    // Nothing more from LINE: go on with imported messages, if any.
-                    self.load_older();
-                } else {
-                    self.status = format!("{n} older messages");
+                let ui: Vec<UiMsg> = msgs.iter().filter_map(|m| to_ui(m, None)).collect();
+                let n = self.prepend(&chat, ui);
+                if done {
+                    // Nothing older on the server (the store was read before asking it).
+                    self.no_older.insert(chat);
                 }
+                self.status = if n == 0 && done {
+                    "this is the beginning of the conversation".into()
+                } else {
+                    format!("{n} older messages")
+                };
             }
             AppEvent::Incoming(op) => self.on_operation(*op),
             AppEvent::Control(name, data) => {
@@ -3005,6 +3131,7 @@ impl App {
                     c.last_seen = c.last_id.clone();
                 }
                 self.persist_chat(&chat);
+                self.sort_chats(self.selected_mid());
                 self.status = "sent".into();
             }
             AppEvent::Status(s) => self.status = s,
@@ -3358,11 +3485,14 @@ impl App {
         self.messages.clear();
         self.read_marks.clear();
         self.no_older.clear();
-        self.server_done.clear();
         self.stale.clear();
         self.reload_pins();
         self.chats.clear();
         self.more_chats = MoreChats::Ready(None);
+        // The store dropped the drafts with the chats.
+        self.drafts.clear();
+        self.input.clear();
+        self.replying = None;
         self.open = None;
         self.focus = Focus::Chats;
         self.list.select(None);
@@ -3377,7 +3507,12 @@ impl App {
         if text.is_empty() {
             return;
         }
+        if let Some(chat) = &self.open {
+            let _ = self.store.remove(&format!("{DRAFT_KEY}{chat}"));
+        }
+        // Several lines are a message, never a command.
         let (cmd, arg) = match text.split_once(char::is_whitespace) {
+            _ if text.contains('\n') => ("", ""),
             Some((c, a)) => (c, a.trim()),
             None => (text.as_str(), ""),
         };
@@ -3385,6 +3520,7 @@ impl App {
         match cmd {
             "/quit" => return self.quit = true,
             "/settings" => return self.open_settings(),
+            "/help" => return self.open_help(keymap::Ctx::Compose),
             "/group" | "/newgroup" => return self.run_action(Action::NewGroup),
             "/join" => {
                 self.status = "LINE's Chrome protocol cannot join by invitation link or QR code \
@@ -3433,7 +3569,8 @@ impl App {
             format!("/{rest}")
         } else if text.starts_with('/') && !text.contains(char::is_whitespace) && text.len() < 20 {
             self.input.set(text.clone());
-            self.status = format!("unknown command {cmd} (start with // to send it as text)");
+            self.status =
+                format!("unknown command {cmd} (start with // to send it as text; /help lists keys)");
             return;
         } else {
             text
@@ -3547,11 +3684,6 @@ impl App {
         use keymap::Cmd;
         match cmd {
             Some(Cmd::Back) => self.end_search(),
-            Some(Cmd::DeleteBackward) => {
-                let mut query = self.chat_query.clone();
-                query.pop();
-                self.set_chat_query(query);
-            }
             Some(Cmd::Confirm) => {
                 if let Some(mid) = self.selected_mid() {
                     self.enter_chat(mid);
@@ -3563,14 +3695,18 @@ impl App {
                 self.end_search();
                 self.focus = Focus::Input;
             }
-            None => {
-                if let Some(c) = typed_char(k) {
-                    let mut query = self.chat_query.clone();
-                    query.push(c);
-                    self.set_chat_query(query);
+            cmd => {
+                let selected = self.selected_mid();
+                match self.chat_query.edit(cmd, k) {
+                    Edit::Changed => self.chat_query_changed(selected),
+                    // Only → past the end leaves; End or Delete there stay in the field.
+                    Edit::MovedHitRight if cmd == Some(Cmd::CursorRight) && self.open.is_some() => {
+                        self.end_search();
+                        self.focus = Focus::Input;
+                    }
+                    _ => {}
                 }
             }
-            _ => {}
         }
     }
 
@@ -3587,6 +3723,14 @@ impl App {
             Some(Cmd::Down) => self.move_chat_sel(1),
             Some(Cmd::PageUp) => self.move_chat_sel(-self.chat_page()),
             Some(Cmd::PageDown) => self.move_chat_sel(self.chat_page()),
+            Some(Cmd::Home) => {
+                let first = (!self.visible_chats().is_empty()).then_some(0);
+                self.list.select(first);
+            }
+            Some(Cmd::End) => {
+                let last = self.visible_chats().len().checked_sub(1);
+                self.list.select(last);
+            }
             Some(Cmd::Confirm) => {
                 if let Some(mid) = selected {
                     self.enter_chat(mid);
@@ -3619,33 +3763,42 @@ impl App {
 
     fn compose_key(&mut self, cmd: Option<keymap::Cmd>, k: &KeyEvent) {
         use keymap::Cmd;
+        let width = self.input_width();
         match cmd {
+            // A pasted line break is not a request to send half of the paste.
+            Some(Cmd::Confirm) if self.pasting => {
+                self.input.insert('\n');
+                self.status = "pasted text keeps its line breaks — Enter sends it".into();
+            }
             Some(Cmd::Confirm) => self.submit(),
+            Some(Cmd::NewLine) => self.input.insert('\n'),
             Some(Cmd::Back) if self.replying.take().is_some() => {
                 self.status = "reply cancelled".into();
             }
             Some(Cmd::Back | Cmd::SwitchFocus) => self.focus = Focus::Chats,
+            Some(Cmd::Up) if self.input.move_row(-1, width) => {}
+            Some(Cmd::Down) => {
+                self.input.move_row(1, width);
+            }
             Some(Cmd::Up) => self.select_msg(self.open_messages().len().checked_sub(1)),
             Some(Cmd::PageUp) => self.scroll_by(10),
             Some(Cmd::PageDown) => self.scroll_by(-10),
-            Some(Cmd::CursorLeft) => self.input.left(),
-            Some(Cmd::CursorRight) => self.input.right(),
-            Some(Cmd::LineStart) => self.input.home(),
-            Some(Cmd::LineEnd) => self.input.end(),
-            Some(Cmd::DeleteBackward) => self.input.backspace(),
-            Some(Cmd::DeleteForward) => self.input.delete(),
-            None => {
-                if let Some(c) = typed_char(k) {
-                    self.input.insert(c);
+            cmd => {
+                // Only ← past the start leaves; Home, Backspace or Delete there stay in the line.
+                if self.input.edit(cmd, k) == Edit::MovedHitLeft && cmd == Some(Cmd::CursorLeft) {
+                    self.focus = Focus::Chats;
                 }
             }
-            _ => {}
         }
+    }
+
+    /// Text columns of the composer as last drawn (0 before the first frame: no wrapping).
+    fn input_width(&self) -> usize {
+        self.hit.input.width.saturating_sub(2) as usize
     }
 
     fn messages_key(&mut self, cmd: Option<keymap::Cmd>, k: &KeyEvent) {
         use keymap::Cmd;
-        let imported = self.selected_msg().is_some_and(|m| m.imported);
         match cmd {
             Some(Cmd::Up) => {
                 if self.sel == Some(0) {
@@ -3664,6 +3817,8 @@ impl App {
             Some(Cmd::Right | Cmd::Back) => self.focus = Focus::Input,
             Some(Cmd::PageUp) => self.scroll_by(10),
             Some(Cmd::PageDown) => self.scroll_by(-10),
+            Some(Cmd::Home) => self.select_msg((!self.open_messages().is_empty()).then_some(0)),
+            Some(Cmd::End) => self.select_msg(self.open_messages().len().checked_sub(1)),
             Some(Cmd::Confirm) if self.selected_msg().is_some_and(UiMsg::plays) => self.play_selected(),
             Some(Cmd::Confirm) => {
                 let media = self.selected_msg().is_some_and(|m| m.media_kind().is_some());
@@ -3673,7 +3828,6 @@ impl App {
             }
             Some(Cmd::Reply) => self.start_reply(),
             Some(Cmd::Menu) => self.message_menu(),
-            Some(Cmd::React | Cmd::Unsend) if imported => self.status = IMPORTED_ONLY_LOCAL.into(),
             Some(Cmd::React) => {
                 if let Some(id) = self
                     .selected_msg()
@@ -3709,7 +3863,7 @@ impl App {
     }
 
     fn can_unsend(&self, m: &UiMsg) -> bool {
-        m.from == self.me && !m.unsent && !m.id.is_empty() && !m.imported
+        m.from == self.me && !m.unsent && !m.id.is_empty()
     }
 
     /// Bracketed paste: into the search field or an overlay's text field; a
@@ -3725,8 +3879,9 @@ impl App {
         // One line: newlines would send nothing useful.
         let line = text.trim_end_matches(['\r', '\n']).replace(['\r', '\n'], " ");
         if self.searching && self.focus == Focus::Chats {
-            let query = format!("{}{line}", self.chat_query);
-            return self.set_chat_query(query);
+            let selected = self.selected_mid();
+            self.chat_query.insert_str(&line);
+            return self.chat_query_changed(selected);
         }
         if self.open.is_some()
             && self.focus != Focus::Chats
@@ -3735,8 +3890,15 @@ impl App {
             return self.open_attach(Some(path));
         }
         if self.open.is_some() {
+            // The message line keeps line breaks; nothing is sent until Enter.
+            let text = text.replace("\r\n", "\n").replace('\r', "\n");
+            let text = text.trim_end_matches('\n');
             self.focus = Focus::Input;
-            self.input.insert_str(&line);
+            self.input.insert_str(text);
+            let lines = text.lines().count();
+            if lines > 1 {
+                self.status = format!("pasted {lines} lines — Enter sends them as one message");
+            }
         }
     }
 
@@ -3841,10 +4003,6 @@ impl App {
         // From the viewer's menu: typing happens in the message line.
         if self.viewer.is_some() {
             self.close_viewer();
-        }
-        if self.selected_msg().is_some_and(|m| m.imported) {
-            self.status = IMPORTED_ONLY_LOCAL.into();
-            return;
         }
         let Some(m) = self.selected_msg().filter(|m| !m.id.is_empty()) else {
             self.status = "this message cannot be replied to yet".into();
@@ -3971,7 +4129,8 @@ impl App {
                 Modal::Form(_) => Ctx::Form,
                 Modal::Pick(_) => Ctx::Pick,
                 Modal::Attach(a) if a.chosen.is_some() => Ctx::AttachSend,
-                Modal::Attach(_) => Ctx::AttachBrowse,
+                Modal::Attach(a) if a.filter.is_empty() => Ctx::AttachBrowse,
+                Modal::Attach(_) => Ctx::AttachFilter,
                 Modal::Stickers(_) => Ctx::Stickers,
                 Modal::Settings(_) => Ctx::Settings,
             };
@@ -3996,14 +4155,14 @@ impl App {
         use keymap::Cmd;
         let chat = self.list.selected().and_then(|i| self.chat_at(i));
         let msg = self.selected_msg();
-        let real_msg = msg.filter(|m| !m.id.is_empty() && !m.imported);
+        let real_msg = msg.filter(|m| !m.id.is_empty());
         match cmd {
             Cmd::ComposeMenu | Cmd::ChatMenu | Cmd::ChatProfile => self.open.is_some(),
             Cmd::Confirm if self.focus == Focus::Chats && self.modal.is_none() => chat.is_some(),
             Cmd::Menu | Cmd::Profile if self.focus == Focus::Chats => chat.is_some(),
             Cmd::PinUp | Cmd::PinDown => chat.is_some_and(|c| self.is_pinned(&c.mid)),
             Cmd::Menu | Cmd::Reply | Cmd::React => real_msg.is_some(),
-            Cmd::Profile => msg.is_some_and(|m| imported_sender_name(&m.from).is_none()),
+            Cmd::Profile => msg.is_some(),
             Cmd::Unsend => msg.is_some_and(|m| self.can_unsend(m)),
             Cmd::Save | Cmd::OpenExternal => msg.is_some_and(|m| m.media_kind().is_some()),
             Cmd::OpenLink => msg.is_some_and(|m| !self.links_of(m).is_empty()),
@@ -4039,38 +4198,72 @@ impl App {
     // -- drawing ---------------------------------------------------------------------------
 
     fn draw(&mut self, f: &mut Frame) {
+        // Pictures not drawn lately make room once over their budgets.
+        self.thumbs.new_frame();
+        self.sticker_pics.new_frame();
+        self.file_previews.new_frame();
+        // Pictures under an open overlay must know what covers them before
+        // they are drawn (only graphics care: text cells stack by themselves).
+        let layered = self.picker.is_some() && self.overlay_open();
+        picture::compose(f, layered, |f| self.draw_layers(f));
+    }
+
+    fn overlay_open(&self) -> bool {
+        self.modal.is_some() || !self.profile.is_empty() || self.viewer.is_some()
+    }
+
+    /// Everything on screen, bottom layer first. Runs twice per frame while
+    /// an overlay is open (see [`picture::compose`]).
+    fn draw_layers(&mut self, f: &mut Frame) {
+        picture::layer(Layer::Base);
         let [main, status] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(f.area());
-        let [left, right] = Layout::horizontal([Constraint::Length(38), Constraint::Min(20)]).areas(main);
+        // The chat list gives up some width on narrow terminals so messages keep room.
+        let list_w = (main.width * 2 / 5).clamp(CHAT_LIST_MIN_W, CHAT_LIST_W);
+        let [left, right] = Layout::horizontal([Constraint::Length(list_w), Constraint::Min(20)]).areas(main);
         self.draw_chats(f, left);
-        let [conv, input] = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(right);
+        let rows = self.input.rows(right.width.saturating_sub(2) as usize).len();
+        let max_rows = (right.height / 3).clamp(1, INPUT_MAX_ROWS);
+        let input_h = (rows as u16).clamp(1, max_rows) + 2;
+        let [conv, input] = Layout::vertical([Constraint::Min(3), Constraint::Length(input_h)]).areas(right);
         self.draw_conversation(f, conv);
         self.draw_input(f, input);
         // Overlays show their own keys on their frame; the status line then
         // only says how to get help, so nothing is listed twice.
-        let overlay = self.modal.is_some() || !self.profile.is_empty() || self.viewer.is_some();
+        let overlay = self.overlay_open();
         let help = keymap::help_key(self.key_context());
         let hint = match self.hint() {
             keys if !overlay && !keys.is_empty() => format!("{help} · {keys}"),
             _ => help.to_owned(),
         };
-        let line = Line::from(vec![
-            Span::styled(
+        let mut spans = Vec::with_capacity(3);
+        if !self.status.is_empty() {
+            // Failures stand out from progress and confirmations.
+            let bg = if status_is_error(&self.status) {
+                Color::Red
+            } else {
+                Color::Green
+            };
+            spans.push(Span::styled(
                 format!(" {} ", self.status),
-                Style::new().fg(Color::Black).bg(Color::Green),
-            ),
-            Span::raw(" "),
-            Span::styled(hint, Style::new().dim()),
-        ]);
+                Style::new().fg(Color::Black).bg(bg),
+            ));
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(hint, Style::new().dim()));
+        let line = Line::from(spans);
         f.render_widget(Paragraph::new(line), status);
         self.hit.viewer = None;
         self.hit.profile = None;
         if self.viewer.is_some() {
+            picture::layer(Layer::Viewer);
             self.draw_viewer(f, main);
         }
         if !self.profile.is_empty() {
+            picture::layer(Layer::Profile);
             self.draw_profile(f, main);
         }
         if self.modal.is_some() {
+            picture::layer(Layer::Modal);
             self.draw_modal(f, main);
         } else {
             self.hit.modal = None;
@@ -4085,7 +4278,7 @@ impl App {
         let [area] = Layout::vertical([Constraint::Percentage(94)])
             .flex(Flex::Center)
             .areas(area);
-        f.render_widget(Clear, area);
+        picture::cover(f, area);
         self.hit.viewer = Some(area);
         // Links behind the viewer are covered now.
         self.hit.links.clear();
@@ -4187,13 +4380,7 @@ impl App {
             let search_area = Rect::new(area.x, area.y, area.width, area.height.min(3));
             let block = self.block(" Search ".into(), self.focus == Focus::Chats);
             let inner = block.inner(search_area);
-            let max = inner.width.saturating_sub(1) as usize;
-            let mut shown = self.chat_query.as_str();
-            while shown.width() > max {
-                let mut chars = shown.chars();
-                chars.next();
-                shown = chars.as_str();
-            }
+            let (shown, cursor) = self.chat_query.view(inner.width as usize);
             f.render_widget(Paragraph::new(shown.to_owned()).block(block), search_area);
             if self.focus == Focus::Chats
                 && self.modal.is_none()
@@ -4201,7 +4388,7 @@ impl App {
                 && self.viewer.is_none()
                 && inner.height > 0
             {
-                f.set_cursor_position(Position::new(inner.x + shown.width() as u16, inner.y));
+                f.set_cursor_position(Position::new(inner.x + cursor, inner.y));
             }
             Rect::new(
                 area.x,
@@ -4312,16 +4499,21 @@ impl App {
                 } else {
                     String::new()
                 };
-                let flat: String = c
-                    .preview
-                    .chars()
-                    .map(|ch| if ch == '\n' { ' ' } else { ch })
-                    .collect();
+                let draft = self.drafts.get(&c.mid).map(|d| d.input.as_str());
+                let flat: String = match draft {
+                    Some(d) => format!("✎ {d}"),
+                    None => c.preview.clone(),
+                }
+                .chars()
+                .map(|ch| if ch == '\n' { ' ' } else { ch })
+                .collect();
                 let preview_w = text_w.saturating_sub(if unread { badge.width() + 1 } else { 0 });
                 let preview = ellipsize(flat.trim(), preview_w);
                 let gap = text_w.saturating_sub(preview.width() + badge.width());
                 let preview_style = if c.invited {
                     Style::new().fg(Color::Yellow)
+                } else if draft.is_some() {
+                    Style::new().fg(Color::Magenta).italic()
                 } else if unread {
                     Style::new()
                 } else {
@@ -4366,7 +4558,12 @@ impl App {
             )));
         }
         let total_unread: u32 = self.chats.iter().map(|c| c.unread).sum();
-        let title = if total_unread > 0 {
+        let title = if self.searching && !self.chat_query.is_empty() {
+            match visible_chats.len() {
+                1 => " Chats · 1 match ".to_owned(),
+                n => format!(" Chats · {n} matches "),
+            }
+        } else if total_unread > 0 {
             format!(" Chats · {total_unread} unread ")
         } else {
             " Chats ".into()
@@ -4442,8 +4639,23 @@ impl App {
             }
         };
         let Some(chat) = self.open.clone() else {
-            let msg = Paragraph::new("Pick a chat on the left (Enter or click).").style(Style::new().dim());
-            f.render_widget(msg, inner);
+            let key = Style::new().fg(Color::Green);
+            let tip = |k: &'static str, what: &'static str| {
+                Line::from(vec![Span::styled(format!("{k:>7}  "), key), Span::raw(what)])
+            };
+            let lines = vec![
+                Line::raw(""),
+                Line::raw("Pick a chat on the left to open it."),
+                Line::raw(""),
+                tip("/", "search chats and friends"),
+                tip("n", "new group"),
+                tip("Ctrl-s", "settings"),
+                tip("?", "all shortcuts (F1 while typing)"),
+            ];
+            let width = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+            let x = inner.x + inner.width.saturating_sub(width) / 2;
+            let area = Rect::new(x, inner.y, width.min(inner.width), inner.height);
+            f.render_widget(Paragraph::new(lines).style(Style::new().dim()), area);
             return;
         };
         let width = inner.width as usize;
@@ -4474,6 +4686,14 @@ impl App {
         } else if !msgs.is_empty() {
             rows.push(Row::Text(
                 Line::from(Span::styled("↑ scroll up for older messages", Style::new().dim())).centered(),
+            ));
+        } else {
+            rows.push(Row::Text(
+                Line::from(Span::styled(
+                    "no messages yet — type below to start the conversation",
+                    Style::new().dim(),
+                ))
+                .centered(),
             ));
         }
         let group_chat = MidType::of(&chat) != MidType::User;
@@ -4580,7 +4800,7 @@ impl App {
                     None => {
                         if let Some(raw) = m.raw.clone() {
                             self.thumbs.insert(m.id.clone(), Load::Loading);
-                            spawn_thumb(self.client.clone(), self.tx.clone(), raw);
+                            spawn_thumb(self.client.clone(), self.tx.clone(), raw, self.thumb_cap());
                         }
                     }
                 }
@@ -4684,6 +4904,17 @@ impl App {
             self.jump_unread = false;
         }
         self.scroll = self.scroll.min(max_scroll);
+        if self.scroll > 0 && area.height > 2 && area.width > 4 {
+            let key = if self.focus == Focus::Messages {
+                "End"
+            } else {
+                "PgDn"
+            };
+            let label = Line::styled(format!(" ↓ newer messages below · {key} "), Style::new().yellow())
+                .right_aligned();
+            let row = Rect::new(area.x + 2, area.y + area.height - 1, area.width - 4, 1);
+            f.render_widget(Paragraph::new(label), row);
+        }
         let start = total.saturating_sub(height + self.scroll);
         self.at_top = start == 0 && !msgs.is_empty();
         for (i, &(s0, s1)) in spans.iter().enumerate() {
@@ -4811,12 +5042,16 @@ impl App {
                 let max = (area.width as usize).saturating_sub(30).max(10);
                 format!(" ↩ Reply to {} · Esc cancel ", self.quote(chat, id, max))
             }
-            _ => " Message ".into(),
+            _ => match self.input.line_count() {
+                1 => " Message ".into(),
+                n => format!(" Message · {n} lines "),
+            },
         };
         let block = self.block(title, self.focus == Focus::Input);
         let inner = block.inner(area);
-        let (shown, cursor) = self.input.view(inner.width as usize);
-        f.render_widget(Paragraph::new(shown.to_owned()).block(block), area);
+        let (rows, (x, y)) = self.input.view_rows(inner.width as usize, inner.height as usize);
+        let lines: Vec<Line> = rows.into_iter().map(|r| Line::raw(r.to_owned())).collect();
+        f.render_widget(Paragraph::new(lines).block(block), area);
         if self.focus == Focus::Input
             && self.modal.is_none()
             && self.profile.is_empty()
@@ -4824,7 +5059,11 @@ impl App {
             && inner.width > 0
             && inner.height > 0
         {
-            f.set_cursor_position(Position::new(inner.x + cursor.min(inner.width - 1), inner.y));
+            let at = Position::new(
+                inner.x + x.min(inner.width - 1),
+                inner.y + y.min(inner.height - 1),
+            );
+            f.set_cursor_position(at);
         }
     }
 }
@@ -4859,20 +5098,31 @@ async fn run(
     mut rx: mpsc::UnboundedReceiver<AppEvent>,
 ) -> std::io::Result<()> {
     let mut keys = EventStream::new();
+    let mut last_burst: Option<Instant> = None;
     let mut tick = tokio::time::interval(Duration::from_secs(30));
-    let mut had_modal = false;
+    let mut had_overlay = (false, false, false);
     while !app.quit {
-        // Opening or closing an overlay over inline pictures can leave
-        // Sixel/Kitty graphics on top of (or behind) it.
-        if app.modal.is_some() != had_modal {
-            had_modal = app.modal.is_some();
+        // Pictures under an overlay are drawn as text cells (see
+        // `picture::compose`), but terminals differ in whether text written
+        // over Sixel pixels erases them: repaint everything when an overlay
+        // opens, closes or gives way to another.
+        let overlay = (app.modal.is_some(), !app.profile.is_empty(), app.viewer.is_some());
+        if overlay != had_overlay {
+            had_overlay = overlay;
             if app.picker.is_some() {
                 app.needs_clear = true;
             }
         }
         if app.needs_clear {
             // Wipe graphics (Sixel/Kitty) left behind by a closed viewer or overlay.
-            terminal.clear()?;
+            // Not `Terminal::clear`: it saves and restores the cursor by asking
+            // the terminal where it is (`ESC[6n`), and a terminal busy drawing
+            // pictures may not answer within crossterm's 2 s, which ended the
+            // app. `resize` to the same size clears the whole screen and
+            // forces a full redraw without asking; every frame places the
+            // cursor itself anyway.
+            let area = terminal.size()?.into();
+            terminal.resize(area)?;
             app.needs_clear = false;
         }
         app.sync_anim();
@@ -4880,23 +5130,75 @@ async fn run(
         terminal.draw(|f| app.draw(f))?;
         app.request_missing_names();
         tokio::select! {
-            ev = keys.next() => match ev {
-                Some(Ok(TermEvent::Key(k))) => app.on_key(k),
-                Some(Ok(TermEvent::Mouse(m))) => app.on_mouse(m),
-                Some(Ok(TermEvent::Paste(text))) => app.on_paste(&text),
-                Some(Ok(TermEvent::FocusGained)) => app.focused = true,
-                Some(Ok(TermEvent::FocusLost)) => app.focused = false,
-                // A resize just redraws.
-                Some(Ok(_)) => {}
-                Some(Err(e)) => app.status = format!("terminal input error: {e}"),
-                // The terminal went away: nothing can reach the app any more.
-                None => app.quit = true,
+            ev = keys.next() => {
+                // Everything the terminal has already sent is handled together,
+                // so a paste typed out as keys can be told from typing. `poll!`
+                // polls with this task's waker: crossterm's `EventStream` keeps
+                // the waker of the first poll that found nothing (until it fires),
+                // so a throwaway waker (`now_or_never`) would leave `select!`
+                // never woken for later keys.
+                let mut batch = vec![ev];
+                while batch.len() < MAX_BATCH && matches!(batch.last(), Some(Some(_))) {
+                    match futures_util::poll!(keys.next()) {
+                        std::task::Poll::Ready(ev) => batch.push(ev),
+                        std::task::Poll::Pending => break,
+                    }
+                }
+                let continued = last_burst.is_some_and(|t| t.elapsed() < BURST_GAP);
+                let pasting = is_paste_burst(&batch, continued);
+                if pasting {
+                    last_burst = Some(Instant::now());
+                }
+                for ev in batch {
+                    if app.quit {
+                        break;
+                    }
+                    app.pasting = pasting;
+                    match ev {
+                        Some(Ok(TermEvent::Key(k))) => app.on_key(k),
+                        Some(Ok(TermEvent::Mouse(m))) => app.on_mouse(m),
+                        Some(Ok(TermEvent::Paste(text))) => app.on_paste(&text),
+                        Some(Ok(TermEvent::FocusGained)) => app.focused = true,
+                        Some(Ok(TermEvent::FocusLost)) => app.focused = false,
+                        // A resize just redraws.
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => app.status = format!("terminal input error: {e}"),
+                        // The terminal went away: nothing can reach the app any more.
+                        None => app.quit = true,
+                    }
+                }
+                app.pasting = false;
             },
             Some(ev) = rx.recv() => app.on_event(ev),
             _ = tick.tick() => {} // refresh relative timestamps
         }
     }
+    app.save_open_draft();
     Ok(())
+}
+
+/// Columns of the chat list (narrower on small terminals, down to the minimum).
+const CHAT_LIST_W: u16 = 38;
+const CHAT_LIST_MIN_W: u16 = 26;
+
+/// Events read in one go, at most (a long paste takes several reads).
+const MAX_BATCH: usize = 4096;
+/// This many key presses read in one go are a paste, not typing: a person
+/// gets that far ahead of the screen only when it stalls.
+const BURST_KEYS: usize = 8;
+/// A read this soon after a paste burst is the rest of it (a paste longer
+/// than one read), whatever its size.
+const BURST_GAP: Duration = Duration::from_millis(15);
+
+/// Whether events read in one go are a paste that a terminal without
+/// bracketed paste typed out as keys: then its Enters are line breaks, so
+/// pasting text that has (or ends in) a line break never sends a message.
+fn is_paste_burst(batch: &[Option<std::io::Result<TermEvent>>], continued: bool) -> bool {
+    let presses = batch
+        .iter()
+        .filter(|ev| matches!(ev, Some(Ok(TermEvent::Key(k))) if k.kind == KeyEventKind::Press))
+        .count();
+    presses > 0 && (continued || presses >= BURST_KEYS)
 }
 
 #[tokio::main]
@@ -5113,64 +5415,11 @@ mod tests {
                     reactions: Vec::new(),
                     unsent: false,
                     delivered: 0,
-                    imported: false,
                 })
                 .collect();
             a.messages.insert((*mid).into(), msgs);
         }
         a
-    }
-
-    #[tokio::test]
-    async fn imported_history_pages_after_line_history() {
-        let mut a = app();
-        // LINE is never reached: the gateway is a closed local port.
-        a.client = Client::new(Config {
-            gateway: "http://127.0.0.1:9".into(),
-            max_retries: 0,
-            ..Config::default()
-        })
-        .unwrap();
-        let day = 86_400_000;
-        let real = |id: &str, t: i64| -> Message {
-            serde_json::from_value(serde_json::json!({
-                "id": id, "from": "Uc", "to": "Ume", "contentType": 0, "text": id, "createdTime": t.to_string()
-            }))
-            .unwrap()
-        };
-        a.store
-            .put_messages("Uc", &[real("100", 10 * day), real("101", 11 * day)], None)
-            .unwrap();
-        let export =
-            rune::parse_chat_export("1970/01/02 Fri\n09:00\tCat\told one\n09:01\tCat\told two\n").unwrap();
-        let msgs = export.to_messages("Uc", |_| None, |t| t.utc_ms(0));
-        assert_eq!(a.store.import_messages("Uc", &msgs).unwrap().added, 2);
-        a.chats.push(ChatEntry {
-            mid: "Uc".into(),
-            ..Default::default()
-        });
-        let shown = a.store.messages("Uc", 200, None).unwrap();
-        assert_eq!(shown.len(), 4);
-        // Only the fetched ones are loaded (as after a fresh fetch).
-        a.messages
-            .insert("Uc".into(), shown[2..].iter().filter_map(stored_to_ui).collect());
-        a.open = Some("Uc".into());
-
-        // LINE's older history comes before the imported messages.
-        a.load_older();
-        assert!(a.older_loading.contains("Uc"));
-        assert_eq!(a.open_messages().len(), 2);
-        a.on_event(AppEvent::Older("Uc".into(), vec![real("99", 5 * day)], true));
-        let ids: Vec<_> = a.open_messages().iter().map(|m| m.id.clone()).collect();
-        assert_eq!(ids, ["99", "100", "101"]);
-        // LINE has nothing older: now the imported ones.
-        a.load_older();
-        let list = a.open_messages();
-        assert_eq!(list.len(), 5);
-        assert!(list[0].imported && list[1].imported);
-        assert_eq!(a.name(&list[0].from), "Cat");
-        a.load_older();
-        assert!(a.no_older.contains("Uc"));
     }
 
     fn unread_app(last_seen: Option<&str>, unread: u32) -> App {
@@ -5198,7 +5447,6 @@ mod tests {
                 reactions: Vec::new(),
                 unsent: false,
                 delivered: 0,
-                imported: false,
             })
             .collect(),
         );
@@ -5258,6 +5506,236 @@ mod tests {
     }
 
     #[test]
+    fn thumbnails_are_kept_no_bigger_than_the_largest_size_shows() {
+        let mut a = app();
+        a.picker = None;
+        let cap = a.thumb_cap();
+        let (cols, rows) = THUMB_SIZES[THUMB_SIZES.len() - 1];
+        let (gw, gh) = a.cell_mode.grid();
+        assert_eq!(cap, (u32::from(cols) * gw * 2, u32::from(rows) * gh * 2));
+        let big = shrink_now(image::DynamicImage::new_rgba8(4000, 1000), (400, 300));
+        assert_eq!((big.width(), big.height()), (400, 100), "aspect ratio is kept");
+        let small = shrink_now(image::DynamicImage::new_rgba8(20, 10), (400, 300));
+        assert_eq!((small.width(), small.height()), (20, 10), "never scaled up");
+        // The weight counts the pixels, so the budget sees the shrink.
+        use piccache::Weigh;
+        let p = Picture::new(big, None);
+        assert!(p.weight() >= 400 * 100 * 4 && p.weight() < 4000 * 1000 * 4);
+    }
+
+    #[test]
+    fn chat_search_edits_at_the_cursor_and_refilters() {
+        let mut a = app();
+        a.names.insert("Ua".into(), "Alpha".into());
+        a.names.insert("Ub".into(), "Bravo".into());
+        a.list.select(Some(0));
+        key(&mut a, KeyCode::Char('/'));
+        type_text(&mut a, "avo");
+        assert_eq!(a.visible_chats(), vec![1]);
+        // "avo" → "Bavo" → "Bravo": typing in the middle refilters.
+        key(&mut a, KeyCode::Home);
+        type_text(&mut a, "B");
+        assert_eq!(a.chat_query, "Bavo");
+        assert!(a.visible_chats().is_empty());
+        type_text(&mut a, "r");
+        assert_eq!(a.chat_query, "Bravo");
+        assert_eq!(a.visible_chats(), vec![1]);
+        assert_eq!(a.selected_mid().as_deref(), Some("Ub"));
+        // ← → move without leaving the search; Delete removes after the cursor.
+        key(&mut a, KeyCode::Left);
+        key(&mut a, KeyCode::Delete);
+        assert_eq!(a.chat_query, "Bavo");
+        assert!(a.searching && a.focus == Focus::Chats);
+        key(&mut a, KeyCode::End);
+        key(&mut a, KeyCode::Right);
+        key(&mut a, KeyCode::Delete);
+        assert_eq!(a.chat_query, "Bavo");
+        // Backspace at the start does nothing.
+        key(&mut a, KeyCode::Home);
+        key(&mut a, KeyCode::Backspace);
+        assert_eq!(a.chat_query, "Bavo");
+        // A paste lands at the cursor too.
+        a.on_paste("Br");
+        assert_eq!(a.chat_query, "BrBavo");
+        key(&mut a, KeyCode::Esc);
+        assert!(a.chat_query.is_empty());
+    }
+
+    #[test]
+    fn people_picker_filter_edits_at_the_cursor() {
+        let mut a = app();
+        a.modal = Some(Modal::Pick(modal::Pick {
+            title: String::new(),
+            kind: modal::PickKind::ShareContact,
+            options: vec![
+                ("U1".into(), "Alice".into()),
+                ("U2".into(), "Bob".into()),
+                ("U3".into(), "อลิส".into()),
+            ],
+            chosen: vec![],
+            filter: TextInput::default(),
+            sel: 0,
+            single: false,
+        }));
+        let pick = |a: &App| match &a.modal {
+            Some(Modal::Pick(p)) => (p.filter.as_str().to_owned(), p.visible(), p.sel),
+            _ => panic!("the picker closed"),
+        };
+        type_text(&mut a, "ace");
+        assert_eq!(pick(&a).1, Vec::<usize>::new());
+        key(&mut a, KeyCode::Down);
+        key(&mut a, KeyCode::Left);
+        key(&mut a, KeyCode::Left);
+        type_text(&mut a, "li");
+        assert_eq!(pick(&a), ("alice".into(), vec![0], 0));
+        key(&mut a, KeyCode::Home);
+        key(&mut a, KeyCode::Delete);
+        key(&mut a, KeyCode::End);
+        key(&mut a, KeyCode::Backspace);
+        assert_eq!(pick(&a).0, "lic");
+        // Thai with combining marks: one step over each cluster.
+        for _ in 0..3 {
+            key(&mut a, KeyCode::Backspace);
+        }
+        type_text(&mut a, "ลิส");
+        assert_eq!(pick(&a).1, vec![2]);
+        // Two steps left is the start; Delete takes ล with its vowel mark.
+        key(&mut a, KeyCode::Left);
+        key(&mut a, KeyCode::Left);
+        key(&mut a, KeyCode::Delete);
+        assert_eq!(pick(&a).0, "ส");
+    }
+
+    #[test]
+    fn file_filter_edits_at_the_cursor_and_backspace_leaves_the_folder_when_empty() {
+        let dir = std::env::temp_dir().join(format!("rune-filter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        for f in ["photo.png", "notes.txt"] {
+            std::fs::write(dir.join("sub").join(f), b"1").unwrap();
+        }
+        let mut a = app();
+        a.modal = Some(Modal::Attach(attach::Attach::new(dir.join("sub"))));
+        let at = |a: &App| match &a.modal {
+            Some(Modal::Attach(at)) => (at.filter.as_str().to_owned(), at.visible().len(), at.dir.clone()),
+            _ => panic!("the browser closed"),
+        };
+        type_text(&mut a, "pg");
+        assert_eq!(a.key_context(), keymap::Ctx::AttachFilter);
+        assert_eq!(at(&a).1, 0);
+        // ← moves the cursor (not to the parent folder) while a filter is typed.
+        key(&mut a, KeyCode::Left);
+        type_text(&mut a, "n");
+        assert_eq!(at(&a), ("png".into(), 1, dir.join("sub")));
+        key(&mut a, KeyCode::Home);
+        type_text(&mut a, ".");
+        assert_eq!(at(&a).0, ".png", "`.` is text inside a filter");
+        key(&mut a, KeyCode::Delete);
+        key(&mut a, KeyCode::End);
+        for _ in 0..3 {
+            key(&mut a, KeyCode::Backspace);
+        }
+        assert_eq!(at(&a), (String::new(), 2, dir.join("sub")));
+        assert_eq!(a.key_context(), keymap::Ctx::AttachBrowse);
+        // Empty filter: Backspace is the parent folder again.
+        key(&mut a, KeyCode::Backspace);
+        assert_eq!(at(&a).2, dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn album_post(id: &str, t: i64, album: &str, name: &str) -> Message {
+        let mut m = Message {
+            id: id.into(),
+            from: "Ua".into(),
+            to: "Ua".into(),
+            content_type: rune::album::POST_NOTIFICATION,
+            created_time: Some(t),
+            ..Default::default()
+        };
+        for (k, v) in [
+            ("serviceType", "AB"),
+            ("albumId", album),
+            ("albumName", name),
+            ("locKey", "BT"),
+            ("mediaOid", "o1"),
+            ("mediaType", "I"),
+        ] {
+            m.content_metadata.insert(k.into(), v.into());
+        }
+        m
+    }
+
+    #[test]
+    fn albums_come_from_indexed_posts_and_stay_current() {
+        let mut a = app();
+        let mut msgs: Vec<Message> = (1..=500)
+            .map(|i| Message {
+                id: (1000 + i).to_string(),
+                from: "Ua".into(),
+                to: "Ua".into(),
+                created_time: Some(i * 10),
+                text: Some("hi".into()),
+                ..Default::default()
+            })
+            .collect();
+        msgs.push(album_post("2001", 15, "A1", "Old name"));
+        msgs.push(album_post("2002", 25, "A2", "Beach"));
+        msgs.push(album_post("2003", 35, "A1", "Trip"));
+        a.store.put_messages("Ua", &msgs, None).unwrap();
+        let albums = a.albums_of("Ua");
+        let summary: Vec<(&str, &str, usize)> = albums
+            .iter()
+            .map(|x| (x.id.as_str(), x.name.as_str(), x.posts.len()))
+            .collect();
+        assert_eq!(summary, [("A1", "Trip", 2), ("A2", "Beach", 1)]);
+        // A post only in memory (not stored yet) counts; an unsent one does not.
+        let mut ui = to_ui(&album_post("2004", 45, "A3", "New"), None).unwrap();
+        ui.raw = Some(album_post("2004", 45, "A3", "New"));
+        a.messages.get_mut("Ua").unwrap().push(ui);
+        a.store.mark_unsent("2002").unwrap();
+        let ids: Vec<String> = a.albums_of("Ua").into_iter().map(|x| x.id).collect();
+        assert_eq!(ids, ["A3", "A1"]);
+    }
+
+    #[tokio::test]
+    async fn viewing_an_album_photo_loads_only_the_history_up_to_it() {
+        let mut a = app();
+        let mut msgs: Vec<Message> = (1..=300)
+            .map(|i| Message {
+                id: (1000 + i).to_string(),
+                from: "Ua".into(),
+                to: "Ua".into(),
+                created_time: Some(i * 10),
+                text: Some("hi".into()),
+                ..Default::default()
+            })
+            .collect();
+        msgs.insert(100, album_post("1100", 1000, "A1", "Trip"));
+        msgs.retain(|m| m.id != "1100" || m.content_type != 0);
+        a.store.put_messages("Ua", &msgs, None).unwrap();
+        // The open chat shows the newest 50 stored messages.
+        let newest: Vec<UiMsg> = a
+            .store
+            .messages("Ua", 50, None)
+            .unwrap()
+            .iter()
+            .filter_map(stored_to_ui)
+            .collect();
+        a.messages.insert("Ua".into(), newest);
+        a.open = Some("Ua".into());
+        a.view_message("Ua", "1100");
+        let loaded = a.open_messages();
+        assert_eq!(loaded.first().map(|m| m.id.as_str()), Some("1100"));
+        // Contiguous and no more than needed: 1100..=1300.
+        assert_eq!(loaded.len(), 201);
+        assert!(
+            loaded
+                .windows(2)
+                .all(|w| message_id_cmp(&w[0].id, &w[1].id).is_lt())
+        );
+    }
+
+    #[test]
     fn chat_search_matches_group_member_names() {
         let mut a = app();
         a.names.insert("Ua".into(), "Project".into());
@@ -5310,6 +5788,33 @@ mod tests {
         assert!(a.searching);
         assert_eq!(a.open, None);
         assert!(screen(&mut a).contains("no matching chats"));
+    }
+
+    #[test]
+    fn chat_search_right_at_the_end_moves_to_the_message_line() {
+        let mut a = app();
+        a.list.select(Some(0));
+        key(&mut a, KeyCode::Char('/'));
+        type_text(&mut a, "ab");
+        // No chat open: there is no message line to move to.
+        key(&mut a, KeyCode::Right);
+        assert!(a.searching && a.focus == Focus::Chats);
+
+        a.open = Some("Ua".into());
+        key(&mut a, KeyCode::Left);
+        assert!(
+            a.searching && a.focus == Focus::Chats,
+            "→ inside the query only moves the cursor"
+        );
+        key(&mut a, KeyCode::End);
+        key(&mut a, KeyCode::Delete);
+        assert!(
+            a.searching && a.focus == Focus::Chats,
+            "End and Delete at the end stay in the field"
+        );
+        key(&mut a, KeyCode::Right);
+        assert!(!a.searching);
+        assert_eq!(a.focus, Focus::Input);
     }
 
     #[test]
@@ -5725,6 +6230,90 @@ mod tests {
     }
 
     #[test]
+    fn pinning_keeps_the_selection_at_the_same_list_position() {
+        let mut a = app();
+        a.chats.push(ChatEntry {
+            mid: "Uc".into(),
+            ..Default::default()
+        });
+        a.list.select(Some(2));
+        a.set_pinned("Uc", true);
+        assert_eq!(
+            a.chats.iter().map(|c| c.mid.as_str()).collect::<Vec<_>>(),
+            ["Uc", "Ua", "Ub"]
+        );
+        assert_eq!(a.list.selected(), Some(2));
+        assert_eq!(a.selected_mid().as_deref(), Some("Ub"));
+
+        a.list.select(Some(0));
+        a.set_pinned("Ub", true);
+        assert_eq!(
+            a.selected_mid().as_deref(),
+            Some("Uc"),
+            "pinning another chat keeps the selected chat"
+        );
+    }
+
+    #[tokio::test]
+    async fn unread_pinned_chats_float_to_the_top_until_read() {
+        let mut a = app();
+        // Opening a chat fetches history: LINE is a closed local port.
+        a.client = Client::new(Config {
+            gateway: "http://127.0.0.1:9".into(),
+            ..Config::default()
+        })
+        .unwrap();
+        for mid in ["Uc", "Ud"] {
+            a.chats.push(ChatEntry {
+                mid: mid.into(),
+                ..Default::default()
+            });
+        }
+        for mid in ["Ua", "Ub", "Uc"] {
+            a.set_pinned(mid, true);
+        }
+        let order = |a: &App| a.chats.iter().map(|c| c.mid.clone()).collect::<Vec<_>>();
+        assert_eq!(order(&a), ["Ua", "Ub", "Uc", "Ud"]);
+        let receive = |a: &mut App, rev: i64, id: &str, from: &str| {
+            a.on_operation(op(serde_json::json!({
+                "revision": rev, "type": 26, "message": sent(id, from, "Ume", "hi")
+            })));
+        };
+
+        a.select_chat_mid(Some("Ua"));
+        receive(&mut a, 1, "100", "Uc");
+        assert_eq!(order(&a), ["Uc", "Ua", "Ub", "Ud"], "an unread pin floats up");
+        assert_eq!(
+            a.selected_mid().as_deref(),
+            Some("Ua"),
+            "the selection stays on its chat"
+        );
+        // An unpinned chat's unread message does not pass the pins.
+        receive(&mut a, 2, "101", "Ud");
+        assert_eq!(order(&a), ["Uc", "Ua", "Ub", "Ud"]);
+        // Several unread pins keep their pin order among themselves.
+        receive(&mut a, 3, "102", "Ub");
+        assert_eq!(order(&a), ["Ub", "Uc", "Ua", "Ud"]);
+        receive(&mut a, 4, "103", "Uc");
+        assert_eq!(
+            order(&a),
+            ["Ub", "Uc", "Ua", "Ud"],
+            "newer messages do not reshuffle them"
+        );
+
+        // Reading here (opening the chat) returns it to its pin position.
+        a.open_chat("Uc".into());
+        assert_eq!(order(&a), ["Ub", "Ua", "Uc", "Ud"]);
+        // Reading elsewhere (another device) does too.
+        a.on_operation(op(serde_json::json!({
+            "revision": 5, "type": 40, "param1": "Ub", "param2": "102", "param3": "0"
+        })));
+        assert_eq!(order(&a), ["Ua", "Ub", "Uc", "Ud"]);
+        assert_eq!(a.pinned, ["Ua", "Ub", "Uc"], "the pin order itself never changes");
+        assert_eq!(a.store.pinned_chats().unwrap(), ["Ua", "Ub", "Uc"]);
+    }
+
+    #[test]
     fn pinned_chats_survive_updates_and_app_recreation() {
         let mut a = app();
         let invite: Chat = serde_json::from_value(serde_json::json!({
@@ -6117,6 +6706,42 @@ mod tests {
         assert!(a.loading.contains("Cg"), "the open stale chat is refetched");
         assert!(a.chats[0].muted, "mute survives the merge");
         assert_eq!(a.chats[0].unread, 0, "the open chat stays read");
+    }
+
+    #[tokio::test]
+    async fn a_live_message_in_an_unopened_chat_keeps_its_stored_history() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_chat(&ChatRow {
+                mid: "Ua".into(),
+                last_message_id: Some("102".into()),
+                last_time: 3,
+                ..Default::default()
+            })
+            .unwrap();
+        let history: Vec<Message> = (100..103)
+            .map(|id| sent(&id.to_string(), "Ua", "Ume", "old"))
+            .collect();
+        store.put_messages("Ua", &history, None).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut a = App::new(Client::new(Config::default()).unwrap(), "Ume".into(), tx, store);
+        a.no_read_receipts_flag = true;
+        // A message arrives while another chat (or none) is open.
+        a.on_operation(op(serde_json::json!({"revision": 5, "type": 26,
+            "message": sent("103", "Ua", "Ume", "new")})));
+        assert_eq!(a.chats[0].unread, 1);
+        assert_eq!(a.chats[0].preview, "new");
+        // The replayed copy of the same message is not counted twice.
+        a.on_operation(op(serde_json::json!({"revision": 6, "type": 26,
+            "message": sent("103", "Ua", "Ume", "new")})));
+        assert_eq!(a.chats[0].unread, 1);
+        a.open_chat("Ua".into());
+        let texts: Vec<&str> = a.open_messages().iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            ["old", "old", "old", "new"],
+            "the stored history is shown too"
+        );
     }
 
     #[tokio::test]
@@ -6539,6 +7164,113 @@ mod tests {
     }
 
     #[test]
+    fn home_and_end_jump_to_the_first_and_last_chat_and_message() {
+        let mut a = app();
+        a.focus = Focus::Chats;
+        key(&mut a, KeyCode::End);
+        assert_eq!(a.list.selected(), Some(1));
+        key(&mut a, KeyCode::Home);
+        assert_eq!(a.list.selected(), Some(0));
+        a.open = Some("Ua".into());
+        a.focus = Focus::Messages;
+        a.sel = Some(1);
+        key(&mut a, KeyCode::Home);
+        assert_eq!((a.sel, a.focus), (Some(0), Focus::Messages));
+        key(&mut a, KeyCode::End);
+        assert_eq!((a.sel, a.focus), (Some(2), Focus::Messages));
+    }
+
+    #[test]
+    fn the_message_line_deletes_by_word() {
+        let mut a = app();
+        a.open = Some("Ua".into());
+        a.focus = Focus::Input;
+        type_text(&mut a, "hello big world");
+        key_with_modifiers(&mut a, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        assert_eq!(a.input.as_str(), "hello big ");
+        key_with_modifiers(&mut a, KeyCode::Left, KeyModifiers::CONTROL);
+        key_with_modifiers(&mut a, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(a.input.as_str(), "hello ");
+        key_with_modifiers(&mut a, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert!(a.input.is_empty());
+        assert_eq!(a.focus, Focus::Input);
+    }
+
+    #[test]
+    fn the_status_line_hides_an_empty_status_and_marks_failures() {
+        let mut a = app();
+        a.status.clear();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| a.draw(f)).unwrap();
+        // The status line starts straight with the help key, no empty chip.
+        assert_eq!(term.backend().buffer()[(0, 29)].symbol(), "?");
+        a.status = "could not unsend: gone".into();
+        term.draw(|f| a.draw(f)).unwrap();
+        assert_eq!(term.backend().buffer()[(1, 29)].bg, Color::Red);
+        a.status = "saved".into();
+        term.draw(|f| a.draw(f)).unwrap();
+        assert_eq!(term.backend().buffer()[(1, 29)].bg, Color::Green);
+    }
+
+    #[test]
+    fn scrolled_up_conversations_say_newer_messages_are_below() {
+        let mut a = app();
+        a.open = Some("Ua".into());
+        let long: Vec<UiMsg> = (0..40)
+            .map(|j| UiMsg {
+                id: format!("{j}"),
+                text: format!("message {j}"),
+                ..a.messages["Ua"][0].clone()
+            })
+            .collect();
+        a.messages.insert("Ua".into(), long);
+        assert!(!screen(&mut a).contains("newer messages below"));
+        a.scroll = 10;
+        assert!(screen(&mut a).contains("newer messages below · PgDn"));
+    }
+
+    #[tokio::test]
+    async fn sending_scrolls_back_to_the_newest_message() {
+        let mut a = app();
+        a.open = Some("Ua".into());
+        a.focus = Focus::Input;
+        a.scroll = 10;
+        type_text(&mut a, "hi");
+        key(&mut a, KeyCode::Enter);
+        assert_eq!(a.scroll, 0);
+    }
+
+    #[test]
+    fn empty_and_welcome_screens_say_what_to_do() {
+        let mut a = app();
+        let s = screen(&mut a);
+        assert!(s.contains("Pick a chat on the left"), "{s}");
+        assert!(s.contains("search chats and friends"), "{s}");
+        a.open = Some("Unew".into());
+        assert!(screen(&mut a).contains("no messages yet"));
+    }
+
+    #[test]
+    fn chat_search_counts_its_matches() {
+        let mut a = app();
+        a.focus = Focus::Chats;
+        key(&mut a, KeyCode::Char('/'));
+        type_text(&mut a, "Ub");
+        assert!(screen(&mut a).contains("Chats · 1 match "));
+    }
+
+    #[test]
+    fn the_message_line_help_lists_its_commands() {
+        let lines = keymap::help_lines(keymap::Ctx::Compose);
+        assert!(lines.iter().any(|(k, _)| k == "/attach [PATH]"));
+        assert!(
+            !keymap::help_lines(keymap::Ctx::Messages)
+                .iter()
+                .any(|(k, _)| k.starts_with('/'))
+        );
+    }
+
+    #[test]
     fn the_message_line_edits_at_a_cursor_and_keeps_the_focus() {
         let mut a = app();
         a.open = Some("Ua".into());
@@ -6550,16 +7282,140 @@ mod tests {
         type_text(&mut a, "> ");
         key(&mut a, KeyCode::Delete);
         assert_eq!(a.input, "> ello");
-        assert_eq!(a.focus, Focus::Input, "← no longer jumps to the chat list");
+        assert_eq!(
+            a.focus,
+            Focus::Input,
+            "Home and Delete at the start keep the focus"
+        );
         key(&mut a, KeyCode::End);
         key(&mut a, KeyCode::Backspace);
         assert_eq!(a.input, "> ell");
-        // A paste lands at the cursor too, as one line.
+        // A paste lands at the cursor too, line breaks and all.
         key(&mut a, KeyCode::Home);
         a.on_paste("a\nb ");
-        assert_eq!(a.input, "a b > ell");
+        assert_eq!(a.input, "a\nb > ell");
         let screen = screen(&mut a);
-        assert!(screen.contains("a b > ell"), "{screen}");
+        assert!(screen.contains("Message · 2 lines"), "{screen}");
+        assert!(screen.contains("│a ") && screen.contains("│b > ell"), "{screen}");
+        // Home goes to the start of the cursor's line; Backspace there joins lines.
+        key(&mut a, KeyCode::Home);
+        key(&mut a, KeyCode::Backspace);
+        assert_eq!(a.input, "ab > ell");
+        assert_eq!(a.focus, Focus::Input);
+        // Only ← at the start moves to the chat list.
+        key(&mut a, KeyCode::Home);
+        key(&mut a, KeyCode::Backspace);
+        assert_eq!(a.focus, Focus::Input);
+        key(&mut a, KeyCode::Left);
+        assert_eq!(a.focus, Focus::Chats);
+    }
+
+    #[tokio::test]
+    async fn the_message_line_takes_several_lines_and_sends_them_as_one() {
+        let mut a = app();
+        a.enter_chat("Ua".into());
+        type_text(&mut a, "hi");
+        key_with_modifiers(&mut a, KeyCode::Enter, KeyModifiers::SHIFT);
+        type_text(&mut a, "there");
+        key_with_modifiers(&mut a, KeyCode::Enter, KeyModifiers::ALT);
+        key_with_modifiers(&mut a, KeyCode::Char('j'), KeyModifiers::CONTROL);
+        type_text(&mut a, "/mute");
+        assert_eq!(a.input, "hi\nthere\n\n/mute");
+        let shown = screen(&mut a);
+        assert!(shown.contains("Message · 4 lines"), "{shown}");
+        assert!(shown.contains("│there "), "the composer grew: {shown}");
+        // ↑ walks up the lines, and only above the first selects messages.
+        for _ in 0..3 {
+            key(&mut a, KeyCode::Up);
+            assert_eq!((a.focus, a.sel), (Focus::Input, None));
+        }
+        key(&mut a, KeyCode::Down);
+        type_text(&mut a, "!");
+        assert_eq!(a.input, "hi\nthere!\n\n/mute");
+        key(&mut a, KeyCode::Up);
+        key(&mut a, KeyCode::Up);
+        assert_eq!(a.focus, Focus::Messages);
+        key(&mut a, KeyCode::Esc);
+        // Several lines are a message even when one looks like a command.
+        key(&mut a, KeyCode::Enter);
+        assert_eq!((a.input.as_str(), a.status.as_str()), ("", "sending…"));
+    }
+
+    #[tokio::test]
+    async fn pasted_line_breaks_never_send() {
+        let mut a = app();
+        a.enter_chat("Ua".into());
+        // A terminal without bracketed paste types the paste out, Enters and all.
+        a.pasting = true;
+        type_text(&mut a, "one");
+        key(&mut a, KeyCode::Enter);
+        type_text(&mut a, "two");
+        key(&mut a, KeyCode::Enter);
+        a.pasting = false;
+        assert_eq!(a.input, "one\ntwo\n");
+        assert!(a.status.contains("Enter sends"), "{}", a.status);
+        // A bracketed paste ending in a line break does not send either.
+        a.input.clear();
+        a.on_paste("three\r\nfour\r\n");
+        assert_eq!(a.input, "three\nfour");
+        assert_eq!(a.status, "pasted 2 lines — Enter sends them as one message");
+        // The person's own Enter sends.
+        key(&mut a, KeyCode::Enter);
+        assert_eq!((a.input.as_str(), a.status.as_str()), ("", "sending…"));
+    }
+
+    #[test]
+    fn paste_bursts_are_told_from_typing() {
+        let press = |c| {
+            Some(Ok(TermEvent::Key(KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            ))))
+        };
+        let typed: Vec<_> = "ok".chars().map(press).collect();
+        assert!(!is_paste_burst(&typed, false), "a few keys are typing");
+        let pasted: Vec<_> = "a pasted line".chars().map(press).collect();
+        assert!(is_paste_burst(&pasted, false));
+        assert!(is_paste_burst(&typed, true), "the rest of a long paste");
+        assert!(!is_paste_burst(&[Some(Ok(TermEvent::FocusGained))], true));
+    }
+
+    #[test]
+    fn drafts_stay_with_their_chat() {
+        let mut a = app();
+        a.enter_chat("Ua".into());
+        type_text(&mut a, "for A");
+        a.replying = Some("01".into());
+        a.enter_chat("Ub".into());
+        assert_eq!((a.input.as_str(), a.replying.as_deref()), ("", None));
+        let shown = screen(&mut a);
+        assert!(
+            shown.contains("✎ for A"),
+            "the chat list shows the draft: {shown}"
+        );
+        type_text(&mut a, "for B");
+        // Enter in another chat never sends A's draft there.
+        a.enter_chat("Ua".into());
+        assert_eq!((a.input.as_str(), a.replying.as_deref()), ("for A", Some("01")));
+        assert_eq!(
+            a.store.get("cache.draft.Ub").unwrap().as_deref(),
+            Some("for B"),
+            "kept across restarts"
+        );
+        // At exit the open chat's draft is kept too; an emptied one is forgotten.
+        a.save_open_draft();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let b = App::new(a.client.clone(), "Ume".into(), tx, a.store.clone());
+        assert_eq!(b.drafts.get("Ua").map(|d| d.input.as_str()), Some("for A"));
+        a.input.clear();
+        a.enter_chat("Ub".into());
+        assert_eq!(a.store.get("cache.draft.Ua").unwrap(), None);
+        assert!(!a.drafts.contains_key("Ua"));
+        // Removing a chat drops its draft.
+        a.enter_chat("Ua".into());
+        a.remove_chat("Ub");
+        assert!(!a.drafts.contains_key("Ub"));
+        assert_eq!(a.store.get("cache.draft.Ub").unwrap(), None);
     }
 
     #[test]
@@ -6698,7 +7554,7 @@ mod tests {
         assert!(a.hint().contains("s save"));
         // No chat open: no chords for it.
         let mut a = app();
-        assert!(!a.hint().contains("Ctrl-O"));
+        assert!(!a.hint().contains("Ctrl-o"));
         a.list.select(Some(0));
         assert!(a.hint().contains("Enter/→ open"));
         // An overlay lists its keys on its frame, not in the status line too.

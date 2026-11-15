@@ -1,7 +1,7 @@
 //! Overlays: menus, forms, pickers, confirmations and info boxes, and the
 //! actions they run (reactions, unsend, group management, other message types).
 
-use super::*;
+use crate::*;
 use rune::Reaction;
 
 /// An overlay on top of the main screen; it gets every key while open.
@@ -80,13 +80,6 @@ pub enum Action {
     ChangeCover,
     ConfirmCover(std::path::PathBuf),
     SetCover(std::path::PathBuf),
-    /// Pick a LINE chat export to import into a chat.
-    ImportHistory(String),
-    /// A file was picked: show what it holds and ask.
-    PreviewImport(String, std::path::PathBuf),
-    Import(String, std::path::PathBuf),
-    ConfirmDeleteImported(String),
-    DeleteImported(String),
 }
 
 pub struct Menu {
@@ -95,7 +88,7 @@ pub struct Menu {
     pub sel: usize,
 }
 
-/// A question with two labelled buttons. Destructive actions start on
+/// A question with two labelled buttons. Every confirmation starts on
 /// "Cancel", so a stray `Enter` never does them.
 pub struct Confirm {
     pub text: String,
@@ -113,16 +106,9 @@ impl Action {
             Action::Decline(_) => "Decline",
             Action::DeletePinList(_) => "Delete",
             Action::ClearCache => "Clear",
-            Action::DeleteImported(_) => "Remove",
             Action::SetCover(_) => "Replace cover",
-            Action::Import(..) => "Import",
             _ => "OK",
         }
-    }
-
-    /// Hard to take back: the confirmation starts on "Cancel".
-    fn destructive(&self) -> bool {
-        !matches!(self, Action::Import(..))
     }
 }
 
@@ -195,14 +181,14 @@ pub struct Pick {
     /// `(mid, name)`.
     pub options: Vec<(String, String)>,
     pub chosen: Vec<String>,
-    pub filter: String,
+    pub filter: TextInput,
     pub sel: usize,
     pub single: bool,
 }
 
 impl Pick {
     pub fn visible(&self) -> Vec<usize> {
-        let f = self.filter.to_lowercase();
+        let f = self.filter.as_str().to_lowercase();
         (0..self.options.len())
             .filter(|&i| f.is_empty() || self.options[i].1.to_lowercase().contains(&f))
             .collect()
@@ -241,11 +227,10 @@ impl App {
     }
 
     pub fn confirm(&mut self, text: impl Into<String>, action: Action) {
-        let yes = !action.destructive();
         self.modal = Some(Modal::Confirm(Confirm {
             text: text.into(),
             action,
-            yes,
+            yes: false,
         }));
     }
 
@@ -259,7 +244,7 @@ impl App {
         self.open_menu(format!(" Invitation to {} ", self.name(mid)), items);
     }
 
-    /// `m` in the chat list / `Ctrl-G` in a chat: what can be done with it.
+    /// `m` in the chat list / `Ctrl-g` in a chat: what can be done with it.
     pub fn chat_menu(&mut self, mid: &str) {
         let name = self.name(mid);
         let entry = self.chats.iter().find(|c| c.mid == mid);
@@ -290,16 +275,6 @@ impl App {
             }
         }
         items.push(("📌 Pin lists…".to_owned(), Action::PinLists));
-        items.push((
-            "📥 Import chat history from LINE…".to_owned(),
-            Action::ImportHistory(mid.into()),
-        ));
-        if self.store.imported_count(mid).unwrap_or(0) > 0 {
-            items.push((
-                "🗑 Remove imported history…".to_owned(),
-                Action::ConfirmDeleteImported(mid.into()),
-            ));
-        }
         self.open_menu(format!(" {name} "), items);
     }
 
@@ -388,10 +363,6 @@ impl App {
         if m.id.is_empty() {
             return;
         }
-        if m.imported {
-            self.status = IMPORTED_ONLY_LOCAL.into();
-            return;
-        }
         let mut items = vec![
             ("↩ Reply".to_owned(), Action::Reply(m.id.clone())),
             ("😀 React…".to_owned(), Action::ReactMenu(m.id.clone())),
@@ -415,7 +386,7 @@ impl App {
         self.open_menu(" Message ", items);
     }
 
-    /// `Ctrl-O`: things to send besides text.
+    /// `Ctrl-o`: things to send besides text.
     pub fn compose_menu(&mut self) {
         if self.open.is_none() {
             self.status = "open a chat first".into();
@@ -460,7 +431,13 @@ impl App {
             .filter(|(mid, _)| !exclude.contains(*mid) && *mid != &self.me)
             .map(|(mid, name)| (mid.clone(), name.clone()))
             .collect();
-        v.sort_by_key(|(_, n)| n.to_lowercase());
+        // Names are display-only and may collide: break ties by mid so
+        // same-named contacts keep a stable order (the map's order is not).
+        v.sort_by(|(a_mid, a), (b_mid, b)| {
+            a.to_lowercase()
+                .cmp(&b.to_lowercase())
+                .then_with(|| a_mid.cmp(b_mid))
+        });
         v
     }
 
@@ -479,7 +456,7 @@ impl App {
             kind,
             options,
             chosen: Vec::new(),
-            filter: String::new(),
+            filter: TextInput::default(),
             sel: 0,
             single,
         }));
@@ -647,21 +624,6 @@ impl App {
             }
             Action::Decline(chat) => self.answer_invite_for(chat, false),
             Action::ClearCache => self.clear_cache(),
-            Action::ImportHistory(chat) => self.open_import_picker(chat),
-            Action::PreviewImport(chat, path) => self.preview_import(chat, path),
-            Action::Import(chat, path) => self.run_import(chat, path),
-            Action::ConfirmDeleteImported(chat) => {
-                let n = self.store.imported_count(&chat).unwrap_or(0);
-                self.confirm(
-                    format!(
-                        "Remove the {n} messages imported into {} from a chat export? \
-                         Messages from LINE stay.",
-                        self.name(&chat)
-                    ),
-                    Action::DeleteImported(chat),
-                );
-            }
-            Action::DeleteImported(chat) => self.delete_imported(chat),
             Action::Albums(chat) => self.albums_menu(&chat),
             Action::AlbumPhotos(chat, album) => self.album_photos_menu(&chat, &album),
             Action::ViewMessage(chat, id) => self.view_message(&chat, &id),
@@ -750,7 +712,7 @@ impl App {
         });
     }
 
-    pub(super) fn reaction_lines(&self, id: &str) -> (String, Vec<String>) {
+    pub(crate) fn reaction_lines(&self, id: &str) -> (String, Vec<String>) {
         let Some(msg) = self.find_msg(id).filter(|m| !m.unsent) else {
             return (" Reactions ".into(), vec!["No reactions".into()]);
         };
@@ -969,6 +931,14 @@ impl App {
                     m.sel = (m.sel + 1) % m.items.len().max(1);
                     keep(self, Modal::Menu(m));
                 }
+                Some(Cmd::Home) => {
+                    m.sel = 0;
+                    keep(self, Modal::Menu(m));
+                }
+                Some(Cmd::End) => {
+                    m.sel = m.items.len().saturating_sub(1);
+                    keep(self, Modal::Menu(m));
+                }
                 Some(Cmd::Confirm) => {
                     if let Some((_, a)) = m.items.into_iter().nth(m.sel) {
                         self.run_action(a);
@@ -1040,23 +1010,7 @@ impl App {
                 }
                 Some(Cmd::Confirm) => self.submit_form(f),
                 cmd => {
-                    let field = &mut f.fields[f.sel].value;
-                    let before = field.clone();
-                    match cmd {
-                        Some(Cmd::CursorLeft) => field.left(),
-                        Some(Cmd::CursorRight) => field.right(),
-                        Some(Cmd::LineStart) => field.home(),
-                        Some(Cmd::LineEnd) => field.end(),
-                        Some(Cmd::DeleteBackward) => field.backspace(),
-                        Some(Cmd::DeleteForward) => field.delete(),
-                        None => {
-                            if let Some(c) = typed_char(&k) {
-                                field.insert(c);
-                            }
-                        }
-                        _ => {}
-                    }
-                    if field.as_str() != before.as_str() {
+                    if f.fields[f.sel].value.edit(cmd, &k) == Edit::Changed {
                         f.error = None;
                     }
                     keep(self, Modal::Form(f));
@@ -1101,19 +1055,12 @@ impl App {
                         }
                         self.submit_pick(p);
                     }
-                    Some(Cmd::DeleteBackward) => {
-                        p.filter.pop();
-                        p.sel = 0;
-                        keep(self, Modal::Pick(p));
-                    }
-                    None => {
-                        if let Some(c) = typed_char(&k) {
-                            p.filter.push(c);
+                    cmd => {
+                        if p.filter.edit(cmd, &k) == Edit::Changed {
                             p.sel = 0;
                         }
                         keep(self, Modal::Pick(p));
                     }
-                    _ => keep(self, Modal::Pick(p)),
                 }
             }
             Modal::Attach(a) => self.attach_key(a, k),
@@ -1131,7 +1078,7 @@ impl App {
                 f.error = None;
             }
             Some(Modal::Pick(p)) => {
-                p.filter.push_str(text.trim());
+                p.filter.insert_str(text.trim());
                 p.sel = 0;
             }
             Some(Modal::Attach(_)) => {
@@ -1204,7 +1151,7 @@ impl App {
     // -- drawing ------------------------------------------------------------------------
 
     fn modal_frame(&mut self, f: &mut Frame, area: Rect, title: &str, help: &str) -> Rect {
-        f.render_widget(Clear, area);
+        crate::picture::cover(f, area);
         self.hit.modal = Some(area);
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
@@ -1304,7 +1251,7 @@ impl App {
                     let mut x = inner.x;
                     for (label, yes) in buttons {
                         let focused = c.yes == yes;
-                        let style = match (focused, yes && c.action.destructive()) {
+                        let style = match (focused, yes) {
                             (true, true) => Style::new().bg(Color::Red).fg(Color::White).bold(),
                             (true, false) => Style::new().bg(Color::Green).fg(Color::Black).bold(),
                             (false, _) => Style::new().bg(Color::DarkGray),
@@ -1422,15 +1369,16 @@ impl App {
                 let [search, count, list] =
                     Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)])
                         .areas(inner);
+                let (shown, cursor) = p.filter.view(search.width.saturating_sub(3) as usize);
                 f.render_widget(
                     Paragraph::new(Line::from(vec![
                         Span::styled("🔍 ", Style::new()),
-                        Span::raw(p.filter.clone()),
+                        Span::raw(shown.to_owned()),
                     ]))
                     .style(Style::new().bg(Color::Indexed(236))),
                     search,
                 );
-                f.set_cursor_position(Position::new(search.x + 3 + p.filter.width() as u16, search.y));
+                f.set_cursor_position(Position::new(search.x + 3 + cursor, search.y));
                 if !p.single {
                     let names: Vec<String> = p
                         .chosen

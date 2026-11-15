@@ -35,7 +35,6 @@ use std::sync::{Arc, Mutex};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
-use crate::import::{fingerprint, imported_sender_name, is_imported_id};
 use crate::models::{Contact, Message, Operation, ReactionKind, apply_reaction, content_type};
 use crate::ops::{OpEvent, message_id_cmp};
 
@@ -74,6 +73,7 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS messages_by_chat ON messages (chat, time, id_num);
 CREATE INDEX IF NOT EXISTS messages_by_type ON messages (content_type, time);
+CREATE INDEX IF NOT EXISTS messages_by_chat_type ON messages (chat, content_type, time);
 CREATE TABLE IF NOT EXISTS contacts (
     mid TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -240,43 +240,18 @@ fn id_num(id: &str) -> i64 {
     id.parse().unwrap_or(0)
 }
 
-/// What [`Store::import_messages`] did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ImportStats {
-    /// Newly stored.
-    pub added: usize,
-    /// Already imported before.
-    pub already: usize,
-    /// Skipped because the real message is stored.
-    pub duplicates: usize,
-}
-
-/// Is `imported` the export's copy of the real message `real` (same minute
-/// is checked by the caller)? An unmatched sender only compares content.
-fn same_message(imported: &Message, real: &Message) -> bool {
-    let sender_ok = imported_sender_name(&imported.from).is_some() || imported.from == real.from;
-    sender_ok && fingerprint(imported).is_some_and(|f| fingerprint(real).as_ref() == Some(&f))
-}
-
-/// Ids of the imported messages in `chat` that copy the real message `m`.
-fn imported_copies(c: &Connection, chat: &str, m: &Message, time: i64) -> rusqlite::Result<Vec<String>> {
-    if fingerprint(m).is_none() {
-        return Ok(Vec::new());
+/// The stored copy `old` (JSON) of `sealed`, if it is decrypted, with the
+/// server-side reactions of the fresh copy; `None` keeps the fresh copy.
+fn keep_decrypted(old: &str, sealed: &Message) -> Option<serde_json::Result<String>> {
+    let mut old: Message = serde_json::from_str(old).ok()?;
+    if old.is_e2ee() {
+        return None;
     }
-    let start = time.div_euclid(60_000) * 60_000;
-    let mut st = c.prepare_cached(
-        "SELECT id, json FROM messages WHERE chat = ?1 AND id_num < 0 AND time >= ?2 AND time < ?3",
-    )?;
-    let rows: Vec<(String, String)> = st
-        .query_map(params![chat, start, start + 60_000], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(rows
-        .into_iter()
-        .filter(|(_, j)| serde_json::from_str::<Message>(j).is_ok_and(|i| same_message(&i, m)))
-        .map(|(id, _)| id)
-        .collect())
+    match sealed.extra.get("reactions") {
+        Some(r) => old.extra.insert("reactions".into(), r.clone()),
+        None => old.extra.remove("reactions"),
+    };
+    Some(serde_json::to_string(&old))
 }
 
 fn now_ms() -> i64 {
@@ -340,6 +315,13 @@ impl Store {
             Some(2) => Self::migrate_v2(&tx).map_err(db_err)?,
             _ => tx.execute_batch(PINNED_SCHEMA).map_err(db_err)?,
         }
+        // Left over from the removed chat-export import: imported messages had
+        // negative ids (real ones never do).
+        tx.execute_batch(
+            "DELETE FROM messages WHERE id_num < 0;
+             DELETE FROM meta WHERE key = 'setting.import_dir';",
+        )
+        .map_err(db_err)?;
         tx.execute(
             "INSERT INTO meta (key, value) VALUES ('schema', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -669,6 +651,14 @@ impl Store {
                 [key, value],
             )
             .map(drop)
+        })
+    }
+
+    /// Every stored value whose key starts with `prefix`, as (key, value).
+    pub fn values_with_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT key, value FROM meta WHERE substr(key, 1, length(?1)) = ?1")?;
+            st.query_map([prefix], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
         })
     }
 
@@ -1156,20 +1146,13 @@ impl Store {
         })
     }
 
-    /// Drop a chat's messages that came from LINE, keeping imported ones
-    /// (which the server cannot give back).
-    pub fn clear_fetched_messages(&self, chat: &str) -> Result<()> {
-        self.with(|c| {
-            c.execute("DELETE FROM messages WHERE chat = ?1 AND id_num >= 0", [chat])
-                .map(drop)
-        })
-    }
-
     // -- messages --------------------------------------------------------------------
 
     /// Store a message (already decrypted where possible) in `chat`.
     /// Returns `true` if it was new. A re-fetched copy replaces the stored
-    /// one (fresher reactions; a later successful decryption).
+    /// one (fresher reactions; a later successful decryption), except that a
+    /// copy which is still sealed never replaces a decrypted one: it only
+    /// brings its reactions (the key may be gone for good by then).
     pub fn put_message(&self, chat: &str, m: &Message, e2ee_error: Option<&str>) -> Result<bool> {
         self.put_messages(chat, std::slice::from_ref(m), e2ee_error)
             .map(|n| n == 1)
@@ -1186,7 +1169,7 @@ impl Store {
             let tx = c.transaction()?;
             let mut new = 0;
             {
-                let mut exists = tx.prepare("SELECT 1 FROM messages WHERE id = ?1")?;
+                let mut stored = tx.prepare("SELECT json FROM messages WHERE id = ?1")?;
                 let mut st = tx.prepare(
                     "INSERT INTO messages (id, id_num, chat, sender, time, content_type, json, e2ee_error)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -1194,9 +1177,19 @@ impl Store {
                          e2ee_error = excluded.e2ee_error, content_type = excluded.content_type",
                 )?;
                 for (m, json) in &rows {
-                    if !exists.exists([&m.id])? {
+                    let old: Option<String> = stored.query_row([&m.id], |r| r.get(0)).optional()?;
+                    if old.is_none() {
                         new += 1;
                     }
+                    let kept = old
+                        .filter(|_| m.is_e2ee())
+                        .and_then(|old| keep_decrypted(&old, m))
+                        .transpose()
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                    let (json, e2ee_error) = match &kept {
+                        Some(decrypted) => (decrypted, None),
+                        None => (json, e2ee_error),
+                    };
                     let time = m.created_time.unwrap_or_else(now_ms);
                     st.execute(params![
                         m.id,
@@ -1208,89 +1201,11 @@ impl Store {
                         json,
                         e2ee_error
                     ])?;
-                    if !is_imported_id(&m.id) {
-                        // The real message supersedes its imported copy.
-                        for id in imported_copies(&tx, chat, m, time)? {
-                            tx.execute("DELETE FROM messages WHERE id = ?1", [id])?;
-                        }
-                    }
                 }
             }
             tx.commit()?;
             Ok(new)
         })
-    }
-
-    /// Store messages imported from a LINE chat export (see [`crate::import`])
-    /// in `chat`. Messages already stored (the same file imported before) and
-    /// messages whose real copy is stored are skipped; nothing is replaced.
-    pub fn import_messages(&self, chat: &str, msgs: &[Message]) -> Result<ImportStats> {
-        let rows: Vec<(&Message, String)> = msgs
-            .iter()
-            .filter(|m| is_imported_id(&m.id))
-            .map(|m| Ok((m, serde_json::to_string(m)?)))
-            .collect::<Result<_>>()?;
-        self.with(|c| {
-            let tx = c.transaction()?;
-            let mut stats = ImportStats::default();
-            {
-                let mut exists = tx.prepare("SELECT 1 FROM messages WHERE id = ?1")?;
-                let mut real = tx.prepare(
-                    "SELECT json FROM messages WHERE chat = ?1 AND id_num >= 0 AND time >= ?2 AND time < ?3",
-                )?;
-                let mut st = tx.prepare(
-                    "INSERT INTO messages (id, id_num, chat, sender, time, content_type, json)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                )?;
-                for (m, json) in &rows {
-                    if exists.exists([&m.id])? {
-                        stats.already += 1;
-                        continue;
-                    }
-                    let time = m.created_time.unwrap_or(0);
-                    let start = time.div_euclid(60_000) * 60_000;
-                    let candidates: Vec<String> = real
-                        .query_map(params![chat, start, start + 60_000], |r| r.get(0))?
-                        .collect::<rusqlite::Result<_>>()?;
-                    let dup = candidates
-                        .iter()
-                        .any(|j| serde_json::from_str::<Message>(j).is_ok_and(|r| same_message(m, &r)));
-                    if dup {
-                        stats.duplicates += 1;
-                        continue;
-                    }
-                    st.execute(params![
-                        m.id,
-                        id_num(&m.id),
-                        chat,
-                        m.from,
-                        time,
-                        m.content_type,
-                        json
-                    ])?;
-                    stats.added += 1;
-                }
-            }
-            tx.commit()?;
-            Ok(stats)
-        })
-    }
-
-    /// How many imported messages `chat` holds.
-    pub fn imported_count(&self, chat: &str) -> Result<usize> {
-        self.with(|c| {
-            c.query_row(
-                "SELECT COUNT(*) FROM messages WHERE chat = ?1 AND id_num < 0",
-                [chat],
-                |r| r.get::<_, i64>(0),
-            )
-        })
-        .map(|n| n as usize)
-    }
-
-    /// Delete the messages imported into `chat`; returns how many there were.
-    pub fn delete_imported(&self, chat: &str) -> Result<usize> {
-        self.with(|c| c.execute("DELETE FROM messages WHERE chat = ?1 AND id_num < 0", [chat]))
     }
 
     fn message_from_row(r: &rusqlite::Row) -> rusqlite::Result<(String, Option<String>, bool)> {
@@ -1347,11 +1262,66 @@ impl Store {
         Ok(out)
     }
 
-    /// The newest message of `chat` that came from LINE (not imported).
-    pub fn newest_fetched_message(&self, chat: &str) -> Result<Option<StoredMessage>> {
+    /// Messages of `chat` from `from` (inclusive) up to `before` (exclusive;
+    /// `None`: to the newest), oldest first: the stretch that joins a stored
+    /// message to the loaded history. Empty if `from` is not stored in `chat`.
+    pub fn messages_from(&self, chat: &str, from: &str, before: Option<&str>) -> Result<Vec<StoredMessage>> {
+        let rows = self.with(|c| {
+            let time_of = |id: &str| -> rusqlite::Result<Option<i64>> {
+                c.query_row(
+                    "SELECT time FROM messages WHERE id = ?1 AND chat = ?2",
+                    [id, chat],
+                    |r| r.get(0),
+                )
+                .optional()
+            };
+            let Some(t0) = time_of(from)? else {
+                return Ok(Vec::new());
+            };
+            let (t1, n1) = match before {
+                Some(id) => (time_of(id)?.unwrap_or(i64::MAX), id_num(id)),
+                None => (i64::MAX, i64::MAX),
+            };
+            let mut st = c.prepare(
+                "SELECT json, e2ee_error, unsent FROM messages
+                 WHERE chat = ?1
+                   AND (time > ?2 OR (time = ?2 AND id_num >= ?3))
+                   AND (time < ?4 OR (time = ?4 AND id_num < ?5))
+                 ORDER BY time, id_num",
+            )?;
+            st.query_map(params![chat, t0, id_num(from), t1, n1], Self::message_from_row)?
+                .collect()
+        })?;
+        Self::decode(rows)
+    }
+
+    /// The album posts of `chat` (content type 16, `serviceType` `AB`),
+    /// newest first. Only post notifications are read (by index), never the
+    /// whole history.
+    pub fn album_posts(&self, chat: &str) -> Result<Vec<StoredMessage>> {
+        let rows = self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT json, e2ee_error, unsent FROM messages
+                 WHERE chat = ?1 AND content_type = ?2 AND unsent = 0
+                 ORDER BY time DESC, id_num DESC",
+            )?;
+            st.query_map(
+                params![chat, crate::album::POST_NOTIFICATION],
+                Self::message_from_row,
+            )?
+            .collect()
+        })?;
+        Ok(Self::decode(rows)?
+            .into_iter()
+            .filter(|sm| sm.message.album_post().is_some())
+            .collect())
+    }
+
+    /// The newest stored message of `chat`.
+    pub fn newest_message(&self, chat: &str) -> Result<Option<StoredMessage>> {
         let row = self.with(|c| {
             c.query_row(
-                "SELECT json, e2ee_error, unsent FROM messages WHERE chat = ?1 AND id_num >= 0
+                "SELECT json, e2ee_error, unsent FROM messages WHERE chat = ?1
                  ORDER BY time DESC, id_num DESC LIMIT 1",
                 [chat],
                 Self::message_from_row,
@@ -1721,40 +1691,69 @@ mod tests {
         m.text.clone().unwrap_or_default()
     }
 
+    fn album_msg(id: &str, chat: &str, t: i64, album: &str, service: &str) -> Message {
+        let mut m = msg(id, "Ua", chat, t, "");
+        m.content_type = crate::album::POST_NOTIFICATION;
+        for (k, v) in [
+            ("serviceType", service),
+            ("albumId", album),
+            ("albumName", "Trip"),
+            ("locKey", "BT"),
+            ("mediaOid", "o1"),
+            ("mediaType", "I"),
+        ] {
+            m.content_metadata.insert(k.into(), v.into());
+        }
+        m
+    }
+
     #[test]
-    fn imported_history_dedupes_and_survives_gap_clears() {
+    fn album_posts_reads_only_album_posts_of_the_chat_newest_first() {
         let s = Store::open_in_memory().unwrap();
-        let export = crate::import::parse_chat_export(
-            "2024/01/15 Mon\n09:00\tAlice\thello\n09:00\tMe\t[Sticker]\n09:01\tAlice\tbye\n",
-        )
-        .unwrap();
-        let map = |n: &str| match n {
-            "Alice" => Some("Ua".to_owned()),
-            "Me" => Some("Ume".to_owned()),
-            _ => None,
+        let mut msgs: Vec<Message> = (0..50)
+            .map(|i| msg(&i.to_string(), "Ua", "Cg", i, "hi"))
+            .collect();
+        msgs.push(album_msg("100", "Cg", 10, "A1", "AB"));
+        msgs.push(album_msg("101", "Cg", 20, "A2", "AB"));
+        // A note post (same content type, other service) and another chat's album.
+        msgs.push(album_msg("102", "Cg", 30, "A3", "GB"));
+        s.put_messages("Cg", &msgs, None).unwrap();
+        s.put_message("Cother", &album_msg("103", "Cother", 40, "A4", "AB"), None)
+            .unwrap();
+        let ids = |s: &Store| -> Vec<String> {
+            s.album_posts("Cg")
+                .unwrap()
+                .into_iter()
+                .map(|m| m.message.id)
+                .collect()
         };
-        let msgs = export.to_messages("Ua", map, |t| t.utc_ms(0));
-        let t0 = msgs[0].created_time.unwrap();
-        // The real "hello" is already stored: its imported copy is skipped.
-        s.put_message("Ua", &msg("500", "Ua", "Ume", t0, "hello"), None)
+        assert_eq!(ids(&s), ["101", "100"]);
+        // Unsent posts drop out; new ones show up (no stale cache).
+        s.mark_unsent("101").unwrap();
+        s.put_message("Cg", &album_msg("104", "Cg", 50, "A1", "AB"), None)
             .unwrap();
-        let st = s.import_messages("Ua", &msgs).unwrap();
-        assert_eq!((st.added, st.duplicates, st.already), (2, 1, 0));
-        assert_eq!(s.import_messages("Ua", &msgs).unwrap().already, 2);
-        assert_eq!(s.imported_count("Ua").unwrap(), 2);
-        // Ordered by time with the real one; the newest fetched is the real one.
-        let all = s.messages("Ua", 10, None).unwrap();
-        let texts: Vec<_> = all.iter().map(|m| m.message.text.clone().unwrap()).collect();
-        assert_eq!(texts, ["hello", "[Sticker]", "bye"]);
-        assert_eq!(s.newest_fetched_message("Ua").unwrap().unwrap().message.id, "500");
-        // Fetching the real "bye" later replaces the imported copy.
-        s.put_message("Ua", &msg("501", "Ua", "Ume", t0 + 61_000, "bye"), None)
-            .unwrap();
-        assert_eq!(s.imported_count("Ua").unwrap(), 1);
-        s.clear_fetched_messages("Ua").unwrap();
-        assert_eq!(s.message_count("Ua").unwrap(), 1);
-        assert_eq!(s.delete_imported("Ua").unwrap(), 1);
-        assert_eq!(s.message_count("Ua").unwrap(), 0);
+        assert_eq!(ids(&s), ["104", "100"]);
+        assert!(s.album_posts("Cnone").unwrap().is_empty());
+    }
+
+    #[test]
+    fn messages_from_joins_a_stored_message_to_the_loaded_history() {
+        let s = Store::open_in_memory().unwrap();
+        let msgs: Vec<Message> = (1..=100)
+            .map(|i| msg(&i.to_string(), "Ua", "Cg", i * 10, "x"))
+            .collect();
+        s.put_messages("Cg", &msgs, None).unwrap();
+        let ids = |v: Vec<StoredMessage>| -> Vec<i64> {
+            v.into_iter().map(|m| m.message.id.parse().unwrap()).collect()
+        };
+        assert_eq!(
+            ids(s.messages_from("Cg", "40", Some("44")).unwrap()),
+            [40, 41, 42, 43]
+        );
+        assert_eq!(ids(s.messages_from("Cg", "98", None).unwrap()), [98, 99, 100]);
+        assert!(s.messages_from("Cg", "44", Some("40")).unwrap().is_empty());
+        assert!(s.messages_from("Cg", "nope", None).unwrap().is_empty());
+        assert!(s.messages_from("Cother", "40", None).unwrap().is_empty());
     }
 
     #[test]
@@ -1885,6 +1884,31 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("rune-{tag}-{}-{unique}.db", std::process::id()))
+    }
+
+    #[test]
+    fn opening_drops_leftovers_of_the_removed_history_import() {
+        let path = temp_db("imported");
+        {
+            let s = Store::open(&path).unwrap();
+            s.put_messages(
+                "Ua",
+                &[
+                    msg("-7", "import:Bob", "Ua", 1, "old"),
+                    msg("500", "Ua", "Ume", 2, "real"),
+                ],
+                None,
+            )
+            .unwrap();
+            s.set("setting.import_dir", "/tmp").unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let ids: Vec<_> = s.messages("Ua", 10, None).unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].message.id, "500");
+        assert_eq!(s.get("setting.import_dir").unwrap(), None);
+        drop(s);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -2204,12 +2228,22 @@ mod tests {
             assert!(!s.bind_account("Ume").unwrap());
             s.put_message("Ua", &msg("1", "Ua", "Ume", 1, "x"), None).unwrap();
             s.set("setting.bell", "on").unwrap();
+            s.set("cache.draft.Ua", "half-written").unwrap();
             s.set_stream_revision(42).unwrap();
         }
         let s = Store::open(&path).unwrap();
         assert_eq!(s.stream_revision().unwrap(), Some(42), "survives a restart");
         assert!(!s.bind_account("Ume").unwrap());
+        assert_eq!(
+            s.values_with_prefix("cache.draft.").unwrap(),
+            [("cache.draft.Ua".to_owned(), "half-written".to_owned())]
+        );
+        assert!(
+            s.values_with_prefix("cache.draft_").unwrap().is_empty(),
+            "no LIKE wildcards"
+        );
         assert!(s.bind_account("Uother").unwrap(), "another account wipes");
+        assert!(s.values_with_prefix("cache.").unwrap().is_empty(), "drafts too");
         assert_eq!(s.stats().unwrap(), (0, 0, 0));
         assert_eq!(s.stream_revision().unwrap(), None);
         assert_eq!(s.get("setting.bell").unwrap().as_deref(), Some("on"));
@@ -2223,6 +2257,43 @@ mod tests {
         }
         drop(s);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_sealed_refetch_keeps_the_decrypted_copy() {
+        let s = Store::open_in_memory().unwrap();
+        let mut plain = msg("700", "Ua", "Ume", 1_000, "secret");
+        s.put_message("Ua", &plain, None).unwrap();
+        // The same message fetched again, but it cannot be decrypted any more
+        // (the peer's key was retired); only its reactions are new.
+        let mut sealed = plain.clone();
+        sealed.text = None;
+        sealed.chunks = Some(vec!["AAAA".into(); 5]);
+        sealed.extra.insert(
+            "reactions".into(),
+            json!([{"fromUserMid": "Ua", "atMillis": "5", "reactionType": {"predefinedReactionType": 3}}]),
+        );
+        assert!(!s.put_message("Ua", &sealed, Some("PeerKeyUnavailable")).unwrap());
+        let sm = s.message("700").unwrap().unwrap();
+        assert_eq!(sm.message.text.as_deref(), Some("secret"));
+        assert!(!sm.message.is_e2ee());
+        assert_eq!(sm.e2ee_error, None);
+        assert_eq!(sm.message.reactions().len(), 1, "the fresh reactions are taken");
+        // A message never decrypted is stored as it comes, error included...
+        sealed.id = "701".into();
+        s.put_message("Ua", &sealed, Some("x")).unwrap();
+        assert_eq!(
+            s.message("701").unwrap().unwrap().e2ee_error.as_deref(),
+            Some("x")
+        );
+        // ...and a later decryption still replaces it.
+        plain.id = "701".into();
+        s.put_message("Ua", &plain, None).unwrap();
+        let sm = s.message("701").unwrap().unwrap();
+        assert_eq!(
+            (sm.message.text.as_deref(), sm.e2ee_error),
+            (Some("secret"), None)
+        );
     }
 
     #[test]

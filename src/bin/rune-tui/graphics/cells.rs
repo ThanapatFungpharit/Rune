@@ -37,7 +37,7 @@ impl CellMode {
     }
 
     /// Pixels per cell (columns, rows).
-    fn grid(self) -> (u32, u32) {
+    pub fn grid(self) -> (u32, u32) {
         match self {
             Self::Half => (1, 2),
             Self::Quadrant => (2, 2),
@@ -93,6 +93,15 @@ impl CellImage {
             source: img.to_rgba8(),
             cache: None,
         }
+    }
+
+    /// Bytes held: the source pixels and the last encoding.
+    pub fn weight(&self) -> usize {
+        self.source.as_raw().len()
+            + self
+                .cache
+                .as_ref()
+                .map_or(0, |(_, _, g)| g.capacity() * std::mem::size_of::<Glyph>())
     }
 
     /// Cells the picture takes when scaled (up or down) to fit `max`,

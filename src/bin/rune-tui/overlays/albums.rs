@@ -3,7 +3,7 @@
 //! are grouped by album, and picking a photo shows it in the viewer. Album
 //! posts are ordinary media messages otherwise (inline picture, `s`/`o`).
 
-use super::*;
+use crate::*;
 
 /// The media kind an album post stands for (`IMAGE`, or `VIDEO` for a video).
 fn album_media_type(m: &Message) -> Option<i64> {
@@ -19,26 +19,34 @@ pub fn media_type(m: &Message) -> i64 {
 }
 
 /// One album seen in a chat.
-struct AlbumSeen {
-    id: String,
-    name: String,
+pub struct AlbumSeen {
+    pub id: String,
+    pub name: String,
     /// `(message id, sender, time, photos in the post)`, newest first.
-    posts: Vec<(String, String, i64, usize)>,
+    pub posts: Vec<(String, String, i64, usize)>,
 }
 
 impl App {
-    /// Album posts of `chat`: loaded messages plus the stored history.
-    fn albums_of(&self, chat: &str) -> Vec<AlbumSeen> {
+    /// Album posts of `chat`: the stored ones (read by index, so opening
+    /// the menu never loads the whole history) plus loaded ones not stored yet.
+    /// Read fresh each time, so new, renamed and unsent posts always show.
+    pub fn albums_of(&self, chat: &str) -> Vec<AlbumSeen> {
         let mut seen: HashMap<String, (Message, i64)> = HashMap::new();
-        for sm in self.store.messages(chat, 20_000, None).unwrap_or_default() {
-            if sm.unsent {
-                continue;
-            }
+        for sm in self.store.album_posts(chat).unwrap_or_default() {
             let t = sm.message.created_time.unwrap_or(0);
             seen.insert(sm.message.id.clone(), (sm.message, t));
         }
         for m in self.messages.get(chat).into_iter().flatten() {
-            if let Some(raw) = m.raw.as_ref().filter(|_| !m.unsent) {
+            if m.unsent {
+                // Unsent here but maybe not yet in the store.
+                seen.remove(&m.id);
+                continue;
+            }
+            if let Some(raw) = m
+                .raw
+                .as_ref()
+                .filter(|r| r.content_type == rune::album::POST_NOTIFICATION)
+            {
                 seen.entry(m.id.clone()).or_insert_with(|| (raw.clone(), m.time));
             }
         }
@@ -141,17 +149,22 @@ impl App {
             self.open_chat(chat.to_owned());
         }
         if !self.open_messages().iter().any(|m| m.id == id) {
-            let oldest = self.open_messages().first().map(|m| m.id.clone());
+            // Only the stretch from that message to the loaded history, which
+            // keeps the history contiguous without reading all of it.
+            let oldest = self
+                .open_messages()
+                .iter()
+                .find(|m| !m.id.is_empty())
+                .map(|m| m.id.clone());
             let older: Vec<UiMsg> = self
                 .store
-                .messages(chat, 20_000, oldest.as_deref())
+                .messages_from(chat, id, oldest.as_deref())
                 .unwrap_or_default()
                 .iter()
                 .filter_map(stored_to_ui)
                 .collect();
-            // Keep the history contiguous: everything from that message on.
-            if let Some(i) = older.iter().position(|m| m.id == id) {
-                self.prepend(chat, older[i..].to_vec());
+            if older.first().is_some_and(|m| m.id == id) {
+                self.prepend(chat, older);
             }
         }
         match self.open_messages().iter().position(|m| m.id == id) {

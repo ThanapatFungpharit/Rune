@@ -2,7 +2,7 @@
 //! account-wide notification settings, profile, and storage; plus desktop
 //! notifications for new messages.
 
-use super::*;
+use crate::*;
 use rune::models::settings_attribute as sa;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,6 +418,8 @@ impl App {
                     None => selectable.first().copied().unwrap_or(0),
                 };
             }
+            Some(keymap::Cmd::Home) => s.sel = selectable.first().copied().unwrap_or(0),
+            Some(keymap::Cmd::End) => s.sel = selectable.last().copied().unwrap_or(0),
             Some(keymap::Cmd::Confirm) => {
                 let act = rows.get(s.sel).map_or(RowAct::None, |r| r.2);
                 let act = if act == RowAct::None {
@@ -528,8 +530,7 @@ impl App {
             RowAct::ClearCache => {
                 return self.confirm(
                     "Delete all locally stored chats, messages and contacts? They are fetched \
-                     from LINE again (only as much history as LINE still serves); \
-                     imported chat history is deleted too.",
+                     from LINE again (only as much history as LINE still serves).",
                     modal::Action::ClearCache,
                 );
             }
@@ -540,7 +541,7 @@ impl App {
 
     pub fn draw_settings(&mut self, f: &mut Frame, area: Rect, s: &mut SettingsPage, hint: String) {
         let r = modal::popup(area, 80, 18);
-        f.render_widget(Clear, r);
+        crate::picture::cover(f, r);
         self.hit.modal = Some(r);
         let block = Block::bordered()
             .border_type(BorderType::Rounded)

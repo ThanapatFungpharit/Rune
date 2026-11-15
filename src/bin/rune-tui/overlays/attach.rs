@@ -1,10 +1,9 @@
 //! Sending photos, videos, audio and files: a file browser with a preview,
-//! then a send dialog. Opened with `Ctrl-O` (or by pasting / dropping a file
+//! then a send dialog. Opened with `Ctrl-o` (or by pasting / dropping a file
 //! path into the input line). The same browser, in cover mode, picks a new
-//! profile cover from your own profile page, and in import mode a LINE chat
-//! export.
+//! profile cover from your own profile page.
 
-use super::*;
+use crate::*;
 use rune::MediaKind;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -28,15 +27,13 @@ pub struct Chosen {
 pub struct Attach {
     pub dir: PathBuf,
     pub entries: Vec<Entry>,
-    pub filter: String,
+    pub filter: TextInput,
     pub sel: usize,
     pub show_hidden: bool,
     pub chosen: Option<Chosen>,
     pub error: Option<String>,
     /// Picking a new profile cover (pictures only) instead of something to send.
     pub cover: bool,
-    /// Picking a LINE chat export to import into this chat instead.
-    pub import: Option<String>,
 }
 
 /// LINE's file limit (the library refuses bigger uploads).
@@ -206,13 +203,12 @@ impl Attach {
         let mut a = Attach {
             dir,
             entries: Vec::new(),
-            filter: String::new(),
+            filter: TextInput::default(),
             sel: 0,
             show_hidden: false,
             chosen: None,
             error: None,
             cover: false,
-            import: None,
         };
         a.reload();
         a
@@ -248,7 +244,7 @@ impl Attach {
     }
 
     pub fn visible(&self) -> Vec<usize> {
-        let f = self.filter.to_lowercase();
+        let f = self.filter.as_str().to_lowercase();
         (0..self.entries.len())
             .filter(|&i| f.is_empty() || self.entries[i].name.to_lowercase().contains(&f))
             .collect()
@@ -278,16 +274,6 @@ impl Attach {
     /// Pick `path` for sending (reads its size and, for MP4, its length).
     pub fn choose(&mut self, path: PathBuf) {
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        if self.import.is_some() {
-            self.chosen = Some(Chosen {
-                path,
-                size,
-                kind: MediaKind::File,
-                original: false,
-                duration_ms: None,
-            });
-            return;
-        }
         if size > MAX_SEND {
             self.error = Some(format!("{} is larger than LINE's 1 GB limit", human_size(size)));
             return;
@@ -374,20 +360,15 @@ impl App {
                 a.choose(p);
             }
             None => {
-                a.filter.push_str(text.trim());
+                a.filter.insert_str(text.trim());
                 a.sel = 0;
             }
         }
         self.keep_attach(a);
     }
 
-    /// Put the browser back, unless an import file was just chosen.
-    fn keep_attach(&mut self, mut a: Attach) {
-        if let Some(chat) = a.import.clone()
-            && let Some(c) = a.chosen.take()
-        {
-            return self.run_action(Action::PreviewImport(chat, c.path));
-        }
+    /// Put the browser back.
+    fn keep_attach(&mut self, a: Attach) {
         self.modal = Some(Modal::Attach(a));
     }
 
@@ -417,7 +398,22 @@ impl App {
             return;
         }
         let vis = a.visible();
-        match keymap::resolve(keymap::Ctx::AttachBrowse, &k) {
+        // With a filter typed, the arrows and Home/End edit it (`AttachFilter`).
+        let ctx = if a.filter.is_empty() {
+            keymap::Ctx::AttachBrowse
+        } else {
+            keymap::Ctx::AttachFilter
+        };
+        let cmd = keymap::resolve(ctx, &k);
+        match a.filter.edit(cmd, &k) {
+            Edit::Changed => {
+                a.sel = 0;
+                return self.keep_attach(a);
+            }
+            Edit::Moved | Edit::MovedHitLeft | Edit::MovedHitRight => return self.keep_attach(a),
+            Edit::Ignored => {}
+        }
+        match cmd {
             Some(keymap::Cmd::Back) => return,
             Some(keymap::Cmd::Up) => a.sel = a.sel.saturating_sub(1),
             Some(keymap::Cmd::Down) => a.sel = (a.sel + 1).min(vis.len().saturating_sub(1)),
@@ -425,15 +421,11 @@ impl App {
             Some(keymap::Cmd::PageDown) => a.sel = (a.sel + 10).min(vis.len().saturating_sub(1)),
             Some(keymap::Cmd::Home) => a.sel = 0,
             Some(keymap::Cmd::End) => a.sel = vis.len().saturating_sub(1),
-            Some(keymap::Cmd::ParentDir) if k.code == KeyCode::Backspace && !a.filter.is_empty() => {
-                a.filter.pop();
-                a.sel = 0;
-            }
             Some(keymap::Cmd::ParentDir) => a.up(),
             Some(keymap::Cmd::Confirm | keymap::Cmd::Right) => {
                 // A typed path ("~/Pictures", "/tmp/a.png") goes there.
-                let typed =
-                    (a.filter.starts_with('/') || a.filter.starts_with('~')).then(|| expand_home(&a.filter));
+                let typed = a.filter.as_str();
+                let typed = (typed.starts_with('/') || typed.starts_with('~')).then(|| expand_home(typed));
                 if let Some(p) = typed {
                     if p.is_dir() {
                         a.cd(p);
@@ -446,22 +438,16 @@ impl App {
                     let p = a.dir.join(&e.name);
                     if e.dir {
                         a.cd(p);
-                    } else if keymap::resolve(keymap::Ctx::AttachBrowse, &k) == Some(keymap::Cmd::Confirm) {
+                    } else if cmd == Some(keymap::Cmd::Confirm) {
                         a.choose(p);
                     }
                 }
             }
-            Some(keymap::Cmd::ShowHidden) if a.filter.is_empty() => {
+            Some(keymap::Cmd::ShowHidden) => {
                 a.show_hidden = !a.show_hidden;
                 a.reload();
             }
-            Some(keymap::Cmd::HomeDir) if a.filter.is_empty() => a.cd(expand_home("~")),
-            Some(keymap::Cmd::ShowHidden | keymap::Cmd::HomeDir) | None => {
-                if let Some(c) = typed_char(&k) {
-                    a.filter.push(c);
-                    a.sel = 0;
-                }
-            }
+            Some(keymap::Cmd::HomeDir) => a.cd(expand_home("~")),
             _ => {}
         }
         self.keep_attach(a);
@@ -514,14 +500,10 @@ impl App {
 
     pub fn draw_attach(&mut self, f: &mut Frame, area: Rect, a: &mut Attach, hint: String) {
         let r = modal::popup(area, 110, area.height.saturating_sub(2).max(12));
-        f.render_widget(Clear, r);
+        crate::picture::cover(f, r);
         self.hit.modal = Some(r);
         let title = match &self.open {
             _ if a.cover => " 🏞 New profile cover ".into(),
-            _ if a.import.is_some() => format!(
-                " 📥 Import LINE chat history into {} ",
-                self.name(a.import.as_deref().unwrap_or_default())
-            ),
             Some(chat) => format!(" 📎 Send to {} ", self.name(chat)),
             None => " 📎 Send ".into(),
         };
@@ -545,20 +527,18 @@ impl App {
             .style(Style::new().bold()),
             path_row,
         );
+        let (shown, cursor) = a.filter.view(filter_row.width.saturating_sub(3) as usize);
         let filter_line = if a.filter.is_empty() {
             Line::from(Span::styled("🔍 type a name or a path…", Style::new().dim()))
         } else {
-            Line::from(vec![Span::raw("🔍 "), Span::raw(a.filter.clone())])
+            Line::from(vec![Span::raw("🔍 "), Span::raw(shown.to_owned())])
         };
         f.render_widget(
             Paragraph::new(filter_line).style(Style::new().bg(Color::Indexed(236))),
             filter_row,
         );
         if a.chosen.is_none() {
-            f.set_cursor_position(Position::new(
-                filter_row.x + 3 + a.filter.width() as u16,
-                filter_row.y,
-            ));
+            f.set_cursor_position(Position::new(filter_row.x + 3 + cursor, filter_row.y));
         }
         let vis = a.visible();
         let h = rows.height as usize;
@@ -727,11 +707,7 @@ impl App {
             }
         } else if a.chosen.is_none() && a.error.is_none() {
             f.render_widget(
-                Paragraph::new(if a.import.is_some() {
-                    "Pick a chat exported from the LINE app on your phone (chat → ☰ → Other settings → \
-                     Export chat history; a .txt file). You see what it holds before anything is imported.\n\n\
-                     The messages are only added on this computer."
-                } else if a.cover {
+                Paragraph::new(if a.cover {
                     "Pick a picture (JPEG or PNG) for your profile cover. It is previewed here; LINE shows the middle of it as a wide band."
                 } else {
                     "Pick a file. Photos are previewed here.\n\nTip: you can also drag a file onto the terminal or paste its path into the message line."
@@ -819,7 +795,7 @@ mod tests {
         let mut a = Attach::new(dir.clone());
         let names: Vec<&str> = a.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["zdir", "a.txt"]);
-        a.filter = "TXT".into();
+        a.filter.set("TXT");
         assert_eq!(a.visible(), [1]);
         a.show_hidden = true;
         a.reload();

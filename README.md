@@ -11,62 +11,69 @@ with [wasmtime](https://wasmtime.dev), so you need neither Node.js nor a
 browser. Its output matches the reference implementation byte for byte (see
 [docs/PROTOCOL.md](docs/PROTOCOL.md)).
 
-> ⚠️ **Read this first.** `rune` is an unofficial, third-party LINE client. It is not an official LINE API, is not developed by, affiliated with, or endorsed by LY Corporation.
+> ⚠️ **Read this first.** `rune` is an unofficial, third-party LINE client. It is not an official LINE API, is not
+> developed by, affiliated with, or endorsed by LY Corporation.
 >
-> `rune` communicates with LINE using undocumented protocols derived from the LINE ChromeOS extension. These protocols are not officially supported for third-party client development and may change or stop working without notice.
+> `rune` communicates with LINE using undocumented protocols derived from the LINE ChromeOS extension. These protocols
+> are not officially supported for third-party client development and may change or stop working without notice.
 >
-> Using unofficial clients and reverse-engineered protocols may conflict with LINE's Terms of Use, particularly provisions concerning unauthorized or improper service access, automated activity, and reverse engineering.
+> Using unofficial clients and reverse-engineered protocols may conflict with LINE's Terms of Use, particularly
+> provisions concerning unauthorized or improper service access, automated activity, and reverse engineering.
 >
-> LY Corporation may restrict access, invalidate sessions, suspend functionality, or take action against accounts in accordance with its terms. Account restrictions or loss of access are possible, and no compatibility or account-safety guarantees are provided.
+> LY Corporation may restrict access, invalidate sessions, suspend functionality, or take action against accounts in
+> accordance with its terms. Account restrictions or loss of access are possible, and no compatibility or account-safety
+> guarantees are provided.
 >
-> **Security and privacy:** `rune` handles sensitive authentication credentials, E2EE private keys, and decrypted messages. Its local session and database files should be treated as confidential. You are also responsible for handling other people's messages and personal information appropriately.
+> **Security and privacy:** `rune` handles sensitive authentication credentials, E2EE private keys, and decrypted
+> messages. Its local session and database files should be treated as confidential. You are also responsible for handling
+> other people's messages and personal information appropriately.
 >
-> Use at your own risk. Only authenticate accounts you are authorized to use, avoid excessive requests, protect your local data, and review [LINE's current Terms of Use](https://terms.line.me/line_terms?lang=en) before using this client.
+> Use at your own risk. Only authenticate accounts you are authorized to use, avoid excessive requests, protect your
+> local data, and review [LINE's current Terms of Use](https://terms.line.me/line_terms?lang=en) before using this client.
 
 ## Status
 
-| Feature | Status |
-|---|---|
-| `X-Hmac` signing (native `ltsm.wasm`) | ✅ verified against reference vectors |
-| QR login (incl. PIN step), certificate reuse | ✅ live-tested |
-| Token refresh (code 119 / 401, retry policy, 10201 kickout) | ✅ refresh endpoint live-tested; 119/10201 paths mock-tested |
-| Timed token refresh (`spawn_token_refresher`: renews before `durationUntilRefreshInSec` runs out, wall-clock aware) | ✅ unit + mock-tested; the TUI runs it |
-| Session save/restore (tokens + E2EE key blobs) | ✅ |
-| Profile, contacts, friends, block/unblock | ✅ profile + contact list live; the rest shapes from reference |
-| Chat list paging, including inactive (hidden or old) chats (`message_boxes_page`); TUI loads more when the last chat is selected | ✅ page shapes and cursor checked live (read-only); TUI paging unit-tested, not yet clicked through live |
-| Group chats: list, create, invite, kick, leave, rename, mute (`create_group`, `rename_chat`, `set_chat_muted`); TUI menus | ✅ listing + mute state live; create/invite/leave/rename/mute calls mock-tested only |
-| Joining a group by invitation link / QR ticket | ❌ the gateway answers `REQUEST_NOT_FOUND` for `findChatByTicket` / `acceptChatInvitationByTicket` (live) |
-| Group invitations: list pending (`invited_chats`), accept/decline (CLI + TUI) | ✅ listing + decline live; accept mock-tested only |
-| Replies: send (`send_reply`, `OutgoingMessage::reply_to`), detect (`Message::reply_to`, `is_forwarded`), TUI quotes | ✅ detection live on real history; sending mock/unit-tested only |
-| OpenChat (Square) | ❌ not served by the Chrome gateway (see `docs/PROTOCOL.md`) |
-| Messages: text, sticker, contact, location, reply, unsend, reactions, read marks, history | ✅ history + sealed text send live; other types shapes from reference |
-| Sending Flex messages | ❌ a feature for official accounts / bots (LINE Messaging API); personal accounts get TalkException 11 "Incompatible app version" (live). Received ones show their alt text |
-| Importing chat history exported from the LINE phone app (`rune::import`, `Store::import_messages`; TUI chat menu → *Import chat history from LINE…*): keeps messages the server no longer serves, local-only, deduped against real messages | ⚠️ unit-tested against hand-written exports in the documented layouts (English, Thai, Japanese date/time forms); not yet run on a real exported file |
-| TUI: stickers (recent ones from owned packs + owned packs; LINE rejects unowned stickers with HTTP 400), location, contact card, reactions, unsend, read receipts | ✅ owned-pack listing live; sending these types mock/unit-tested, not sent live |
-| Typed operations (`Operation::event()`): read marks, reads on other devices, unsend, reactions, membership | ✅ layouts read off the live stream (2026-11-14) |
-| Read status ("Read" / "Read by N") | ✅ from live `NOTIFIED_READ_MESSAGE` ops; `getMessageReadRange` is served but returned `[]` live, so earlier reads are unknown |
-| Typing indicators | ⚠️ shown when op 62 arrives (never observed live); the Chrome protocol has no method to send them |
-| Local store (`rune::store`, SQLite): chats, decrypted messages, contacts, read marks, stream position, settings | ✅ unit-tested; TUI start-up from the store and resume live-tested |
-| Store: user cache (any mid's name/status/picture/cover/members) and profile picture/cover images | ✅ unit-tested; not yet live-tested |
-| Notification settings: LINE's account switches (`settings_attributes` / `update_settings`), per-chat mute; desktop notifications in the TUI | ✅ reading live; writing mock-tested only |
-| Operation stream (SSE, resume cursor, reconnect) | ✅ live (connect, pings, replay from a cursor, auto-decrypt) |
-| Any of the 77 extension methods via `Client::call` | ✅ (`rune::endpoints::THRIFT_METHODS`) |
-| Letter Sealing primitives (ECDH, V1, V2) | ✅ V1 interop with the reference; V2 round-trip with real keys |
-| Keychain capture at login | ✅ live (keys persist and reload) |
-| Reading sealed (E2EE) messages, 1:1 and group | ✅ live: history 37/37, and live stream (official-app and phone messages) |
-| E2EE failures typed, never dropped; key status/rotation handling; restart | ✅ mock-tested with real keys; `e2ee-status` live |
-| Sending sealed text/location, 1:1 and group (auto on code 82) | ✅ 1:1 and group sent live (existing group key); creating a new group key mock-tested only |
-| Media download: images, video, audio, files (plain, sealed, bot URLs) | ✅ live, incl. official-app sealed media |
-| Media upload (sealed V2 + plain V1), image previews/resizing | ✅ sealed image sent live; video/audio/file and plain flow mock-tested |
-| Profile/group pictures, sticker images | ✅ live |
-| Profile covers (`profile_cover`, `download_cover`; video covers reported); TUI profile pages show them | ✅ live (own + friends'); groups have none |
-| Changing your cover (`set_profile_cover`, CLI `set-cover`, TUI `e` on your profile) | ⚠️ mock-tested only (would change the live profile); TUI picker and confirmation checked live, upload not run |
-| Group albums: album posts (`Message::album_post`) and album events (`album_event`: rename/delete/items removed), album photo download (`download_album_media`, also via `download_media`); TUI album list per group | ✅ posts parsed and all photos downloaded live; events unit-tested from the extension's code |
-| Listing, creating or editing albums | ❌ the gateway serves no album API (the extension has no album browser) |
-| Animated stickers (`Message::is_animated_sticker`, `StickerImage::Animation` APNG); TUI plays them, GIFs and animated WebPs in the viewer (frame-by-frame decode at a fixed 12 fps, looping), videos and audio in mpv | ✅ metadata and APNG URL checked live; in-viewer playback unit-tested (frame decode, replace, loop, stop), not yet watched live against a real animated sticker; mpv playback unit-tested (mpv was not installed on the test machine) |
-| Call history: `Message::call()` → `CallRecord` (1:1 + group, voice/video/live, duration); TUI/CLI show `📞 Voice call · 3:12` | ⚠️ unit-tested only: no call record was left in the account's server-side history; metadata keys from the official apps, parsed leniently |
-| Placing or answering voice/video calls | ❌ not possible: the extension protocol has no call methods and LINE's call media stack is proprietary (TUI points incoming calls at the phone) |
-| E-mail/password login | ❌ not planned for now |
+| Feature                                                                                                                                                                                                                                     | Status                                                                                                                                                                                                                                |
+|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `X-Hmac` signing (native `ltsm.wasm`)                                                                                                                                                                                                       | ✅ verified against reference vectors                                                                                                                                                                                                 |
+| QR login (incl. PIN step), certificate reuse                                                                                                                                                                                                | ✅ live-tested                                                                                                                                                                                                                        |
+| Token refresh (code 119 / 401, retry policy, 10201 kickout)                                                                                                                                                                                 | ✅ refresh endpoint live-tested; 119/10201 paths mock-tested                                                                                                                                                                          |
+| Timed token refresh (`spawn_token_refresher`: renews before `durationUntilRefreshInSec` runs out, wall-clock aware)                                                                                                                         | ✅ unit + mock-tested; the TUI runs it                                                                                                                                                                                                |
+| Session save/restore (tokens + E2EE key blobs)                                                                                                                                                                                              | ✅                                                                                                                                                                                                                                    |
+| Profile, contacts, friends, block/unblock                                                                                                                                                                                                   | ✅ profile + contact list live; the rest shapes from reference                                                                                                                                                                        |
+| Chat list paging, including inactive (hidden or old) chats (`message_boxes_page`); TUI loads more when the last chat is selected                                                                                                            | ✅ page shapes and cursor checked live (read-only); TUI paging unit-tested, not yet clicked through live                                                                                                                              |
+| Group chats: list, create, invite, kick, leave, rename, mute (`create_group`, `rename_chat`, `set_chat_muted`); TUI menus                                                                                                                   | ✅ listing + mute state live; create/invite/leave/rename/mute calls mock-tested only                                                                                                                                                  |
+| Joining a group by invitation link / QR ticket                                                                                                                                                                                              | ❌ the gateway answers `REQUEST_NOT_FOUND` for `findChatByTicket` / `acceptChatInvitationByTicket` (live)                                                                                                                             |
+| Group invitations: list pending (`invited_chats`), accept/decline (CLI + TUI)                                                                                                                                                               | ✅ listing + decline live; accept mock-tested only                                                                                                                                                                                    |
+| Replies: send (`send_reply`, `OutgoingMessage::reply_to`), detect (`Message::reply_to`, `is_forwarded`), TUI quotes                                                                                                                         | ✅ detection live on real history; sending mock/unit-tested only                                                                                                                                                                      |
+| OpenChat (Square)                                                                                                                                                                                                                           | ❌ not served by the Chrome gateway (see `docs/PROTOCOL.md`)                                                                                                                                                                          |
+| Messages: text, sticker, contact, location, reply, unsend, reactions, read marks, history                                                                                                                                                   | ✅ history + sealed text send live; other types shapes from reference                                                                                                                                                                 |
+| Sending Flex messages                                                                                                                                                                                                                       | ❌ a feature for official accounts / bots (LINE Messaging API); personal accounts get TalkException 11 "Incompatible app version" (live). Received ones show their alt text                                                           |
+| TUI: stickers (recent ones from owned packs + owned packs; LINE rejects unowned stickers with HTTP 400), location, contact card, reactions, unsend, read receipts                                                                           | ✅ owned-pack listing live; sending these types mock/unit-tested, not sent live                                                                                                                                                       |
+| Typed operations (`Operation::event()`): read marks, reads on other devices, unsend, reactions, membership                                                                                                                                  | ✅ layouts read off the live stream (2026-11-14)                                                                                                                                                                                      |
+| Read status ("Read" / "Read by N")                                                                                                                                                                                                          | ✅ from live `NOTIFIED_READ_MESSAGE` ops; `getMessageReadRange` is served but returned `[]` live, so earlier reads are unknown                                                                                                        |
+| Typing indicators                                                                                                                                                                                                                           | ⚠️ shown when op 62 arrives (never observed live); the Chrome protocol has no method to send them                                                                                                                                     |
+| Local store (`rune::store`, SQLite): chats, decrypted messages, contacts, read marks, stream position, settings                                                                                                                             | ✅ unit-tested; TUI start-up from the store and resume live-tested                                                                                                                                                                    |
+| Store: user cache (any mid's name/status/picture/cover/members) and profile picture/cover images                                                                                                                                            | ✅ unit-tested; not yet live-tested                                                                                                                                                                                                   |
+| Notification settings: LINE's account switches (`settings_attributes` / `update_settings`), per-chat mute; desktop notifications in the TUI                                                                                                 | ✅ reading live; writing mock-tested only                                                                                                                                                                                             |
+| Operation stream (SSE, resume cursor, reconnect)                                                                                                                                                                                            | ✅ live (connect, pings, replay from a cursor, auto-decrypt)                                                                                                                                                                          |
+| Any of the 77 extension methods via `Client::call`                                                                                                                                                                                          | ✅ (`rune::endpoints::THRIFT_METHODS`)                                                                                                                                                                                                |
+| Letter Sealing primitives (ECDH, V1, V2)                                                                                                                                                                                                    | ✅ V1 interop with the reference; V2 round-trip with real keys                                                                                                                                                                        |
+| Keychain capture at login                                                                                                                                                                                                                   | ✅ live (keys persist and reload)                                                                                                                                                                                                     |
+| Reading sealed (E2EE) messages, 1:1 and group                                                                                                                                                                                               | ✅ live: history 37/37, and live stream (official-app and phone messages)                                                                                                                                                             |
+| E2EE failures typed, never dropped; key status/rotation handling; restart                                                                                                                                                                   | ✅ mock-tested with real keys; `e2ee-status` live                                                                                                                                                                                     |
+| Sending sealed text/location, 1:1 and group (auto on code 82)                                                                                                                                                                               | ✅ 1:1 and group sent live (existing group key); creating a new group key mock-tested only                                                                                                                                            |
+| Media download: images, video, audio, files (plain, sealed, bot URLs)                                                                                                                                                                       | ✅ live, incl. official-app sealed media                                                                                                                                                                                              |
+| Media upload (sealed V2 + plain V1), image previews/resizing                                                                                                                                                                                | ✅ sealed image sent live; video/audio/file and plain flow mock-tested                                                                                                                                                                |
+| Profile/group pictures, sticker images                                                                                                                                                                                                      | ✅ live                                                                                                                                                                                                                               |
+| Profile covers (`profile_cover`, `download_cover`; video covers reported); TUI profile pages show them                                                                                                                                      | ✅ live (own + friends'); groups have none                                                                                                                                                                                            |
+| Changing your cover (`set_profile_cover`, CLI `set-cover`, TUI `e` on your profile)                                                                                                                                                         | ⚠️ mock-tested only (would change the live profile); TUI picker and confirmation checked live, upload not run                                                                                                                         |
+| Group albums: album posts (`Message::album_post`) and album events (`album_event`: rename/delete/items removed), album photo download (`download_album_media`, also via `download_media`); TUI album list per group                         | ✅ posts parsed and all photos downloaded live; events unit-tested from the extension's code                                                                                                                                          |
+| Listing, creating or editing albums                                                                                                                                                                                                         | ❌ the gateway serves no album API (the extension has no album browser)                                                                                                                                                               |
+| Animated stickers (`Message::is_animated_sticker`, `StickerImage::Animation` APNG); TUI plays them, GIFs and animated WebPs in the viewer (frame-by-frame decode at a fixed 12 fps, looping), videos and audio in mpv                       | ✅ metadata and APNG URL checked live; in-viewer playback unit-tested (frame decode, replace, loop, stop), not yet watched live against a real animated sticker; mpv playback unit-tested (mpv was not installed on the test machine) |
+| Call history: `Message::call()` → `CallRecord` (1:1 + group, voice/video/live, duration); TUI/CLI show `📞 Voice call · 3:12`                                                                                                               | ⚠️ unit-tested only: no call record was left in the account's server-side history; metadata keys from the official apps, parsed leniently                                                                                             |
+| Placing or answering voice/video calls                                                                                                                                                                                                      | ❌ not possible: the extension protocol has no call methods and LINE's call media stack is proprietary (TUI points incoming calls at the phone)                                                                                       |
+| E-mail/password login                                                                                                                                                                                                                       | ❌ not planned                                                                                                                                                                                                                        |
 
 "Shapes from reference" means the request and response formats come from
 OkLine, which reports testing them live; `rune` has not exercised those calls
@@ -118,17 +125,17 @@ contacts, read marks and the stream position in SQLite:
 
 ```rust
 let me = client.my_mid().unwrap();
-let store = rune::Store::open("rune.db")?;          // created 0600
-store.bind_account(&me)?;                           // wipes another account's data
-let mut ops = client.operations(store.stream_revision()?); // resume where we stopped
+let store = rune::Store::open("rune.db") ?;          // created 0600
+store.bind_account( & me) ?;                           // wipes another account's data
+let mut ops = client.operations(store.stream_revision() ? ); // resume where we stopped
 loop {
-    let op = ops.next_operation().await?;
-    store.apply(&op, &me, |m| m.text.clone().unwrap_or_default())?; // also saves the position
-    match op.event() {
-        rune::OpEvent::Read { chat, reader, message_id } => { /* "Read by" */ }
-        rune::OpEvent::Reaction { message_id, from, reaction, .. } => { /* … */ }
-        _ => {}
-    }
+let op = ops.next_operation().await?;
+store.apply( & op, &me, | m | m.text.clone().unwrap_or_default()) ?; // also saves the position
+match op.event() {
+rune::OpEvent::Read { chat, reader, message_id } => { /* "Read by" */ }
+rune::OpEvent::Reaction { message_id, from, reaction, .. } => { /* … */ }
+_ => {}
+}
 }
 ```
 
@@ -150,11 +157,13 @@ receive, seal on send). Images, video previews and stickers appear as inline
 thumbnails; a viewer shows them full-size, and any media can be saved or opened.
 Text messages sit in rounded bubbles: yours on the right, everyone else's on
 the left, word-wrapped to three quarters of the pane.
-Pinned chats live in named **pin lists**: each LINE account has its own lists
-(a `Default` list holds pins made before lists existed), one of them is active,
+Pinned chats live in named **pin lists**: each LINE account has its own lists (a `Default` list holds pins made before
+lists existed), one of them is active,
 and each keeps its own order. "📌 Pin lists…" in a chat's menu switches
 between them, creates, renames and deletes them; pinning, unpinning and
-`K`/`J` act on the active list only. Lists and the
+`K`/`J` act on the active list only. A pinned chat with unread messages
+moves to the top of the pinned section until it is read, then returns to its
+place (several unread pins keep their pin order). Lists and the
 active choice are stored locally and survive restarts.
 Links are underlined and open in your browser on click (or `Enter` on
 the selected message). Pictures are scanned for QR codes; what a code says is
@@ -163,7 +172,7 @@ shown under the picture and in the viewer, and QR links open the same way.
 Profiles look like LINE's: the cover photo as a band across the top, a
 round avatar, name and status message, Chat, Photo and Cover buttons, and
 members for groups (pick one to see their profile). Open one with `p` on a
-chat or message, `Ctrl-P` for the open chat, Settings › Profile for your
+chat or message, `Ctrl-p` for the open chat, Settings › Profile for your
 own, or by clicking the chat title or a sender's name. `←`/`→` pick a button
 and `Enter` presses it (or click): *Cover* opens the full cover, and on your
 own profile *Change cover* picks a new cover picture in the file browser and
@@ -171,27 +180,12 @@ asks before replacing it. Groups (which have no
 cover) and users with LINE's default cover get the profile picture, blurred
 and darkened, instead.
 
-**Importing old history.** LINE serves only so much history (about two
-weeks of media on this device). For older messages, export the chat from the
-LINE app on your phone (chat → ☰ → *Other settings* → *Export chat history*,
-a `.txt` file), copy it to the computer, and pick it with *📥 Import chat
-history from LINE…* in the chat's menu. rune shows the date range and how
-the senders were matched (you, the chat's members and your friends by
-name; anyone else is shown by name) before importing. Imported messages
-sit above LINE's history in time order and stay on this computer: they
-cannot be replied to, reacted to or unsent, photos and stickers are only
-placeholders such as `[Photo]`, and times are read in the computer's time
-zone. Importing the same file twice adds nothing; a message that is later
-fetched from LINE replaces its imported copy. *Remove imported history…*
-deletes them again.
-
 **Albums.** When someone creates an album or adds photos to one, the chat
 shows "🖼 added to the album «…»" with the photo inline; it opens in the
 viewer and saves like any picture. The group menu's *Albums* (or `/albums`)
 lists every album the chat's history mentions with its photos; picking one
 shows it in the viewer. LINE's Chrome protocol cannot list an album's full
-contents, so an album shows the photos that were announced in the chat
-(LINE announces the first few photos of a batch).
+contents, so an album shows the photos that were announced in the chat (LINE announces the first few photos of a batch).
 
 Pictures, inline and in the viewer, use the terminal's own image protocol at
 full resolution: Kitty, Sixel or iTerm2, detected at start-up (WezTerm and
@@ -223,6 +217,15 @@ newest one (or just typing) returns to the input line. The mouse works too —
 click a chat or a picture, scroll with the wheel. Pass `--no-mouse` to leave
 the mouse to the terminal (Shift-drag selects text in most terminals anyway).
 
+`Enter` sends and `Shift-Enter` starts a new line (`Alt-Enter` or `Ctrl-j`
+where the terminal does not report `Shift-Enter`). Nothing half-written
+goes out by accident: pasted text keeps its line breaks and waits for your
+`Enter` — also in terminals without bracketed paste, which type a paste out
+as keys (a burst of keys read at once is a paste, and its `Enter`s are line
+breaks); several lines are never taken for a `/command`; and each chat
+keeps its own draft (and reply), shown as `✎ …` in the chat list and kept
+across restarts, so switching chats never sends one chat's text to another.
+
 `?` (or `F1`, which also works while typing) lists every key of the screen
 you are on; the status line shows the common ones that apply right now.
 Letters are only bound where nothing is typed and only for frequent actions;
@@ -230,47 +233,51 @@ everything else is in the selected item's menu (`m`), by name. Consequential
 actions (unsend, leave, decline, delete) ask first, with the *Cancel* button
 highlighted.
 
-| Key / mouse / command | Action |
-|---|---|
-| `Ctrl-C` | quit (also `/quit`) |
-| `?`, `F1` | the keys of the current screen |
-| `Ctrl-S` | settings (also `/settings`) |
-| `↑` `↓` / `j` `k`, wheel | move in the chat list / message list |
-| chat list: `PgUp` `PgDn` | a page of chats up / down |
-| chat list: `↓` / wheel to the last chat | load more chats: older and hidden ones the start-up list leaves out (100 per page, until all are listed) |
-| `Enter`, click | open the chat · send the message · view the selected media (GIFs and animated stickers play in the viewer); videos, audio and audio/video files **play in mpv** |
-| chat list: `Enter` on an invitation | join or decline (invitations are listed first, in yellow) |
-| chat list: `/` | search chats by name or member (`Esc` stops) |
-| chat list: `m`, `Ctrl-G` in a chat | the chat's menu: pin/unpin, move pin, pin lists, invite, rename, members, albums, mute, import history, leave |
-| chat list: `p`, `Ctrl-P` in a chat | the chat's profile |
-| chat list: `n` | new group (name, then pick friends) |
-| chat list: `K` / `J` | move the selected pinned chat up / down |
-| `Tab` | jump between the chat list and the open chat |
-| `Esc` | back: viewer → messages → typing → chat list |
-| typing: `←` `→` `Home` `End` `Delete` `Backspace` | edit the message at the cursor |
-| typing: `↑` | select messages (starts at the newest) |
-| messages: `↓` past the newest, or any other letter | back to typing |
-| typing / messages: `Ctrl-O` | send a photo/video/file, sticker, location or contact card |
-| paste or drop a file path | offers to send that file |
-| messages: `r` | reply to the selected message (input shows the quote; `Esc` cancels) |
-| messages: `e` | react (👍 ❤️ 😆 😲 😢 😡; again to change, "remove" to take it back) |
-| messages / viewer: `s` | save to `~/Downloads/rune/` (original file name, never overwrites) |
-| messages / viewer: `o` | open (from `~/.cache/rune/view/`, not Downloads): motion media in mpv, everything else with the system app (`xdg-open` / `open`) |
-| messages: `p` | the sender's profile |
-| messages: `x` | unsend one of your messages (asks first) |
-| messages / viewer: `m` | every action for the message: reply, react, reactions, read by, unsend, view, save, open, go to the quoted message, sender's profile |
-| viewer: `←` `→` / `h` `l`, wheel | previous / next media in the chat |
-| viewer: `Space` | play a video or audio clip in mpv; pause / resume a GIF or animated sticker |
-| viewer: `u` | open the link in the picture's QR code |
-| viewer: click outside, right-click | close |
-| `PgUp` `PgDn`, wheel | scroll the conversation |
-| `PgUp` / wheel at the top | load older messages (store first, then LINE) |
-| `/save PATH` | save the most recent picture/video/audio/file of the chat |
-| `/attach [PATH]` (`/image`, `/file`), `/sticker`, `/location`, `/contact` | open the matching dialog |
-| `/group`, `/invite`, `/rename`, `/albums`, `/leave`, `/mute`, `/unmute`, `/menu` | group shortcuts |
+| Key / mouse / command                                                            | Action                                                                                                                                                          |
+|----------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `Ctrl-c`                                                                         | quit (also `/quit`)                                                                                                                                             |
+| `?`, `F1`                                                                        | the keys of the current screen                                                                                                                                  |
+| `Ctrl-s`                                                                         | settings (also `/settings`)                                                                                                                                     |
+| `↑` `↓` / `j` `k`, wheel                                                         | move in the chat list / message list                                                                                                                            |
+| chat list: `PgUp` `PgDn`                                                         | a page of chats up / down                                                                                                                                       |
+| `Home` `End` (chat list, messages, menus, settings)                              | first / last item; in messages `End` selects the newest message                                                                                                 |
+| chat list: `↓` / wheel to the last chat                                          | load more chats: older and hidden ones the start-up list leaves out (100 per page, until all are listed)                                                        |
+| `Enter`, click                                                                   | open the chat · send the message · view the selected media (GIFs and animated stickers play in the viewer); videos, audio and audio/video files **play in mpv** |
+| chat list: `Enter` on an invitation                                              | join or decline (invitations are listed first, in yellow)                                                                                                       |
+| chat list: `/`                                                                   | search chats by name or member (`Esc` stops)                                                                                                                    |
+| chat list: `m`, `Ctrl-g` in a chat                                               | the chat's menu: pin/unpin, move pin, pin lists, invite, rename, members, albums, mute, leave                                                                   |
+| chat list: `p`, `Ctrl-p` in a chat                                               | the chat's profile                                                                                                                                              |
+| chat list: `n`                                                                   | new group (name, then pick friends)                                                                                                                             |
+| chat list: `K` / `J`                                                             | move the selected pinned chat up / down                                                                                                                         |
+| `Tab`                                                                            | jump between the chat list and the open chat                                                                                                                    |
+| `Esc`                                                                            | back: viewer → messages → typing → chat list                                                                                                                    |
+| typing: `←` `→` `Home` `End` `Delete` `Backspace`                                | edit the message at the cursor (`Home` / `End`: start / end of the line)                                                                                        |
+| typing: `Ctrl-←` `Ctrl-→` `Ctrl-w` `Ctrl-u` `Ctrl-k`                             | previous / next word, delete the word before the cursor, delete to the start / end of the line (every text field)                                               |
+| typing: `Shift-Enter` / `Alt-Enter` / `Ctrl-j`                                   | new line: the message line grows with the text and `Enter` sends all of it as one message                                                                         |
+| typing: `↑` `↓`                                                                  | move between the lines; `↑` on the first line selects messages (starts at the newest)                                                                             |
+| messages: `↓` past the newest, or any other letter                               | back to typing                                                                                                                                                  |
+| typing / messages: `Ctrl-o`                                                      | send a photo/video/file, sticker, location or contact card                                                                                                      |
+| paste or drop a file path                                                        | offers to send that file                                                                                                                                        |
+| messages: `r`                                                                    | reply to the selected message (input shows the quote; `Esc` cancels)                                                                                            |
+| messages: `e`                                                                    | react (👍 ❤️ 😆 😲 😢 😡; again to change, "remove" to take it back)                                                                                            |
+| messages / viewer: `s`                                                           | save to `~/Downloads/rune/` (original file name, never overwrites)                                                                                              |
+| messages / viewer: `o`                                                           | open (from `~/.cache/rune/view/`, not Downloads): motion media in mpv, everything else with the system app (`xdg-open` / `open`)                                |
+| messages: `p`                                                                    | the sender's profile                                                                                                                                            |
+| messages: `x`                                                                    | unsend one of your messages (asks first)                                                                                                                        |
+| messages / viewer: `m`                                                           | every action for the message: reply, react, reactions, read by, unsend, view, save, open, go to the quoted message, sender's profile                            |
+| viewer: `←` `→` / `h` `l`, wheel                                                 | previous / next media in the chat                                                                                                                               |
+| viewer: `Space`                                                                  | play a video or audio clip in mpv; pause / resume a GIF or animated sticker                                                                                     |
+| viewer: `u`                                                                      | open the link in the picture's QR code                                                                                                                          |
+| viewer: click outside, right-click                                               | close                                                                                                                                                           |
+| `PgUp` `PgDn`, wheel                                                             | scroll the conversation                                                                                                                                         |
+| `PgUp` / wheel at the top                                                        | load older messages (store first, then LINE)                                                                                                                    |
+| `/save PATH`                                                                     | save the most recent picture/video/audio/file of the chat                                                                                                       |
+| `/attach [PATH]` (`/image`, `/file`), `/sticker`, `/location`, `/contact`        | open the matching dialog                                                                                                                                        |
+| `/group`, `/invite`, `/rename`, `/albums`, `/leave`, `/mute`, `/unmute`, `/menu` | group shortcuts                                                                                                                                                 |
+| `/help`                                                                          | the shortcuts, followed by every `/` command                                                                                                                    |
 
-**Sending things.** `Ctrl-O` → *Photo, video or file* opens a file browser
-(type to filter, `~` home, `.` hidden files) with a preview of pictures;
+**Sending things.** `Ctrl-o` → *Photo, video or file* opens a file browser (type to filter, `~` home, `.` hidden files)
+with a preview of pictures;
 choosing a file shows a send dialog that picks photo/video/audio/file from
 the extension (`f` sends it as a plain file instead, `o` sends photos in
 original quality with location and personal metadata removed). MP4/M4A
@@ -305,11 +312,11 @@ members and leave from the chat menu; `Enter` on an invitation joins or
 declines it. Joining by invitation link or QR code is not
 possible: the Chrome gateway does not serve the ticket methods.
 
-**Settings** (`Ctrl-S`): *Notifications* (desktop notification, terminal bell
-or off; message text; groups; muted chats never notify; a test button),
-*LINE account* (LINE's own notification switches — they apply to your
-phone too), *Chats* (read receipts, automatic pictures, inline picture size),
-*Profile* (display name, status message, your profile page), *Storage* (database path,
+**Settings** (`Ctrl-s`): *Notifications* (desktop notification, terminal bell
+or off; message text; groups; muted chats never notify; a test button), *LINE account* (LINE's own notification
+switches — they apply to your
+phone too), *Chats* (read receipts, automatic pictures, inline picture size), *Profile* (display name, status message,
+your profile page), *Storage* (database path,
 counts, stream position, clear local data).
 
 Opening a chat marks it as read (others see the read receipt) unless you
@@ -380,20 +387,20 @@ RUNE_SESSION=session.json \
 
 ## Layout
 
-| Path | What |
-|---|---|
-| `src/ltsm/` | wasmtime host for `ltsm.wasm` (`runtime.rs`) and its typed API (`mod.rs`) |
-| `src/transport.rs` | HTTP, headers, signing, envelope, retries, token refresh |
-| `src/client.rs` | typed operations |
-| `src/auth.rs` | QR login |
-| `src/e2ee.rs` | Letter Sealing: framing, 1:1/group keys, seal/decrypt |
-| `src/media.rs` | media upload/download, blob encryption, pictures, stickers |
-| `src/events.rs` | SSE operation stream |
-| `src/models.rs` | message builders, typed responses |
-| `src/session.rs` | session persistence |
-| `src/import.rs` | parser for chats exported from the LINE app |
-| `src/bin/rune-tui.rs` | terminal chat app (feature `tui`) |
-| `docs/PROTOCOL.md` | protocol findings and what is verified |
+| Path                  | What                                                                      |
+|-----------------------|---------------------------------------------------------------------------|
+| `src/ltsm/`           | wasmtime host for `ltsm.wasm` (`runtime.rs`) and its typed API (`mod.rs`) |
+| `src/transport.rs`    | HTTP, headers, signing, envelope, retries, token refresh                  |
+| `src/client.rs`       | typed operations                                                          |
+| `src/auth.rs`         | QR login                                                                  |
+| `src/e2ee.rs`         | Letter Sealing: framing, 1:1/group keys, seal/decrypt                     |
+| `src/media.rs`        | media upload/download, blob encryption, pictures, stickers                |
+| `src/events.rs`       | SSE operation stream                                                      |
+| `src/models.rs`       | message builders, typed responses                                         |
+| `src/session.rs`      | session persistence                                                       |
+| `src/bin/rune-tui/`   | terminal chat app (feature `tui`): `main.rs`, `graphics/`, `overlays/`    |
+| `docs/PROTOCOL.md`    | protocol findings and what is verified                                    |
 
 ## Why is it called a `rune`?
+
 It's because Ru(st) + (Li)ne = Rune.

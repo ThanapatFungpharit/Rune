@@ -38,7 +38,6 @@ pub mod endpoints;
 pub mod error;
 pub mod events;
 mod exif;
-pub mod import;
 pub mod ltsm;
 pub mod media;
 pub mod models;
@@ -54,7 +53,6 @@ pub use auth::{E2eeKey, LoginResult, QrLoginEvent, QrLoginOptions};
 pub use client::{Client, Reaction, ReadRange, StickerPackage};
 pub use error::{ApiError, E2eeErrorKind, E2eeFailure, Error, Result};
 pub use events::{Event, OperationStream};
-pub use import::{ChatExport, parse_chat_export};
 pub use media::{MediaKind, MediaUpload, PictureSize, StickerImage};
 pub use models::{
     CallMedia, CallOutcome, CallRecord, Chat, Contact, Message, MessageReaction, MidType, Operation,
@@ -63,6 +61,6 @@ pub use models::{
 pub use ops::OpEvent;
 pub use session::Session;
 #[cfg(feature = "store")]
-pub use store::{ImportStats, PinProfile, Store};
+pub use store::{PinProfile, Store};
 pub use timeline::{ObsObject, ProfileCover};
 pub use transport::{Config, Tokens};

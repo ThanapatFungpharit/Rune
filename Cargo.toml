@@ -52,5 +52,5 @@ tui = ["store", "dep:rqrr", "dep:ratatui", "dep:crossterm", "dep:chrono", "dep:u
 
 [[bin]]
 name = "rune-tui"
-path = "src/bin/rune-tui.rs"
+path = "src/bin/rune-tui/main.rs"
 required-features = ["tui"]

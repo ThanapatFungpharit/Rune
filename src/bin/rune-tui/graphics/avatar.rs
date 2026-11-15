@@ -1,7 +1,7 @@
 //! Small round profile pictures shown beside names: in message headers
 //! (2×1 cells) and in the chat list (4×2 cells).
 
-use super::*;
+use crate::*;
 use image::DynamicImage;
 use rune::PictureSize;
 
