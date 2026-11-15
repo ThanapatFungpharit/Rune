@@ -4,6 +4,7 @@
 pub mod albums;
 pub mod attach;
 pub mod modal;
+pub mod plugin_ui;
 pub mod profile;
 pub mod settings;
 pub mod stickers;

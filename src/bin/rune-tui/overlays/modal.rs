@@ -1,8 +1,20 @@
 //! Overlays: menus, forms, pickers, confirmations and info boxes, and the
 //! actions they run (reactions, unsend, group management, other message types).
 
+use std::borrow::Cow;
+
 use crate::*;
-use rune::Reaction;
+use rune::{EmojiPackage, Reaction};
+
+/// Emoji the react menu offers from "Recent" before "More LINE emoji…".
+const MENU_RECENT_EMOJI: usize = 4;
+
+/// A reaction we leave.
+pub enum NewReaction {
+    Builtin(Reaction),
+    /// A LINE emoji: its package and emoji id.
+    Emoji(EmojiPackage, String),
+}
 
 /// An overlay on top of the main screen; it gets every key while open.
 pub enum Modal {
@@ -10,14 +22,13 @@ pub enum Modal {
     Form(Form),
     Pick(Pick),
     Confirm(Confirm),
-    /// Read-only text; `scroll` is the first line shown.
-    Info {
-        title: String,
-        lines: Vec<String>,
-        scroll: usize,
-    },
     /// The people and emoji on a message, refreshed from message state each draw.
     Reactions {
+        msg: String,
+        scroll: usize,
+    },
+    /// Who has read one of our messages (open chat), refreshed each draw.
+    ReadBy {
         msg: String,
         scroll: usize,
     },
@@ -29,6 +40,10 @@ pub enum Modal {
     Attach(attach::Attach),
     Stickers(stickers::Stickers),
     Settings(settings::SettingsPage),
+    /// One plugin's page (from Settings › Plugins).
+    Plugins(plugin_ui::Manager),
+    /// A plugin's own view.
+    PluginView(plugin_ui::PluginView),
 }
 
 /// Something the user can ask for from a menu, key or form.
@@ -36,6 +51,10 @@ pub enum Modal {
 pub enum Action {
     /// React to a message (`None` takes our reaction back).
     React(String, Option<Reaction>),
+    /// React with a LINE emoji: message, package, emoji.
+    ReactEmoji(String, String, String),
+    /// The LINE emoji picker for a message.
+    EmojiPicker(String),
     ReactMenu(String),
     Reactions(String),
     ConfirmUnsend(String),
@@ -45,6 +64,8 @@ pub enum Action {
     ViewMedia,
     Save,
     Open,
+    /// Open a downloaded file of a type that can run programs (asked first).
+    OpenAnyway(String),
     GotoQuoted,
     Profile(String),
     Attach,
@@ -80,12 +101,42 @@ pub enum Action {
     ChangeCover,
     ConfirmCover(std::path::PathBuf),
     SetCover(std::path::PathBuf),
+    /// Turn a plugin on (asked first, listing its permissions).
+    EnablePlugin(String),
+    ClearPluginData(String),
+    ForgetPlugin(String),
+    /// Delete a plugin installed from a repository (asked first).
+    UninstallPlugin(String),
+    /// Load the newer version waiting beside a running plugin (asked first).
+    ApprovePluginUpdate(String),
+    /// Let a plugin's new versions load without asking (asked first).
+    AutoloadPlugin(String),
+    /// Make a Git-installed plugin follow a branch, a range or one version.
+    PluginTrack(String, plugins::versions::Track),
+    /// Pin a Git-installed plugin to the version it has.
+    PinPlugin(String),
+    // The main menu's own entries.
+    Search,
+    ChatMenu(String),
+    ComposeMenu,
+    Settings(settings::Tab),
+    ToggleReadReceipts,
+    Help,
+    Quit,
 }
 
+/// A menu item's label may end in `\t` and a shortcut, shown right-aligned.
 pub struct Menu {
     pub title: String,
     pub items: Vec<(String, Action)>,
     pub sel: usize,
+    /// Indices of items drawn with a divider line above them (groups).
+    pub breaks: Vec<usize>,
+}
+
+/// A menu label with its shortcut (see [`Menu`]).
+fn with_key(label: impl Into<String>, key: &str) -> String {
+    format!("{}\t{key}", label.into())
 }
 
 /// A question with two labelled buttons. Every confirmation starts on
@@ -106,7 +157,14 @@ impl Action {
             Action::Decline(_) => "Decline",
             Action::DeletePinList(_) => "Delete",
             Action::ClearCache => "Clear",
+            Action::OpenAnyway(_) => "Open",
             Action::SetCover(_) => "Replace cover",
+            Action::EnablePlugin(_) => "Enable",
+            Action::ClearPluginData(_) => "Delete",
+            Action::ForgetPlugin(_) => "Forget",
+            Action::UninstallPlugin(_) => "Uninstall",
+            Action::ApprovePluginUpdate(_) => "Load it",
+            Action::AutoloadPlugin(_) => "Allow",
             _ => "OK",
         }
     }
@@ -124,12 +182,24 @@ pub enum FormKind {
     StatusMessage,
     NewPinList,
     RenamePinList(i64),
+    /// A form a plugin asked for (`Action::Form`).
+    Plugin {
+        plugin: String,
+        form: String,
+    },
+    /// One of a plugin's settings.
+    PluginSetting {
+        plugin: String,
+        key: String,
+    },
+    /// Install a plugin from a Git repository.
+    PluginInstall,
 }
 
 pub struct Field {
-    pub label: &'static str,
+    pub label: Cow<'static, str>,
     pub value: TextInput,
-    pub hint: &'static str,
+    pub hint: Cow<'static, str>,
 }
 
 pub struct Form {
@@ -152,9 +222,9 @@ impl Form {
             fields: fields
                 .into_iter()
                 .map(|(label, value, hint)| Field {
-                    label,
+                    label: label.into(),
                     value: value.into(),
-                    hint,
+                    hint: hint.into(),
                 })
                 .collect(),
             sel: 0,
@@ -213,17 +283,30 @@ pub fn parse_lat_lon(s: &str) -> Option<(f64, f64)> {
     Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
 }
 
-/// Why there is no "send a Flex message" (`/flex`).
-pub const FLEX_UNSUPPORTED: &str = "LINE does not accept Flex messages from the Chrome app \
-     (TalkException 11, \"Incompatible app version\"); only bots can send them";
-
 impl App {
     pub fn open_menu(&mut self, title: impl Into<String>, items: Vec<(String, Action)>) {
         self.modal = Some(Modal::Menu(Menu {
             title: title.into(),
             items,
             sel: 0,
+            breaks: Vec::new(),
         }));
+    }
+
+    /// A menu in groups separated by divider lines; empty groups are skipped.
+    pub fn open_grouped_menu(&mut self, title: impl Into<String>, groups: Vec<Vec<(String, Action)>>) {
+        let mut items = Vec::new();
+        let mut breaks = Vec::new();
+        for group in groups.into_iter().filter(|g| !g.is_empty()) {
+            if !items.is_empty() {
+                breaks.push(items.len());
+            }
+            items.extend(group);
+        }
+        self.open_menu(title, items);
+        if let Some(Modal::Menu(menu)) = &mut self.modal {
+            menu.breaks = breaks;
+        }
     }
 
     pub fn confirm(&mut self, text: impl Into<String>, action: Action) {
@@ -244,6 +327,50 @@ impl App {
         self.open_menu(format!(" Invitation to {} ", self.name(mid)), items);
     }
 
+    /// `Ctrl-x`: everything that is not about one chat or message, each
+    /// with its shortcut, so the menu also teaches the keys.
+    pub fn main_menu(&mut self) {
+        // This chat, then finding and starting chats, then the account,
+        // then the app itself, and quitting alone at the end.
+        let mut chat = Vec::new();
+        if let Some(open) = self.open.clone() {
+            chat.push((
+                with_key(format!("💬 Chat menu: {}", self.name(&open)), "Ctrl-g"),
+                Action::ChatMenu(open),
+            ));
+            chat.push((
+                with_key("📎 Send a photo, file, sticker…", "Ctrl-o"),
+                Action::ComposeMenu,
+            ));
+        }
+        let receipts = if self.read_receipts() { "On" } else { "Off" };
+        let groups = vec![
+            chat,
+            vec![
+                (with_key("🔍 Find a chat or friend", "Ctrl-f"), Action::Search),
+                (with_key("👥 New group…", "n"), Action::NewGroup),
+            ],
+            vec![
+                ("👤 My profile".to_owned(), Action::Profile(self.me.clone())),
+                ("📌 Pin lists…".to_owned(), Action::PinLists),
+                (
+                    with_key(format!("👀 Read receipts: {receipts}"), "Ctrl-r"),
+                    Action::ToggleReadReceipts,
+                ),
+            ],
+            vec![
+                (
+                    with_key("🔧 Settings", "Ctrl-s"),
+                    Action::Settings(settings::Tab::Notifications),
+                ),
+                ("🧩 Plugins".to_owned(), Action::Settings(settings::Tab::Plugins)),
+                (with_key("❓ Keyboard shortcuts", "F1"), Action::Help),
+            ],
+            vec![(with_key("👋 Quit", "Ctrl-c"), Action::Quit)],
+        ];
+        self.open_grouped_menu(" ☰ rune ", groups);
+    }
+
     /// `m` in the chat list / `Ctrl-g` in a chat: what can be done with it.
     pub fn chat_menu(&mut self, mid: &str) {
         let name = self.name(mid);
@@ -252,33 +379,44 @@ impl App {
             return self.invitation_menu(mid);
         }
         let muted = entry.is_some_and(|c| c.muted);
-        let mut items = Vec::new();
-        if MidType::of(mid) == MidType::User {
-            items.push(("👤 Profile".to_owned(), Action::Profile(mid.into())));
-            items.push(mute_item(mid, muted));
-            items.push(pin_item(mid, self.is_pinned(mid)));
+        // The same order for every kind of chat: look, send, organise, then
+        // what changes the chat for others, and leaving alone at the end.
+        let group = MidType::of(mid) != MidType::User;
+        let profile = if group {
+            "👥 Members & profile"
         } else {
-            items.push(("➕ Invite friends…".to_owned(), Action::Invite(mid.into())));
-            items.push(("✏ Rename group…".to_owned(), Action::Rename(mid.into())));
-            items.push(("👥 Members & profile".to_owned(), Action::Profile(mid.into())));
-            items.push(("🖼 Albums".to_owned(), Action::Albums(mid.into())));
-            items.push(mute_item(mid, muted));
-            items.push(pin_item(mid, self.is_pinned(mid)));
-            items.push(("🚪 Leave group…".to_owned(), Action::ConfirmLeave(mid.into())));
+            "👤 Profile"
+        };
+        let mut look = vec![(with_key(profile, "p"), Action::Profile(mid.into()))];
+        if group {
+            look.push(("🖼 Albums".to_owned(), Action::Albums(mid.into())));
         }
+        let mut send = Vec::new();
+        if self.open.as_deref() == Some(mid) {
+            send.push((
+                with_key("📎 Send a photo, file, sticker…", "Ctrl-o"),
+                Action::ComposeMenu,
+            ));
+        }
+        let mut organise = vec![mute_item(mid, muted), pin_item(mid, self.is_pinned(mid))];
         if let Some(position) = self.pinned.iter().position(|pinned| pinned == mid) {
             if position > 0 {
-                items.push(("⬆ Move pin up".to_owned(), Action::MovePin(mid.into(), -1)));
+                organise.push((with_key("⬆ Move pin up", "K"), Action::MovePin(mid.into(), -1)));
             }
             if position + 1 < self.pinned.len() {
-                items.push(("⬇ Move pin down".to_owned(), Action::MovePin(mid.into(), 1)));
+                organise.push((with_key("⬇ Move pin down", "J"), Action::MovePin(mid.into(), 1)));
             }
         }
-        items.push(("📌 Pin lists…".to_owned(), Action::PinLists));
-        self.open_menu(format!(" {name} "), items);
+        let (mut manage, mut leave) = (Vec::new(), Vec::new());
+        if group {
+            manage.push(("➕ Invite friends…".to_owned(), Action::Invite(mid.into())));
+            manage.push(("✏ Rename group…".to_owned(), Action::Rename(mid.into())));
+            leave.push(("🚪 Leave group…".to_owned(), Action::ConfirmLeave(mid.into())));
+        }
+        self.open_grouped_menu(format!(" {name} "), vec![look, send, organise, manage, leave]);
     }
 
-    /// "📌 Pin lists…" in a chat's menu: the account's pin lists, the active one selected.
+    /// The account's pin lists (main menu, Settings › Chats), the active one selected.
     pub fn pin_lists_menu(&mut self) {
         let lists = match self.store.pin_profiles() {
             Ok(lists) => lists,
@@ -363,27 +501,33 @@ impl App {
         if m.id.is_empty() {
             return;
         }
-        let mut items = vec![
-            ("↩ Reply".to_owned(), Action::Reply(m.id.clone())),
-            ("😀 React…".to_owned(), Action::ReactMenu(m.id.clone())),
+        // Act on it, then look into it, then the destructive unsend alone at the end.
+        let mut act = vec![
+            (with_key("↩ Reply", "r"), Action::Reply(m.id.clone())),
+            (with_key("😀 React…", "e"), Action::ReactMenu(m.id.clone())),
         ];
-        if !m.unsent && !m.reactions.is_empty() {
-            items.push(("👥 Reactions…".to_owned(), Action::Reactions(m.id.clone())));
-        }
-        if m.from == self.me && !m.unsent {
-            items.push(("👁 Read by…".to_owned(), Action::ReadBy(m.id.clone())));
-            items.push(("🚫 Unsend…".to_owned(), Action::ConfirmUnsend(m.id.clone())));
-        }
         if m.media_kind().is_some() && !m.unsent {
-            items.push(("🖼 View".to_owned(), Action::ViewMedia));
-            items.push(("💾 Save to ~/Downloads/rune".to_owned(), Action::Save));
-            items.push(("↗ Open with system app".to_owned(), Action::Open));
+            act.push((with_key("🖼 View", "Enter"), Action::ViewMedia));
+            act.push((with_key("💾 Save to ~/Downloads/rune", "s"), Action::Save));
+            act.push((with_key("↗ Open with system app", "o"), Action::Open));
         }
+        let mut info = Vec::new();
         if m.reply_to.is_some() {
-            items.push(("⤴ Go to quoted message".to_owned(), Action::GotoQuoted));
+            info.push(("⤴ Go to quoted message".to_owned(), Action::GotoQuoted));
         }
-        items.push(("👤 Sender's profile".to_owned(), Action::Profile(m.from.clone())));
-        self.open_menu(" Message ", items);
+        if !m.unsent && !m.reactions.is_empty() {
+            info.push(("👥 Reactions…".to_owned(), Action::Reactions(m.id.clone())));
+        }
+        let mut unsend = Vec::new();
+        if m.from == self.me && !m.unsent {
+            info.push(("👁 Read by…".to_owned(), Action::ReadBy(m.id.clone())));
+            unsend.push((with_key("🚫 Unsend…", "x"), Action::ConfirmUnsend(m.id.clone())));
+        }
+        info.push((
+            with_key("👤 Sender's profile", "p"),
+            Action::Profile(m.from.clone()),
+        ));
+        self.open_grouped_menu(" Message ", vec![act, info, unsend]);
     }
 
     /// `Ctrl-o`: things to send besides text.
@@ -410,18 +554,57 @@ impl App {
                 .find(|r| r.from == self.me)
                 .map(|r| r.kind.clone())
         });
+        let tick = |on: bool| if on { "  ✓" } else { "" };
         let mut items: Vec<(String, Action)> = Reaction::ALL
             .iter()
             .map(|r| {
                 let on = mine == Some(ReactionKind::Predefined(*r as i64));
-                let label = format!("{} {}{}", r.emoji(), r.label(), if on { "  ✓" } else { "" });
+                let label = format!("{} {}{}", r.emoji(), r.label(), tick(on));
                 (label, Action::React(id.into(), Some(*r)))
             })
             .collect();
+        let mut mine_listed = matches!(mine, None | Some(ReactionKind::Predefined(_)));
+        for (pkg, emoji, _) in self.recent_emoji_refs(MENU_RECENT_EMOJI) {
+            let kind = ReactionKind::Paid {
+                product_id: pkg.clone(),
+                emoji_id: emoji.clone(),
+            };
+            let on = mine.as_ref() == Some(&kind);
+            mine_listed |= on;
+            let label = format!("{}{}", self.reaction_label(&kind), tick(on));
+            items.push((label, Action::ReactEmoji(id.into(), pkg, emoji)));
+        }
+        let more = match mine.as_ref().filter(|_| !mine_listed) {
+            Some(k) => format!("✨ More LINE emoji…  ✓ {}", self.reaction_label(k)),
+            None => "✨ More LINE emoji…".into(),
+        };
+        items.push((more, Action::EmojiPicker(id.into())));
         if mine.is_some() {
             items.push(("✖ Remove my reaction".into(), Action::React(id.into(), None)));
         }
         self.open_menu(" React ", items);
+    }
+
+    /// Alt text of a LINE emoji reaction from an owned package.
+    fn paid_alt(&self, kind: &ReactionKind) -> Option<&str> {
+        match kind {
+            ReactionKind::Paid { product_id, emoji_id } => {
+                self.emoji_alt(product_id, emoji_id).filter(|a| !a.is_empty())
+            }
+            ReactionKind::Predefined(_) => None,
+        }
+    }
+
+    /// "👍 Nice", "🫶 heart hands", "✨ heart eyes Moon": a reaction for menus and the status line.
+    pub(crate) fn reaction_label(&self, kind: &ReactionKind) -> String {
+        let name = match kind {
+            ReactionKind::Predefined(n) => Reaction::from_i64(*n).map(Reaction::label),
+            ReactionKind::Paid { .. } => self.paid_alt(kind),
+        };
+        match name {
+            Some(n) => format!("{} {n}", reaction_glyph(kind)),
+            None => reaction_glyph(kind).to_owned(),
+        }
     }
 
     fn contact_options(&self, exclude: &HashSet<String>) -> Vec<(String, String)> {
@@ -466,7 +649,9 @@ impl App {
     pub fn run_action(&mut self, action: Action) {
         let (client, tx) = (self.client.clone(), self.tx.clone());
         match action {
-            Action::React(id, r) => self.react(&id, r),
+            Action::React(id, r) => self.react(&id, r.map(NewReaction::Builtin)),
+            Action::ReactEmoji(id, pkg, emoji) => self.react_emoji(&id, &pkg, &emoji),
+            Action::EmojiPicker(id) => self.open_emoji_picker(id),
             Action::ReactMenu(id) => self.react_menu(&id),
             Action::Reactions(id) => self.modal = Some(Modal::Reactions { msg: id, scroll: 0 }),
             Action::ConfirmUnsend(id) => self.confirm(
@@ -488,10 +673,11 @@ impl App {
                 }
                 self.start_reply();
             }
-            Action::ReadBy(id) => self.show_read_by(&id),
+            Action::ReadBy(id) => self.modal = Some(Modal::ReadBy { msg: id, scroll: 0 }),
             Action::ViewMedia => self.open_viewer(),
             Action::Save => self.act_on_selected(After::Save),
             Action::Open => self.act_on_selected(After::Open),
+            Action::OpenAnyway(id) => self.finish(&id, After::OpenAnyway),
             Action::GotoQuoted => self.goto_quoted(),
             Action::Profile(mid) => self.open_profile(mid),
             Action::Attach => self.open_attach(None),
@@ -624,6 +810,33 @@ impl App {
             }
             Action::Decline(chat) => self.answer_invite_for(chat, false),
             Action::ClearCache => self.clear_cache(),
+            Action::Search => {
+                self.close_profile();
+                self.start_search();
+            }
+            Action::ChatMenu(chat) => {
+                self.close_profile();
+                self.chat_menu(&chat);
+            }
+            Action::ComposeMenu => {
+                self.close_profile();
+                self.compose_menu();
+            }
+            Action::Settings(tab) => self.open_settings_at(tab),
+            Action::ToggleReadReceipts => self.toggle_read_receipts(),
+            Action::Help => {
+                let ctx = self.key_context();
+                self.open_help(ctx);
+            }
+            Action::Quit => self.quit = true,
+            Action::EnablePlugin(id) => self.enable_plugin(&id),
+            Action::ClearPluginData(id) => self.clear_plugin_data(&id),
+            Action::ForgetPlugin(id) => self.forget_plugin(&id),
+            Action::UninstallPlugin(id) => self.uninstall_plugin(&id),
+            Action::ApprovePluginUpdate(id) => self.approve_plugin_update(&id),
+            Action::AutoloadPlugin(id) => self.set_plugin_autoload(&id, true),
+            Action::PluginTrack(id, track) => self.switch_plugin_track(&id, track),
+            Action::PinPlugin(id) => self.pin_plugin(&id),
             Action::Albums(chat) => self.albums_menu(&chat),
             Action::AlbumPhotos(chat, album) => self.album_photos_menu(&chat, &album),
             Action::ViewMessage(chat, id) => self.view_message(&chat, &id),
@@ -659,57 +872,136 @@ impl App {
     }
 
     /// React (or take a reaction back), showing it at once.
-    fn react(&mut self, id: &str, r: Option<Reaction>) {
-        let kind = r.map(|r| ReactionKind::Predefined(r as i64));
-        let me = self.me.clone();
-        if let Some(m) = self.find_msg_mut(id) {
-            rune::models::apply_reaction(&mut m.reactions, &me, kind.clone(), now_ms());
-        }
-        let _ = self.store.set_reaction(id, &me, kind, now_ms());
-        let (client, tx, id) = (self.client.clone(), self.tx.clone(), id.to_owned());
-        self.status = match r {
-            Some(r) => format!("reacted {}", r.emoji()),
+    pub(crate) fn react(&mut self, id: &str, r: Option<NewReaction>) {
+        let kind = r.as_ref().map(|r| match r {
+            NewReaction::Builtin(b) => ReactionKind::Predefined(*b as i64),
+            NewReaction::Emoji(p, e) => ReactionKind::Paid {
+                product_id: p.id.clone(),
+                emoji_id: e.clone(),
+            },
+        });
+        self.status = match &kind {
+            Some(k) => format!("reacted {}", self.reaction_label(k)),
             None => "reaction removed".into(),
         };
+        if let Some(NewReaction::Emoji(p, e)) = &r {
+            self.note_recent_emoji(&p.id, e);
+        }
+        let me = self.me.clone();
+        let mut before = None;
+        if let Some(m) = self.find_msg_mut(id) {
+            before = m.reactions.iter().find(|x| x.from == me).map(|x| x.kind.clone());
+            rune::models::apply_reaction(&mut m.reactions, &me, kind.clone(), now_ms());
+        }
+        self.saved(self.store.set_reaction(id, &me, kind.clone(), now_ms()));
+        let (client, tx, id) = (self.client.clone(), self.tx.clone(), id.to_owned());
         tokio::spawn(async move {
             let res = match r {
-                Some(r) => client.react(&id, r).await,
+                Some(NewReaction::Builtin(r)) => client.react(&id, r).await,
+                Some(NewReaction::Emoji(p, e)) => client.react_emoji(&id, &p, &e).await,
                 None => client.cancel_reaction(&id).await,
             };
             if let Err(e) = res {
-                let _ = tx.send(AppEvent::Status(format!("reaction failed: {e}")));
+                let _ = tx.send(AppEvent::ReactionFailed(id, before, kind, e.to_string()));
             }
         });
     }
 
-    fn show_read_by(&mut self, id: &str) {
-        let Some(chat) = self.open.clone() else { return };
-        let readers = self.readers(&chat, id);
-        let mut lines: Vec<String> = readers.iter().map(|m| format!("✓ {}", self.name(m))).collect();
-        if lines.is_empty() {
-            lines.push("No one has read it yet (that rune has seen).".into());
+    /// LINE refused a reaction shown ahead of its answer: show (and keep)
+    /// the previous one again, unless another reaction replaced it meanwhile.
+    pub(crate) fn on_reaction_failed(
+        &mut self,
+        id: &str,
+        before: Option<ReactionKind>,
+        tried: Option<ReactionKind>,
+        e: String,
+    ) {
+        self.status = format!("reaction failed: {e}");
+        let me = self.me.clone();
+        let Some(m) = self.find_msg_mut(id) else {
+            return;
+        };
+        let current = m.reactions.iter().find(|x| x.from == me).map(|x| x.kind.clone());
+        if current != tried {
+            return;
         }
-        if MidType::of(&chat) != MidType::User
-            && let Some(members) = self.members.get(&chat)
-        {
-            let unread: Vec<String> = members
-                .iter()
-                .filter(|m| **m != self.me && !readers.contains(m))
-                .map(|m| self.name(m))
-                .collect();
-            if !unread.is_empty() {
-                lines.push(String::new());
-                lines.push(format!("Not yet: {}", unread.join(", ")));
-            }
+        rune::models::apply_reaction(&mut m.reactions, &me, before.clone(), now_ms());
+        self.saved(self.store.set_reaction(id, &me, before, now_ms()));
+    }
+
+    /// Title and lines of the *Read by…* box for message `id` of the open
+    /// chat: readers with when they read it (or how we know), then the
+    /// group members not known to have read it.
+    pub(crate) fn read_by_lines(&self, id: &str) -> (String, Vec<String>) {
+        let Some(chat) = self.open.as_deref() else {
+            return (" Read by ".into(), Vec::new());
+        };
+        let readers = self.readers(chat, id);
+        let times = self.store.read_times(chat, id).unwrap_or_default();
+        let mut rows: Vec<(Option<i64>, String, &str, String)> = readers
+            .iter()
+            .map(|(mid, how)| {
+                let at = match how {
+                    SeenBy::Receipt => times.get(mid).copied(),
+                    _ => None,
+                };
+                let detail = match (how, at) {
+                    (SeenBy::Receipt, Some(at)) => hhmm(at),
+                    (SeenBy::Receipt, None) => String::new(),
+                    (SeenBy::WroteLater, _) => "wrote later".into(),
+                    (SeenBy::Reacted, _) => "reacted".into(),
+                };
+                (at, self.name(mid), mid.as_str(), detail)
+            })
+            .collect();
+        // In reading order where known, then by name (mid breaks ties).
+        rows.sort_by(|a, b| (a.0.is_none(), a.0, &a.1, a.2).cmp(&(b.0.is_none(), b.0, &b.1, b.2)));
+        let name_w = rows.iter().map(|r| r.1.width()).max().unwrap_or(0).min(28);
+        let mut lines: Vec<String> = rows
+            .iter()
+            .map(|(_, name, _, detail)| {
+                let name = ellipsize(name, name_w);
+                let pad = " ".repeat(name_w.saturating_sub(name.width()));
+                format!("✓ {name}{pad}  {detail}").trim_end().to_owned()
+            })
+            .collect();
+        if lines.is_empty() {
+            lines.push("No one is known to have read it yet.".into());
+        }
+        let group = MidType::of(chat) != MidType::User;
+        let others: Vec<&String> = self
+            .members
+            .get(chat)
+            .filter(|_| group)
+            .into_iter()
+            .flatten()
+            .filter(|m| **m != self.me)
+            .collect();
+        let mut not_yet: Vec<(String, &str)> = others
+            .iter()
+            .filter(|m| !readers.iter().any(|(r, _)| r == **m))
+            .map(|m| (self.name(m), m.as_str()))
+            .collect();
+        not_yet.sort();
+        if !not_yet.is_empty() {
+            lines.push(String::new());
+            lines.push(format!("Not yet ({}):", not_yet.len()));
+            lines.extend(not_yet.into_iter().map(|(name, _)| format!("  {name}")));
         }
         lines.push(String::new());
-        lines.push("Read marks arrive live; reads from before rune was running".into());
-        lines.push("are unknown (LINE's Chrome protocol returns no read history).".into());
-        self.modal = Some(Modal::Info {
-            title: format!(" Read by {} ", readers.len()),
-            lines,
-            scroll: 0,
-        });
+        lines.push(
+            "Times are when LINE reported the read. LINE's Chrome protocol returns no read \
+             history, so reads from before rune was listening are known only when the reader \
+             wrote or reacted later."
+                .into(),
+        );
+        let title = match (group, others.len()) {
+            (false, _) if readers.is_empty() => " Not read yet ".into(),
+            (false, _) => " Read ".into(),
+            (true, 0) => format!(" Read by {} ", readers.len()),
+            (true, n) => format!(" Read by {} of {n} ", readers.len().min(n)),
+        };
+        (title, lines)
     }
 
     pub(crate) fn reaction_lines(&self, id: &str) -> (String, Vec<String>) {
@@ -719,14 +1011,15 @@ impl App {
         let lines: Vec<String> = msg
             .reactions
             .iter()
-            .map(|r| {
-                let emoji = match &r.kind {
-                    ReactionKind::Predefined(n) => {
-                        Reaction::from_i64(*n).map_or("•", Reaction::emoji).to_owned()
-                    }
-                    ReactionKind::Paid { .. } => "✨".into(),
-                };
-                format!("{emoji}  {}", self.name(&r.from))
+            .map(|r| match &r.kind {
+                ReactionKind::Paid { .. } => {
+                    format!("{}  {}", reaction_glyph(&r.kind), self.name(&r.from))
+                        + &self
+                            .paid_alt(&r.kind)
+                            .map(|a| format!("  ({a})"))
+                            .unwrap_or_default()
+                }
+                ReactionKind::Predefined(_) => format!("{}  {}", reaction_glyph(&r.kind), self.name(&r.from)),
             })
             .collect();
         if lines.is_empty() {
@@ -744,6 +1037,7 @@ impl App {
         };
         match form.kind.clone() {
             FormKind::NewGroup => {
+                self.close_profile();
                 let name = form.value(0).trim().to_owned();
                 if name.is_empty() {
                     return fail(self, form, "give the group a name".into());
@@ -830,6 +1124,26 @@ impl App {
                     Err(e) => fail(self, form, e.to_string()),
                 }
             }
+            FormKind::Plugin { plugin, form: id } => {
+                let values = form.fields.iter().map(|f| f.value.as_str().to_owned()).collect();
+                self.plugin_event(&plugin, plugins::Event::FormSubmitted { form: id, values });
+            }
+            FormKind::PluginInstall => {
+                match plugins::install::Request::new(form.value(0), form.value(1), form.value(2)) {
+                    Ok(req) => self.install_plugin(req),
+                    Err(e) => fail(self, form, e),
+                }
+            }
+            FormKind::PluginSetting { plugin, key } => {
+                let value = serde_json::Value::from(form.value(0));
+                match self.plugins.set_setting(&plugin, &key, value) {
+                    Ok(fx) => {
+                        self.apply_plugin_effects(fx);
+                        self.open_plugin_page(plugin);
+                    }
+                    Err(e) => fail(self, form, e),
+                }
+            }
             FormKind::DisplayName | FormKind::StatusMessage => {
                 let value = form.value(0).to_owned();
                 let is_name = form.kind == FormKind::DisplayName;
@@ -851,7 +1165,7 @@ impl App {
                     let _ = tx.send(AppEvent::Status(s));
                     let _ = tx.send(AppEvent::ProfileChanged);
                 });
-                self.open_settings_at(3);
+                // Settings › Account comes back (it was opened from there).
             }
         }
     }
@@ -912,6 +1226,11 @@ impl App {
     fn close_modal(&mut self) {
         self.modal = match self.modal.take() {
             Some(Modal::Help { under, .. }) => under.map(|modal| *modal),
+            // The plugin hears that its view went (as with Esc).
+            Some(Modal::PluginView(v)) => {
+                let view = plugins::Event::ViewClosed { view: v.view.id };
+                return self.plugin_event(&v.view.plugin, view);
+            }
             _ => None,
         };
     }
@@ -973,14 +1292,14 @@ impl App {
                 }
                 _ => keep(self, Modal::Confirm(c)),
             },
-            Modal::Info { title, lines, scroll } => {
-                if let Some(scroll) = text_scroll(&k, scroll) {
-                    keep(self, Modal::Info { title, lines, scroll });
-                }
-            }
             Modal::Reactions { msg, scroll } => {
                 if let Some(scroll) = text_scroll(&k, scroll) {
                     keep(self, Modal::Reactions { msg, scroll });
+                }
+            }
+            Modal::ReadBy { msg, scroll } => {
+                if let Some(scroll) = text_scroll(&k, scroll) {
+                    keep(self, Modal::ReadBy { msg, scroll });
                 }
             }
             Modal::Help { ctx, under, scroll } => match keymap::resolve(Ctx::Help, &k) {
@@ -991,7 +1310,14 @@ impl App {
                 }
             },
             Modal::Form(mut f) => match keymap::resolve(Ctx::Form, &k) {
-                Some(Cmd::Back) => self.status = "cancelled".into(),
+                Some(Cmd::Back) => {
+                    self.status = "cancelled".into();
+                    if let FormKind::Plugin { plugin, form } = f.kind {
+                        self.plugin_event(&plugin, plugins::Event::FormCancelled { form });
+                    } else if let FormKind::PluginSetting { plugin, .. } = f.kind {
+                        self.open_plugin_page(plugin);
+                    }
+                }
                 Some(Cmd::Down) => {
                     f.sel = (f.sel + 1) % f.fields.len();
                     keep(self, Modal::Form(f));
@@ -1066,6 +1392,8 @@ impl App {
             Modal::Attach(a) => self.attach_key(a, k),
             Modal::Stickers(s) => self.stickers_key(s, k),
             Modal::Settings(s) => self.settings_key(s, k),
+            Modal::Plugins(m) => self.plugins_key(m, k),
+            Modal::PluginView(v) => self.plugin_view_key(v, k),
         }
     }
 
@@ -1132,6 +1460,13 @@ impl App {
                             s.sel = i;
                         }
                     }
+                    Some(Modal::Plugins(m)) => {
+                        if m.sel() == i {
+                            self.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                        } else {
+                            m.select(i);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1155,9 +1490,9 @@ impl App {
         self.hit.modal = Some(area);
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(Color::Green))
+            .border_style(Style::new().fg(theme::t().accent))
             .title(Span::styled(title.to_owned(), Style::new().bold()))
-            .title_bottom(Span::styled(help.to_owned(), Style::new().dim()));
+            .title_bottom(frame_hint(help, area));
         let inner = block.inner(area);
         f.render_widget(block, area);
         inner
@@ -1201,34 +1536,70 @@ impl App {
         };
         match &mut modal {
             Modal::Menu(m) => {
+                // A shortcut (after `\t`) sits right-aligned, 2 columns from the label.
                 let w = m
                     .items
                     .iter()
-                    .map(|(l, _)| l.width())
+                    .map(|(l, _)| match l.split_once('\t') {
+                        Some((label, key)) => label.width() + key.width() + 2,
+                        None => l.width(),
+                    })
                     .max()
                     .unwrap_or(10)
                     .max(m.title.width())
                     + 8;
-                let r = popup(area, w as u16, m.items.len() as u16 + 2);
+                let rows = m.items.len() + m.breaks.len();
+                let r = popup(area, w as u16, rows as u16 + 2);
                 let inner = self.modal_frame(f, r, &m.title, &hint);
-                let first = scroll_first(m.sel, inner.height as usize);
+                // Dividers only when everything fits; a scrolling menu is a plain list.
+                let dividers = rows <= inner.height as usize;
+                let first = if dividers {
+                    0
+                } else {
+                    scroll_first(m.sel, inner.height as usize)
+                };
                 let label_w = inner.width.saturating_sub(2) as usize;
-                for (row, (label, _)) in m.items.iter().skip(first).take(inner.height as usize).enumerate() {
-                    let i = first + row;
-                    let y = inner.y + row as u16;
+                let mut y = inner.y;
+                for (i, (label, _)) in m.items.iter().enumerate().skip(first) {
+                    if dividers && m.breaks.contains(&i) {
+                        let rule = "─".repeat(inner.width as usize);
+                        f.render_widget(
+                            Paragraph::new(Span::styled(rule, theme::muted())),
+                            Rect::new(inner.x, y, inner.width, 1),
+                        );
+                        y += 1;
+                    }
+                    if y >= inner.y + inner.height {
+                        break;
+                    }
                     self.hit.modal_rows.push((y, i));
                     let sel = i == m.sel;
                     let style = if sel {
-                        Style::new().bg(Color::Green).fg(Color::Black).bold()
+                        Style::new().bg(theme::t().accent_soft).fg(theme::t().text).bold()
                     } else {
                         Style::new()
                     };
                     let key = if i < 9 { format!("{} ", i + 1) } else { "  ".into() };
+                    let (label, shortcut) = label.split_once('\t').unwrap_or((label, ""));
+                    // The shortcut gives way first when the box is narrow.
+                    let shortcut = if label.width() + shortcut.width() + 2 <= label_w {
+                        format!(" {shortcut} ")
+                    } else {
+                        String::new()
+                    };
+                    let text_w = label_w.saturating_sub(shortcut.width());
+                    let key_style = if sel {
+                        style.remove_modifier(ratatui::style::Modifier::BOLD)
+                    } else {
+                        theme::muted()
+                    };
                     let line = Line::from(vec![
-                        Span::styled(key, Style::new().dim()),
-                        Span::styled(pad_to(&ellipsize(label, label_w), label_w), style),
+                        Span::styled(key, theme::muted()),
+                        Span::styled(pad_to(&ellipsize(label, text_w), text_w), style),
+                        Span::styled(shortcut, key_style),
                     ]);
                     f.render_widget(Paragraph::new(line), Rect::new(inner.x, y, inner.width, 1));
+                    y += 1;
                 }
             }
             Modal::Confirm(c) => {
@@ -1252,9 +1623,13 @@ impl App {
                     for (label, yes) in buttons {
                         let focused = c.yes == yes;
                         let style = match (focused, yes) {
-                            (true, true) => Style::new().bg(Color::Red).fg(Color::White).bold(),
-                            (true, false) => Style::new().bg(Color::Green).fg(Color::Black).bold(),
-                            (false, _) => Style::new().bg(Color::DarkGray),
+                            (true, true) => {
+                                Style::new().bg(theme::t().danger).fg(theme::t().on_danger).bold()
+                            }
+                            (true, false) => {
+                                Style::new().bg(theme::t().accent).fg(theme::t().on_accent).bold()
+                            }
+                            (false, _) => Style::new().bg(theme::t().surface_hi),
                         };
                         let w = (label.width() as u16).min((inner.x + inner.width).saturating_sub(x));
                         let rect = Rect::new(x, y, w, 1);
@@ -1264,15 +1639,20 @@ impl App {
                     }
                 }
             }
-            Modal::Info { title, lines, scroll } => {
-                self.draw_text_modal(f, area, title, lines, scroll, hint.clone());
-            }
             Modal::Reactions { msg, scroll } => {
                 let (title, lines) = self.reaction_lines(msg);
                 self.draw_text_modal(f, area, &title, &lines, scroll, hint.clone());
             }
-            Modal::Help { ctx, scroll, .. } => {
-                let lines = keymap::help_lines(*ctx);
+            Modal::ReadBy { msg, scroll } => {
+                let (title, lines) = self.read_by_lines(msg);
+                self.draw_text_modal(f, area, &title, &lines, scroll, hint.clone());
+            }
+            Modal::Help { ctx, scroll, under } => {
+                let view = match under.as_deref() {
+                    Some(Modal::PluginView(v)) => Some(v),
+                    _ => None,
+                };
+                let lines = self.help_lines(*ctx, view);
                 let want = lines
                     .iter()
                     .map(|(key, description)| key.width() + description.width() + 3)
@@ -1300,7 +1680,7 @@ impl App {
                         Line::from(vec![
                             Span::styled(
                                 pad_to(&ellipsize(key, key_width), key_width),
-                                Style::new().fg(Color::Green).bold(),
+                                Style::new().fg(theme::t().accent).bold(),
                             ),
                             Span::raw(" "),
                             Span::raw(ellipsize(description, description_width)),
@@ -1320,14 +1700,14 @@ impl App {
                     }
                     let sel = i == form.sel;
                     let label_style = if sel {
-                        Style::new().fg(Color::Green).bold()
+                        Style::new().fg(theme::t().accent).bold()
                     } else {
                         Style::new().bold()
                     };
                     f.render_widget(
                         Paragraph::new(Line::from(vec![
-                            Span::styled(field.label, label_style),
-                            Span::styled(format!("  {}", field.hint), Style::new().dim()),
+                            Span::styled(field.label.clone(), label_style),
+                            Span::styled(format!("  {}", field.hint), theme::muted()),
                         ])),
                         Rect::new(inner.x, y, inner.width, 1),
                     );
@@ -1335,9 +1715,9 @@ impl App {
                     self.hit.modal_rows.push((y + 1, i));
                     let (shown, cursor) = field.value.view(inner.width.saturating_sub(2) as usize);
                     let bg = if sel {
-                        Color::Indexed(237)
+                        theme::t().surface_hi
                     } else {
-                        Color::Indexed(235)
+                        theme::t().surface
                     };
                     f.render_widget(
                         Paragraph::new(format!(" {shown}")).style(Style::new().bg(bg)),
@@ -1352,7 +1732,7 @@ impl App {
                 if let Some(e) = &form.error {
                     f.render_widget(
                         Paragraph::new(e.as_str())
-                            .style(Style::new().fg(Color::LightRed))
+                            .style(Style::new().fg(theme::t().danger))
                             .wrap(Wrap { trim: true }),
                         Rect::new(
                             inner.x,
@@ -1375,7 +1755,7 @@ impl App {
                         Span::styled("🔍 ", Style::new()),
                         Span::raw(shown.to_owned()),
                     ]))
-                    .style(Style::new().bg(Color::Indexed(236))),
+                    .style(Style::new().bg(theme::t().surface)),
                     search,
                 );
                 f.set_cursor_position(Position::new(search.x + 3 + cursor, search.y));
@@ -1392,7 +1772,7 @@ impl App {
                     };
                     f.render_widget(
                         Paragraph::new(ellipsize(&txt, count.width as usize))
-                            .style(Style::new().fg(Color::Green)),
+                            .style(Style::new().fg(theme::t().accent)),
                         count,
                     );
                 }
@@ -1410,9 +1790,9 @@ impl App {
                         (false, false) => "☐ ",
                     };
                     let style = if first + row == p.sel {
-                        Style::new().bg(Color::Green).fg(Color::Black)
+                        Style::new().bg(theme::t().accent_soft).fg(theme::t().text).bold()
                     } else if ticked {
-                        Style::new().fg(Color::Green)
+                        Style::new().fg(theme::t().accent)
                     } else {
                         Style::new()
                     };
@@ -1425,10 +1805,14 @@ impl App {
                     );
                 }
                 if vis.is_empty() {
-                    f.render_widget(Paragraph::new("no match").style(Style::new().dim()), list);
+                    f.render_widget(Paragraph::new("no match").style(theme::muted()), list);
                 }
             }
-            Modal::Attach(_) | Modal::Stickers(_) | Modal::Settings(_) => {}
+            Modal::Attach(_)
+            | Modal::Stickers(_)
+            | Modal::Settings(_)
+            | Modal::Plugins(_)
+            | Modal::PluginView(_) => {}
         }
         self.modal = Some(modal);
         match self.modal.take() {
@@ -1443,6 +1827,14 @@ impl App {
             Some(Modal::Settings(mut s)) => {
                 self.draw_settings(f, area, &mut s, hint);
                 self.modal = Some(Modal::Settings(s));
+            }
+            Some(Modal::Plugins(mut m)) => {
+                self.draw_plugins(f, area, &mut m, hint);
+                self.modal = Some(Modal::Plugins(m));
+            }
+            Some(Modal::PluginView(mut v)) => {
+                self.draw_plugin_view(f, area, &mut v, hint);
+                self.modal = Some(Modal::PluginView(v));
             }
             other => self.modal = other,
         }

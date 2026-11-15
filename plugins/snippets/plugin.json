@@ -1,0 +1,20 @@
+{
+  "id": "snippets",
+  "name": "Snippets",
+  "version": "1.0.0",
+  "api_version": "1.0",
+  "description": "Reusable bits of text: save them once, insert them into the message line with /snip NAME or Alt-s.",
+  "author": "rune sample plugins",
+  "entry": "snippets.wasm",
+  "permissions": ["compose", "storage"],
+  "commands": [
+    { "name": "snip", "usage": "/snip [NAME | add [NAME] | rm NAME]", "help": "insert, add or remove a snippet (no NAME: the list)" }
+  ],
+  "keys": [
+    { "id": "open", "key": "alt+s", "help": "the snippet list" }
+  ],
+  "settings": [
+    { "key": "sort", "label": "Order", "type": "choice", "default": "name", "choices": ["name", "newest"], "help": "how the list is sorted" },
+    { "key": "preview", "label": "Preview length", "type": "int", "default": 60, "min": 10, "max": 200, "help": "characters of each snippet shown in the list" }
+  ]
+}

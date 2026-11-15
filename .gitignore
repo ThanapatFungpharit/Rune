@@ -7,3 +7,5 @@ session.db-*
 *.db
 *.db-wal
 *.db-shm
+plugins/*/target
+plugin-sdk/target

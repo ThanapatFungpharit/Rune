@@ -4,9 +4,14 @@
 //!
 //! The rules the tables follow:
 //! - Global chords work in every view where they make sense, also while
-//!   typing: `Ctrl-c` quits, `F1` shows help, `Ctrl-s` opens settings, and
-//!   with a chat open `Ctrl-o` (send something), `Ctrl-g` (chat menu) and
-//!   `Ctrl-p` (chat profile).
+//!   typing: `Ctrl-c` quits, `F1` shows help, `Ctrl-x` opens the main menu
+//!   (everything that is not about one chat or message: search, new group,
+//!   your profile, pin lists, read receipts, settings, plugins, quit),
+//!   `Ctrl-s` opens settings, and `Ctrl-r` turns read receipts on or off,
+//!   and with a chat open `Ctrl-o` (send something), `Ctrl-g` (chat menu)
+//!   and `Ctrl-p` (chat profile).
+//! - Navigation is never typed into the message line: the `/` commands act
+//!   on the open chat; screens are opened by keys and menus.
 //! - `?` shows help wherever printable keys are not text.
 //! - Plain letters are only bound where nothing is typed, and only for
 //!   things done often to the selected item. Everything else lives in the
@@ -16,6 +21,8 @@
 //! - Text fields edit at a cursor (`←` `→` `Home` `End` `Delete`), and by
 //!   word the way shells do (`Ctrl-←` `Ctrl-→` `Ctrl-w` `Ctrl-u` `Ctrl-k`).
 //! - Lists jump to their first and last item with `Home` and `End`.
+//! - `Alt-<letter or digit>` is never bound here: those keys belong to
+//!   plugins (`is_plugin_key`), so a plugin can never shadow a rune key.
 //! - On the message line `Enter` sends and `Shift-Enter` (or `Alt-Enter`,
 //!   or `Ctrl-j` where the terminal cannot tell `Shift-Enter` apart) starts
 //!   a new line; `↑` `↓` move between its lines.
@@ -41,12 +48,17 @@ pub enum Ctx {
     AttachFilter,
     AttachSend,
     Stickers,
+    Emoji,
     Settings,
+    /// One plugin's page (Settings › Plugins › a plugin).
+    Plugins,
+    /// A plugin's view: keys not bound here go to the plugin.
+    PluginView,
 }
 
 impl Ctx {
     #[cfg(test)]
-    pub const ALL: [Ctx; 17] = [
+    pub const ALL: [Ctx; 20] = [
         Ctx::ChatList,
         Ctx::ChatSearch,
         Ctx::Compose,
@@ -63,7 +75,10 @@ impl Ctx {
         Ctx::AttachFilter,
         Ctx::AttachSend,
         Ctx::Stickers,
+        Ctx::Emoji,
         Ctx::Settings,
+        Ctx::Plugins,
+        Ctx::PluginView,
     ];
 
     /// Shown as the help screen's title.
@@ -85,7 +100,10 @@ impl Ctx {
             Ctx::AttachFilter => "File filter",
             Ctx::AttachSend => "Send dialog",
             Ctx::Stickers => "Stickers",
+            Ctx::Emoji => "LINE emoji reactions",
             Ctx::Settings => "Settings",
+            Ctx::Plugins => "Plugin page",
+            Ctx::PluginView => "Plugin view",
         }
     }
 }
@@ -120,17 +138,20 @@ pub enum Cmd {
     NewLine,
     // Global.
     Help,
+    MainMenu,
     Settings,
     Quit,
     ComposeMenu,
     ChatMenu,
     ChatProfile,
+    ReadReceipts,
     // On the selected chat / message / media.
     Menu,
     Profile,
     NewGroup,
     PinUp,
     PinDown,
+    NextUnread,
     Reply,
     React,
     Unsend,
@@ -218,10 +239,13 @@ use KeyCode::{
 pub const GLOBAL: &[Binding] = &[
     binding!(Cmd::Quit, "quit", false; ctrl('c')),
     binding!(Cmd::Help, "show the shortcuts", false; key(KeyCode::F(1))),
+    binding!(Cmd::MainMenu, "menu", true; ctrl('x')),
     binding!(Cmd::Settings, "settings", false; ctrl('s')),
+    binding!(Cmd::Search, "search chats and friends", false; ctrl('f')),
     binding!(Cmd::ComposeMenu, "attach a photo, file, sticker, location or contact", true; ctrl('o')),
     binding!(Cmd::ChatMenu, "the open chat's menu", false; ctrl('g')),
     binding!(Cmd::ChatProfile, "the open chat's profile", false; ctrl('p')),
+    binding!(Cmd::ReadReceipts, "turn read receipts on / off", false; ctrl('r')),
 ];
 
 /// `?` where printable keys are not text.
@@ -252,20 +276,23 @@ static CHAT_LIST: &[Binding] = &[
     binding!(Cmd::End, "last chat", false; key(End)),
     binding!(Cmd::Confirm, "open (invitations: join or decline)", true; key(Enter), key(Right)),
     binding!(Cmd::SwitchFocus, "go to the open chat", false; key(Tab), key(BackTab)),
-    binding!(Cmd::Search, "search", true; ch('/')),
-    binding!(Cmd::Menu, "menu", true; ch('m')),
+    binding!(Cmd::Search, "search chats and friends", true; ch('/')),
+    binding!(Cmd::Menu, "chat menu", true; ch('m')),
     binding!(Cmd::Profile, "profile", true; ch('p')),
     binding!(Cmd::NewGroup, "new group", true; ch('n')),
     binding!(Cmd::PinUp, "move the pinned chat up", false; ch('K')),
     binding!(Cmd::PinDown, "move the pinned chat down", false; ch('J')),
+    binding!(Cmd::NextUnread, "nearest unread chat", true; ch('u')),
 ];
 
 static CHAT_SEARCH: &[Binding] = &[
     binding!(Cmd::Back, "stop searching", true; key(Esc)),
     binding!(Cmd::Confirm, "open the chat", true; key(Enter)),
     binding!(Cmd::Up, "previous match", true; key(Up)),
-    binding!(Cmd::Down, "next match", true; key(Down)),
-    binding!(Cmd::SwitchFocus, "go to the open chat", false; key(Tab), key(BackTab)),
+    binding!(Cmd::Down, "next match (at the end: search older chats)", false; key(Down)),
+    binding!(Cmd::PageUp, "page up", false; key(PageUp)),
+    binding!(Cmd::PageDown, "page down", false; key(PageDown)),
+    binding!(Cmd::SwitchFocus, "go to the open chat (the search stays until Esc)", false; key(Tab), key(BackTab)),
 ];
 
 static COMPOSE: &[Binding] = &[
@@ -430,6 +457,17 @@ static STICKERS: &[Binding] = &[
     binding!(Cmd::PrevTab, "previous pack", false; key(BackTab)),
 ];
 
+static EMOJI: &[Binding] = &[
+    binding!(Cmd::Back, "close", true; key(Esc)),
+    binding!(Cmd::Confirm, "react with the emoji", true; key(Enter)),
+    binding!(Cmd::Left, "previous emoji", false; key(Left), ch('h')),
+    binding!(Cmd::Right, "next emoji", false; key(Right), ch('l')),
+    binding!(Cmd::Up, "row up", false; key(Up), ch('k')),
+    binding!(Cmd::Down, "row down", false; key(Down), ch('j')),
+    binding!(Cmd::NextTab, "next pack", true; key(Tab)),
+    binding!(Cmd::PrevTab, "previous pack", false; key(BackTab)),
+];
+
 static SETTINGS: &[Binding] = &[
     binding!(Cmd::Back, "close", true; key(Esc)),
     binding!(Cmd::NextTab, "next tab", true; key(Right), key(Tab)),
@@ -439,6 +477,22 @@ static SETTINGS: &[Binding] = &[
     binding!(Cmd::Home, "first setting", false; key(Home)),
     binding!(Cmd::End, "last setting", false; key(End)),
     binding!(Cmd::Confirm, "change", true; key(Enter), ch(' ')),
+];
+
+static PLUGINS: &[Binding] = &[
+    binding!(Cmd::Back, "back to Settings › Plugins", true; key(Esc)),
+    binding!(Cmd::Up, "previous row", false; key(Up), ch('k')),
+    binding!(Cmd::Down, "next row", false; key(Down), ch('j')),
+    binding!(Cmd::Home, "first row", false; key(Home)),
+    binding!(Cmd::End, "last row", false; key(End)),
+    binding!(Cmd::Confirm, "open / change", true; key(Enter), ch(' ')),
+];
+
+/// A plugin's view takes every other key itself (it lists them on its frame).
+static PLUGIN_VIEW: &[Binding] = &[
+    binding!(Cmd::Back, "close", true; key(Esc)),
+    binding!(Cmd::PageUp, "scroll up", false; key(PageUp)),
+    binding!(Cmd::PageDown, "scroll down", false; key(PageDown)),
 ];
 
 /// The context's own bindings, then the shared ones it takes.
@@ -460,7 +514,10 @@ fn tables(ctx: Ctx) -> [&'static [Binding]; 3] {
         Ctx::AttachFilter => ATTACH_FILTER,
         Ctx::AttachSend => ATTACH_SEND,
         Ctx::Stickers => STICKERS,
+        Ctx::Emoji => EMOJI,
         Ctx::Settings => SETTINGS,
+        Ctx::Plugins => PLUGINS,
+        Ctx::PluginView => PLUGIN_VIEW,
     };
     let edit = if matches!(
         ctx,
@@ -497,8 +554,10 @@ fn global_allowed(ctx: Ctx, cmd: Cmd) -> bool {
     let main_view = matches!(ctx, ChatList | ChatSearch | Compose | Messages | Viewer);
     match cmd {
         Cmd::Quit | Cmd::Help => true,
-        Cmd::Settings => main_view || ctx == Profile,
-        Cmd::ComposeMenu | Cmd::ChatMenu | Cmd::ChatProfile => main_view,
+        Cmd::Settings | Cmd::MainMenu => main_view || ctx == Profile,
+        Cmd::ComposeMenu | Cmd::ChatMenu | Cmd::ChatProfile | Cmd::ReadReceipts => main_view,
+        // Not from the viewer: the chat list is behind it.
+        Cmd::Search => main_view && ctx != Viewer,
         _ => false,
     }
 }
@@ -527,10 +586,13 @@ pub fn help_key(ctx: Ctx) -> &'static str {
     if is_typing(ctx) { "F1 help" } else { "? help" }
 }
 
-/// The hinted bindings of `ctx` whose command `available` allows right now.
+/// The hinted bindings of `ctx` whose command `available` allows right now
+/// (the main menu first: everything else can be found from it).
 pub fn hint(ctx: Ctx, available: impl Fn(Cmd) -> bool) -> String {
-    all(ctx)
-        .filter(|b| b.hint && available(b.cmd))
+    let mut shown: Vec<&Binding> = all(ctx).filter(|b| b.hint && available(b.cmd)).collect();
+    shown.sort_by_key(|b| b.cmd != Cmd::MainMenu);
+    shown
+        .into_iter()
         .map(|b| {
             let keys = match b.cmd {
                 Cmd::Digit(_) => "1…9".to_owned(),
@@ -541,11 +603,72 @@ pub fn hint(ctx: Ctx, available: impl Fn(Cmd) -> bool) -> String {
             format!("{keys} {}", b.help)
         })
         .collect::<Vec<_>>()
-        .join(" · ")
+        .join(HINT_SEP)
+}
+
+/// Separates the entries of a hint.
+pub const HINT_SEP: &str = " · ";
+
+/// `hint` (entries joined by [`HINT_SEP`], optionally padded with spaces) made to
+/// fit `width` columns: whole entries are dropped from the end and a final `…`
+/// says more are on the help screen (left out when only the first entry fits);
+/// the first entry (how to get help) is never dropped, only cut when it alone
+/// does not fit.
+pub fn fit_hint(hint: &str, width: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if hint.width() <= width {
+        return hint.to_owned();
+    }
+    // Keep the padding only while there is room for it.
+    let inner = hint.trim();
+    let (lead, trail) = if hint.starts_with(' ') && hint.ends_with(' ') && width >= inner.width().min(8) + 2 {
+        (" ", " ")
+    } else {
+        ("", "")
+    };
+    let room = width.saturating_sub(lead.len() + trail.len());
+    let more = format!("{HINT_SEP}…");
+    let mut out = String::new();
+    for (i, part) in inner.split(HINT_SEP).enumerate() {
+        let candidate = if i == 0 {
+            part.to_owned()
+        } else {
+            format!("{out}{HINT_SEP}{part}")
+        };
+        // Something always follows an entry that is not the last: leave room for the `…`.
+        if candidate.width() + more.width() > room {
+            break;
+        }
+        out = candidate;
+    }
+    let first = inner.split(HINT_SEP).next().unwrap_or("");
+    if out.is_empty() && first.width() <= room {
+        // Only the first entry fits: it goes alone.
+        out = first.to_owned();
+    } else if out.is_empty() {
+        // Not even the first entry fits: cut it.
+        if room == 0 {
+            return String::new();
+        }
+        let mut w = 0;
+        for ch in inner.chars() {
+            let cw = ch.width().unwrap_or(0);
+            if w + cw + 1 > room {
+                break;
+            }
+            out.push(ch);
+            w += cw;
+        }
+        out.push('…');
+    } else {
+        out.push_str(&more);
+    }
+    format!("{lead}{out}{trail}")
 }
 
 /// The message line's commands (typed and sent with `Enter`), listed after
-/// its keys on the help screen.
+/// its keys on the help screen. They act on the open chat; screens
+/// (settings, plugins, help, …) are opened with keys and the main menu.
 const COMMANDS: &[(&str, &str)] = &[
     (
         "/attach [PATH]",
@@ -555,15 +678,29 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/location", "send a location"),
     ("/contact", "share a contact"),
     ("/save PATH", "save the chat's newest media to PATH"),
-    ("/menu", "the chat's menu"),
     ("/mute, /unmute", "turn the chat's notifications off / on"),
     ("/invite, /rename", "invite to / rename the group"),
     ("/albums, /leave", "the group's albums / leave the group"),
-    ("/group", "new group"),
-    ("/settings, /help", "settings / these shortcuts"),
-    ("/quit", "quit"),
     ("//text", "send \"/text\" as it is"),
 ];
+
+/// The `/name`s the message line handles itself (see `App::submit`):
+/// plugins cannot take them.
+pub const CORE_COMMANDS: &[&str] = &[
+    "save", "attach", "image", "file", "send", "sticker", "stickers", "location", "contact", "invite",
+    "leave", "rename", "albums", "album", "mute", "unmute",
+];
+
+/// Whether plugins may bind `Alt-<c>` (rune never does).
+pub fn is_plugin_key(event: &KeyEvent) -> Option<char> {
+    match event.code {
+        KeyCode::Char(c) if event.modifiers == KeyModifiers::ALT => {
+            let c = c.to_ascii_lowercase();
+            (c.is_ascii_lowercase() || c.is_ascii_digit()).then_some(c)
+        }
+        _ => None,
+    }
+}
 
 /// Every binding of `ctx`, for the help screen.
 pub fn help_lines(ctx: Ctx) -> Vec<(String, &'static str)> {
@@ -799,14 +936,18 @@ mod tests {
         let chord = |c| event(KeyCode::Char(c), KeyModifiers::CONTROL);
         for (c, cmd) in [
             ('s', Cmd::Settings),
+            ('x', Cmd::MainMenu),
             ('o', Cmd::ComposeMenu),
             ('g', Cmd::ChatMenu),
             ('p', Cmd::ChatProfile),
+            ('r', Cmd::ReadReceipts),
         ] {
             assert_eq!(resolve(Ctx::Compose, &chord(c)), Some(cmd));
             assert_eq!(resolve(Ctx::Menu, &chord(c)), None);
         }
         assert_eq!(resolve(Ctx::Profile, &chord('s')), Some(Cmd::Settings));
+        assert_eq!(resolve(Ctx::Profile, &chord('x')), Some(Cmd::MainMenu));
+        assert_eq!(resolve(Ctx::Settings, &chord('x')), None);
         // Settings has one key only.
         assert_eq!(resolve(Ctx::ChatList, &plain(KeyCode::Char('S'))), None);
         assert_eq!(resolve(Ctx::Compose, &chord(',')), None);
@@ -825,6 +966,51 @@ mod tests {
     }
 
     #[test]
+    fn fitted_hints_keep_whole_entries_and_the_help_key() {
+        use unicode_width::UnicodeWidthStr;
+        let hint = "? help · Enter open · Tab focus · / search";
+        assert_eq!(fit_hint(hint, 80), hint);
+        assert_eq!(fit_hint(hint, hint.width()), hint);
+        assert_eq!(fit_hint(hint, 30), "? help · Enter open · …");
+        assert_eq!(fit_hint(hint, 10), "? help · …");
+        // Too narrow for anything but a shortened help key.
+        assert_eq!(fit_hint(hint, 5), "? he…");
+        assert_eq!(fit_hint(hint, 0), "");
+        // Frame titles keep their padding while it fits.
+        assert_eq!(fit_hint(" a · bb · cc ", 10), " a · … ");
+        for ctx in [
+            Ctx::ChatList,
+            Ctx::Messages,
+            Ctx::Compose,
+            Ctx::Viewer,
+            Ctx::Profile,
+        ] {
+            let full = format!("{}{HINT_SEP}{}", help_key(ctx), hint_text(ctx));
+            for w in 0..=full.width() + 2 {
+                let fitted = fit_hint(&full, w);
+                assert!(fitted.width() <= w, "{ctx:?} at {w}: {fitted:?}");
+                if w >= help_key(ctx).width() + 4 {
+                    assert!(fitted.starts_with(help_key(ctx)), "{ctx:?} at {w}: {fitted:?}");
+                }
+                // Never an entry cut in the middle.
+                for part in fitted.trim_end_matches('…').split(HINT_SEP) {
+                    let part = part.trim_end_matches(" ·");
+                    assert!(
+                        part.is_empty()
+                            || full.split(HINT_SEP).any(|p| p == part)
+                            || w < help_key(ctx).width() + 4,
+                        "{ctx:?} at {w}: {fitted:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn hint_text(ctx: Ctx) -> String {
+        hint(ctx, |_| true)
+    }
+
+    #[test]
     fn hints_skip_unavailable_commands() {
         let all_on = hint(Ctx::Messages, |_| true);
         assert!(all_on.contains("r reply"), "{all_on}");
@@ -833,6 +1019,67 @@ mod tests {
         assert_eq!(help_key(Ctx::Compose), "F1 help");
         assert_eq!(help_key(Ctx::Messages), "? help");
         assert_eq!(display_key(ctrl('o')), "Ctrl-o");
+    }
+
+    #[test]
+    fn alt_letters_and_digits_are_left_to_plugins() {
+        for ctx in Ctx::ALL {
+            for c in ('a'..='z').chain('0'..='9') {
+                let alt = event(KeyCode::Char(c), KeyModifiers::ALT);
+                assert_eq!(resolve(ctx, &alt), None, "{ctx:?} binds Alt-{c}");
+                assert_eq!(is_plugin_key(&alt), Some(c));
+            }
+        }
+        assert_eq!(
+            is_plugin_key(&event(KeyCode::Char('S'), KeyModifiers::ALT)),
+            Some('s')
+        );
+        assert_eq!(
+            is_plugin_key(&event(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(is_plugin_key(&event(KeyCode::Enter, KeyModifiers::ALT)), None);
+    }
+
+    #[test]
+    fn every_listed_command_is_reserved_from_plugins() {
+        for (usage, _) in COMMANDS {
+            for name in usage.split(", ").filter_map(|c| c.strip_prefix('/')) {
+                let name = name.split_whitespace().next().unwrap();
+                if !name.is_empty() && !name.starts_with('/') {
+                    assert!(CORE_COMMANDS.contains(&name), "/{name} is not in CORE_COMMANDS");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_main_menu_is_hinted_first_in_every_main_view() {
+        for ctx in [
+            Ctx::ChatList,
+            Ctx::ChatSearch,
+            Ctx::Compose,
+            Ctx::Messages,
+            Ctx::Viewer,
+        ] {
+            assert!(hint(ctx, |_| true).starts_with("Ctrl-x menu"), "{ctx:?}");
+        }
+        assert!(!hint(Ctx::Menu, |_| true).contains("Ctrl-x"));
+    }
+
+    #[test]
+    fn screens_are_not_message_line_commands() {
+        for name in [
+            "settings", "plugins", "help", "quit", "group", "newgroup", "menu", "join", "flex",
+        ] {
+            assert!(!CORE_COMMANDS.contains(&name), "/{name} is not a command");
+            assert!(
+                !COMMANDS
+                    .iter()
+                    .any(|(usage, _)| usage.contains(&format!("/{name}"))),
+                "/{name} is still listed as a command"
+            );
+        }
     }
 
     #[test]

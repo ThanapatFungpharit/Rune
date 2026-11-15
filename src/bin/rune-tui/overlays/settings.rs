@@ -1,6 +1,10 @@
 //! Settings: this app's preferences (kept in the local store), LINE's
-//! account-wide notification settings, profile, and storage; plus desktop
-//! notifications for new messages.
+//! account-wide notification settings, your account, plugins and storage;
+//! plus desktop notifications for new messages (worded and shown by `notice`).
+//!
+//! Screens opened from a settings row (a form, the pin lists, a plugin's
+//! page, a confirmation) come back to Settings when they close: see
+//! `App::open_from_settings` and `App::settle_modal`.
 
 use crate::*;
 use rune::models::settings_attribute as sa;
@@ -60,6 +64,7 @@ pub struct Prefs {
     /// Load pictures in chats automatically.
     pub auto_pictures: bool,
     pub thumb_size: usize,
+    pub theme: theme::ThemeMode,
 }
 
 impl Default for Prefs {
@@ -72,6 +77,7 @@ impl Default for Prefs {
             read_receipts: true,
             auto_pictures: true,
             thumb_size: 2,
+            theme: theme::ThemeMode::Auto,
         }
     }
 }
@@ -94,6 +100,9 @@ impl Prefs {
                 .and_then(|v| v.parse().ok())
                 .filter(|&n| n < THUMB_SIZES.len())
                 .unwrap_or(d.thumb_size),
+            theme: get("theme")
+                .and_then(|v| theme::ThemeMode::parse(&v))
+                .unwrap_or(d.theme),
         }
     }
 
@@ -106,6 +115,7 @@ impl Prefs {
             ("read_receipts", self.read_receipts.to_string()),
             ("auto_pictures", self.auto_pictures.to_string()),
             ("thumb_size", self.thumb_size.to_string()),
+            ("theme", self.theme.as_str().to_owned()),
         ];
         for (k, v) in pairs {
             let _ = store.set(&format!("setting.{k}"), &v);
@@ -113,50 +123,51 @@ impl Prefs {
     }
 }
 
-/// Show a notification (off the UI thread for external commands).
-pub fn notify(mode: NotifyMode, title: &str, body: &str) {
-    use std::io::Write;
-    match mode {
-        NotifyMode::Off => {}
-        NotifyMode::Bell => {
-            let mut out = std::io::stdout();
-            let _ = out.write_all(b"\x07");
-            let _ = out.flush();
-        }
-        NotifyMode::Desktop => {
-            let spawned = if cfg!(target_os = "macos") {
-                let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-                std::process::Command::new("osascript")
-                    .arg("-e")
-                    .arg(format!(
-                        "display notification \"{}\" with title \"{}\"",
-                        esc(body),
-                        esc(title)
-                    ))
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-            } else {
-                std::process::Command::new("notify-send")
-                    .args(["--app-name=rune", "--", title, body])
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-            };
-            if spawned.is_err() {
-                // OSC 777 (urxvt, foot, WezTerm, Ghostty, …).
-                let clean = |s: &str| s.replace([';', '\x07', '\x1b', '\n'], " ");
-                let mut out = std::io::stdout();
-                let _ = write!(out, "\x1b]777;notify;{};{}\x07", clean(title), clean(body));
-                let _ = out.flush();
-            }
-        }
-    }
+/// The tabs, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    /// This computer's notifications, then LINE's (which apply to the phone too).
+    Notifications,
+    Chats,
+    /// Your display name, status message and profile page.
+    Account,
+    Plugins,
+    Storage,
 }
 
-const TABS: [&str; 5] = ["Notifications", "LINE account", "Chats", "Profile", "Storage"];
+impl Tab {
+    pub const ALL: [Tab; 5] = [
+        Tab::Notifications,
+        Tab::Chats,
+        Tab::Account,
+        Tab::Plugins,
+        Tab::Storage,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            Tab::Notifications => "Notifications",
+            Tab::Chats => "Chats",
+            Tab::Account => "Account",
+            Tab::Plugins => "Plugins",
+            Tab::Storage => "Storage",
+        }
+    }
+
+    fn index(self) -> usize {
+        Tab::ALL.iter().position(|&t| t == self).unwrap_or(0)
+    }
+
+    fn step(self, forward: bool) -> Tab {
+        let n = Tab::ALL.len();
+        let i = if forward {
+            self.index() + 1
+        } else {
+            self.index() + n - 1
+        };
+        Tab::ALL[i % n]
+    }
+}
 
 /// LINE's account notification switches: attribute, `Settings` field, label.
 const SERVER_TOGGLES: [(i64, &str, &str); 7] = [
@@ -197,14 +208,22 @@ enum RowAct {
     ReadReceipts,
     AutoPictures,
     ThumbSize,
+    Theme,
     DisplayName,
     StatusMessage,
     ClearCache,
+    PinLists,
+    /// One plugin's page, by index in the plugin list.
+    Plugin(usize),
+    /// Install a plugin from a Git repository.
+    InstallPlugin,
+    /// Check every Git-installed plugin for a new version.
+    CheckAll,
     None,
 }
 
 pub struct SettingsPage {
-    pub tab: usize,
+    pub tab: Tab,
     pub sel: usize,
 }
 
@@ -214,17 +233,43 @@ fn on_off(b: bool) -> String {
 
 impl App {
     pub fn open_settings(&mut self) {
-        self.open_settings_at(0);
+        self.open_settings_at(Tab::Notifications);
     }
 
-    pub fn open_settings_at(&mut self, tab: usize) {
-        self.modal = Some(Modal::Settings(SettingsPage { tab, sel: 0 }));
+    pub fn open_settings_at(&mut self, tab: Tab) {
+        self.modal_parent = None;
+        // On the first row that does something (the tab may start with a note).
+        let sel = self
+            .settings_rows(tab)
+            .iter()
+            .position(|r| r.2 != RowAct::None)
+            .unwrap_or(0);
+        self.modal = Some(Modal::Settings(SettingsPage { tab, sel }));
         self.fetch_tab_data(tab);
     }
 
-    fn fetch_tab_data(&mut self, tab: usize) {
+    /// Settings › Plugins with `plugin`'s row selected (where its page goes back to).
+    pub fn open_settings_on_plugin(&mut self, plugin: &str) {
+        self.open_settings_at(Tab::Plugins);
+        let at = self.settings_rows(Tab::Plugins).iter().position(|r| {
+            matches!(r.2, RowAct::Plugin(i) if self.plugins.entries.get(i).is_some_and(|e| e.id == plugin))
+        });
+        if let (Some(Modal::Settings(s)), Some(i)) = (self.modal.as_mut(), at) {
+            s.sel = i;
+        }
+    }
+
+    /// Open a screen over Settings (by `open`); Settings comes back when it closes.
+    fn open_from_settings(&mut self, open: impl FnOnce(&mut App)) {
+        self.modal_parent = self.modal.take().map(Box::new);
+        open(self);
+    }
+
+    pub fn fetch_tab_data(&mut self, tab: Tab) {
         let (client, tx) = (self.client.clone(), self.tx.clone());
-        if tab == 1 && !matches!(self.server_settings, Some(Load::Ready(_)) | Some(Load::Loading)) {
+        if tab == Tab::Notifications
+            && !matches!(self.server_settings, Some(Load::Ready(_)) | Some(Load::Loading))
+        {
             self.server_settings = Some(Load::Loading);
             tokio::spawn(async move {
                 let attrs: Vec<i64> = SERVER_TOGGLES.iter().map(|t| t.0).collect();
@@ -234,7 +279,7 @@ impl App {
                     .map_err(|e| e.to_string());
                 let _ = tx.send(AppEvent::ServerSettings(res));
             });
-        } else if tab == 3 && self.my_profile.is_none() {
+        } else if tab == Tab::Account && self.my_profile.is_none() {
             self.my_profile = Some(Load::Loading);
             tokio::spawn(async move {
                 let res = client.profile().await.map_err(|e| e.to_string());
@@ -244,39 +289,34 @@ impl App {
     }
 
     /// The rows of a tab: label, value, what Enter does.
-    fn settings_rows(&self, tab: usize) -> Vec<(String, String, RowAct)> {
+    fn settings_rows(&self, tab: Tab) -> Vec<(String, String, RowAct)> {
         let p = &self.prefs;
+        let note = |text: &str| (text.to_owned(), String::new(), RowAct::None);
         match tab {
-            0 => vec![
-                ("New messages".into(), p.notify.label().into(), RowAct::NotifyMode),
-                (
-                    "Show message text".into(),
-                    on_off(p.notify_preview),
-                    RowAct::NotifyPreview,
-                ),
-                (
-                    "Group chats".into(),
-                    on_off(p.notify_groups),
-                    RowAct::NotifyGroups,
-                ),
-                (
-                    "Even for the open chat".into(),
-                    on_off(p.notify_focused),
-                    RowAct::NotifyFocused,
-                ),
-                ("Send a test notification".into(), "↵".into(), RowAct::TestNotify),
-                (
-                    "Muted chats never notify (mute one from its menu).".into(),
-                    String::new(),
-                    RowAct::None,
-                ),
-            ],
-            1 => {
-                let mut rows = vec![(
-                    "These are LINE's settings: they apply to your phone too.".into(),
-                    String::new(),
-                    RowAct::None,
-                )];
+            Tab::Notifications => {
+                let mut rows = vec![
+                    note("On this computer"),
+                    ("New messages".into(), p.notify.label().into(), RowAct::NotifyMode),
+                    (
+                        "Show message text".into(),
+                        on_off(p.notify_preview),
+                        RowAct::NotifyPreview,
+                    ),
+                    (
+                        "Group chats".into(),
+                        on_off(p.notify_groups),
+                        RowAct::NotifyGroups,
+                    ),
+                    (
+                        "Even for the open chat".into(),
+                        on_off(p.notify_focused),
+                        RowAct::NotifyFocused,
+                    ),
+                    ("Send a test notification".into(), "↵".into(), RowAct::TestNotify),
+                    note("Muted chats never notify (mute one from its menu)."),
+                    note(""),
+                    note("On LINE (these apply to your phone too)"),
+                ];
                 match &self.server_settings {
                     Some(Load::Ready(v)) => {
                         for (i, (_, field, label)) in SERVER_TOGGLES.iter().enumerate() {
@@ -302,7 +342,7 @@ impl App {
                 }
                 rows
             }
-            2 => {
+            Tab::Chats => {
                 let receipts = if self.no_read_receipts_flag {
                     "Off (--no-read-receipts)".into()
                 } else {
@@ -320,6 +360,15 @@ impl App {
                         format!("{}/{}", self.thumb_size + 1, THUMB_SIZES.len()),
                         RowAct::ThumbSize,
                     ),
+                    ("Colour theme".into(), p.theme.label().into(), RowAct::Theme),
+                    (
+                        "Pin lists…".into(),
+                        self.store
+                            .active_pin_profile()
+                            .map(|p| p.name)
+                            .unwrap_or_default(),
+                        RowAct::PinLists,
+                    ),
                     (
                         "Typing indicators are shown when LINE sends them;".into(),
                         String::new(),
@@ -332,7 +381,7 @@ impl App {
                     ),
                 ]
             }
-            3 => {
+            Tab::Account => {
                 let (name, status) = match &self.my_profile {
                     Some(Load::Ready((n, s))) => (n.clone(), s.clone()),
                     Some(Load::Failed(e)) => (format!("? ({e})"), String::new()),
@@ -353,7 +402,51 @@ impl App {
                     ),
                 ]
             }
-            _ => {
+            Tab::Plugins => {
+                let plugins = &self.plugins;
+                let mut rows = Vec::new();
+                if plugins.safe_mode {
+                    rows.push(note("Plugins are off for this run (--no-plugins)."));
+                }
+                rows.extend(plugins.entries.iter().enumerate().map(|(i, e)| {
+                    let version = e
+                        .manifest
+                        .as_ref()
+                        .map(|m| format!("  {}", m.version))
+                        .unwrap_or_default();
+                    let state = match e.state.is_problem() {
+                        true => format!("⚠ {}", e.state.label()),
+                        false => e.state.label().to_owned(),
+                    };
+                    (format!("{}{version}", e.name()), state, RowAct::Plugin(i))
+                }));
+                if plugins.entries.is_empty() {
+                    rows.push(note("No plugins installed."));
+                }
+                if plugins.dir.is_some() {
+                    let busy = self.plugin_job.clone().unwrap_or_else(|| "↵".into());
+                    rows.push((
+                        "Install from a Git repository…".into(),
+                        busy.clone(),
+                        RowAct::InstallPlugin,
+                    ));
+                    if plugins.entries.iter().any(|e| e.source.is_some()) {
+                        rows.push(("Check all for new versions".into(), busy, RowAct::CheckAll));
+                    }
+                }
+                rows.push(note(""));
+                rows.push(match &plugins.dir {
+                    Some(d) => note(&format!("Installed in {}", d.display())),
+                    None => note("No plugin directory (set --plugins DIR)."),
+                });
+                rows.push(note("Plugins add commands, keys and views. Each runs only once"));
+                rows.push(note(
+                    "you enable it on its page (Enter) and allow what it asks for.",
+                ));
+                rows.push(note("Changed files are picked up while rune runs."));
+                rows
+            }
+            Tab::Storage => {
                 let (chats, msgs, contacts) = self.store.stats().unwrap_or_default();
                 let path = self
                     .store
@@ -392,18 +485,19 @@ impl App {
         }
     }
 
+    /// The labels of a tab's rows.
+    #[cfg(test)]
+    pub fn settings_rows_for_test(&self, tab: Tab) -> Vec<String> {
+        self.settings_rows(tab).into_iter().map(|r| r.0).collect()
+    }
+
     pub fn settings_key(&mut self, mut s: SettingsPage, k: KeyEvent) {
         let rows = self.settings_rows(s.tab);
         let selectable: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].2 != RowAct::None).collect();
         match keymap::resolve(keymap::Ctx::Settings, &k) {
             Some(keymap::Cmd::Back) => return,
-            Some(keymap::Cmd::PrevTab) => {
-                s.tab = s.tab.checked_sub(1).unwrap_or(TABS.len() - 1);
-                s.sel = 0;
-                self.fetch_tab_data(s.tab);
-            }
-            Some(keymap::Cmd::NextTab) => {
-                s.tab = (s.tab + 1) % TABS.len();
+            Some(cmd @ (keymap::Cmd::PrevTab | keymap::Cmd::NextTab)) => {
+                s.tab = s.tab.step(cmd == keymap::Cmd::NextTab);
                 s.sel = 0;
                 self.fetch_tab_data(s.tab);
             }
@@ -457,7 +551,15 @@ impl App {
                 } else {
                     self.prefs.notify
                 };
-                notify(mode, "rune", "Notifications work 🎉");
+                // With your own picture, so the icon is tested too.
+                let me = vec![self.me.clone()];
+                self.notify_later_as(mode, &[], me, None, |_| {
+                    Some(notice::Notice::new(
+                        "rune",
+                        "Notifications are working",
+                        notice::Category::Other,
+                    ))
+                });
                 self.status = format!("sent a test ({})", mode.label());
             }
             RowAct::Server(i) => {
@@ -481,11 +583,18 @@ impl App {
             RowAct::ReadReceipts if self.no_read_receipts_flag => {
                 self.status = "read receipts are off for this run (--no-read-receipts)".into();
             }
-            RowAct::ReadReceipts => self.prefs.read_receipts ^= true,
+            RowAct::ReadReceipts => {
+                self.prefs.read_receipts ^= true;
+                self.receipts_switched();
+            }
             RowAct::AutoPictures => self.prefs.auto_pictures ^= true,
             RowAct::ThumbSize => {
                 self.thumb_size = (self.thumb_size + 1) % THUMB_SIZES.len();
                 self.prefs.thumb_size = self.thumb_size;
+            }
+            RowAct::Theme => {
+                self.prefs.theme = self.prefs.theme.next();
+                theme::apply(self.prefs.theme);
             }
             RowAct::DisplayName | RowAct::StatusMessage => {
                 let (name, status) = match &self.my_profile {
@@ -509,31 +618,50 @@ impl App {
                         "shown on your profile; empty clears it",
                     )
                 };
-                self.modal = Some(Modal::Form(modal::Form {
+                let form = modal::Form {
                     title: title.into(),
                     kind,
                     fields: vec![modal::Field {
-                        label,
+                        label: label.into(),
                         value: value.into(),
-                        hint,
+                        hint: hint.into(),
                     }],
                     sel: 0,
                     error: None,
-                }));
-                return;
+                };
+                return self.open_from_settings(|app| app.modal = Some(Modal::Form(form)));
             }
             RowAct::ProfilePage => {
+                // The profile page is not an overlay: Settings closes.
                 self.modal = None;
+                self.modal_parent = None;
                 let me = self.me.clone();
                 return self.open_profile(me);
             }
             RowAct::ClearCache => {
-                return self.confirm(
-                    "Delete all locally stored chats, messages and contacts? They are fetched \
-                     from LINE again (only as much history as LINE still serves).",
-                    modal::Action::ClearCache,
-                );
+                return self.open_from_settings(|app| {
+                    app.confirm(
+                        "Delete all locally stored chats, messages and contacts? They are fetched \
+                         from LINE again (only as much history as LINE still serves).",
+                        modal::Action::ClearCache,
+                    )
+                });
             }
+            RowAct::PinLists => return self.open_from_settings(App::pin_lists_menu),
+            RowAct::Plugin(i) => {
+                let Some(id) = self.plugins.entries.get(i).map(|e| e.id.clone()) else {
+                    return;
+                };
+                return self.open_from_settings(|app| app.open_plugin_page(id));
+            }
+            RowAct::InstallPlugin => {
+                if let Some(job) = &self.plugin_job {
+                    self.status = format!("wait: {job}");
+                    return;
+                }
+                return self.open_from_settings(App::install_plugin_form);
+            }
+            RowAct::CheckAll => return self.check_all_plugins(),
             RowAct::None => return,
         }
         self.prefs.save(&self.store);
@@ -545,21 +673,21 @@ impl App {
         self.hit.modal = Some(r);
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(Color::Green))
+            .border_style(Style::new().fg(theme::t().accent))
             .title(Span::styled(" ⚙ Settings ", Style::new().bold()))
-            .title_bottom(Span::styled(hint, Style::new().dim()));
+            .title_bottom(frame_hint(&hint, r));
         let inner = block.inner(r);
         f.render_widget(block, r);
         let [tabs, _, body] =
             Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)]).areas(inner);
         let mut spans = Vec::new();
-        for (i, t) in TABS.iter().enumerate() {
-            let style = if i == s.tab {
-                Style::new().bg(Color::Green).fg(Color::Black).bold()
+        for t in Tab::ALL {
+            let style = if t == s.tab {
+                Style::new().bg(theme::t().accent).fg(theme::t().on_accent).bold()
             } else {
-                Style::new().dim()
+                theme::muted()
             };
-            spans.push(Span::styled(format!(" {t} "), style));
+            spans.push(Span::styled(format!(" {} ", t.title()), style));
             spans.push(Span::raw(" "));
         }
         f.render_widget(Paragraph::new(Line::from(spans)), tabs);
@@ -586,13 +714,13 @@ impl App {
             let pad = (body.width as usize).saturating_sub(label.width() + value.width() + 2);
             let (ls, vs) = if sel {
                 (
-                    Style::new().bg(Color::Green).fg(Color::Black),
-                    Style::new().bg(Color::Green).fg(Color::Black).bold(),
+                    Style::new().bg(theme::t().accent_soft).fg(theme::t().text),
+                    Style::new().bg(theme::t().accent_soft).fg(theme::t().text).bold(),
                 )
             } else if note {
-                (Style::new().dim().italic(), Style::new().dim())
+                (theme::muted().italic(), theme::muted())
             } else {
-                (Style::new(), Style::new().fg(Color::Green))
+                (Style::new(), Style::new().fg(theme::t().accent))
             };
             f.render_widget(
                 Paragraph::new(Line::from(vec![
@@ -618,10 +746,18 @@ mod tests {
             notify_preview: false,
             read_receipts: false,
             thumb_size: 1,
+            theme: theme::ThemeMode::Light,
             ..Prefs::default()
         };
         p.save(&store);
         assert_eq!(Prefs::load(&store), p);
         assert_eq!(NotifyMode::Desktop.next(), NotifyMode::Off);
+    }
+
+    #[test]
+    fn tabs_wrap_around_both_ways() {
+        assert_eq!(Tab::Storage.step(true), Tab::Notifications);
+        assert_eq!(Tab::Notifications.step(false), Tab::Storage);
+        assert_eq!(Tab::Chats.step(true), Tab::Account);
     }
 }

@@ -45,21 +45,24 @@ pub fn spawn_avatar(
 }
 
 impl App {
-    /// The avatar for `mid` if it is ready; starts the download the first
-    /// time a mid with a known picture is asked for.
+    /// The avatar for `mid` if it is ready; queues the download (see
+    /// `App::start_media`) while a mid with a known picture is asked for. A mid not looked up this
+    /// run is queued for the next lookup round (its stored picture may be
+    /// stale, or missing), so every view gets pictures the same way.
     pub fn avatar_ready(&mut self, mid: &str) -> bool {
+        if !self.looked_up.contains(mid) {
+            self.name_misses.get_mut().insert(mid.to_owned());
+        }
         match self.avatars.get(mid) {
             Some(Load::Ready(_)) => true,
             Some(_) => false,
             None => {
                 if let Some(path) = self.picture_paths.get(mid).cloned() {
-                    self.avatars.insert(mid.to_owned(), Load::Loading);
-                    spawn_avatar(
-                        self.client.clone(),
-                        self.tx.clone(),
-                        self.store.clone(),
-                        mid.to_owned(),
-                        path,
+                    // Started after the frame, by how near the screen it is drawn.
+                    self.media.want(
+                        MediaKey::Avatar(mid.to_owned()),
+                        fetchq::UNPLACED,
+                        MediaStart::Avatar(path),
                     );
                 }
                 false
@@ -68,12 +71,20 @@ impl App {
     }
 
     pub fn on_avatar(&mut self, mid: String, img: Option<DynamicImage>) {
+        self.media.done(&MediaKey::Avatar(mid.clone()));
         let slot = match img {
-            Some(i) => Load::Ready(Avatar {
-                head: Picture::new(i.clone(), self.picker.as_ref()),
-                list: Picture::new(i, self.picker.as_ref()),
-            }),
-            None => Load::Failed("no picture".into()),
+            Some(i) => {
+                self.loaded(&Job::Avatar(mid.clone()));
+                Load::Ready(Avatar {
+                    head: Picture::new(i.clone(), self.picker.as_ref()),
+                    list: Picture::new(i, self.picker.as_ref()),
+                })
+            }
+            None => {
+                // Not fetched or not decodable: tried again while it is drawn.
+                self.retry_later(Job::Avatar(mid.clone()));
+                Load::Failed("no picture".into())
+            }
         };
         self.avatars.insert(mid, slot);
     }

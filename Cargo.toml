@@ -22,6 +22,8 @@ ratatui = { version = "0.30.2", optional = true }
 ratatui-image = { version = "11.1.0", optional = true, default-features = false, features = ["crossterm"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "stream", "http2"] }
 rqrr = { version = "0.11.0", optional = true }
+# The plugin API (wire types, manifest), shared with plugin authors.
+rune-plugin = { path = "plugin-sdk", optional = true }
 rusqlite = { version = "0.42.0", features = ["bundled"], optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -29,6 +31,7 @@ sha2 = "0.11.1"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "sync", "fs"] }
 tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", optional = true, default-features = false, features = ["env-filter", "fmt", "std"] }
 unicode-width = { version = "0.2.3", optional = true }
 url = "2.5.8"
 wasmtime = { version = "50.0.1", default-features = false, features = ["cranelift", "runtime", "std", "parallel-compilation"] }
@@ -43,12 +46,14 @@ image = { version = "0.25.10", default-features = false, features = ["png"] }
 qrcode = { version = "0.14.1", default-features = false }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 wiremock = "0.6.5"
+# Test plugins written in the WebAssembly text format.
+wat = "1.263.0"
 
 [features]
 # Local SQLite message store (`rune::store`); SQLite is compiled in (needs a C compiler).
 store = ["dep:rusqlite"]
 # The terminal chat app (`cargo run --release --features tui --bin rune-tui`).
-tui = ["store", "dep:rqrr", "dep:ratatui", "dep:crossterm", "dep:chrono", "dep:unicode-width", "dep:qrcode", "dep:ratatui-image"]
+tui = ["store", "dep:rqrr", "dep:ratatui", "dep:crossterm", "dep:chrono", "dep:unicode-width", "dep:qrcode", "dep:ratatui-image", "dep:tracing-subscriber", "dep:rune-plugin", "tokio/signal"]
 
 [[bin]]
 name = "rune-tui"

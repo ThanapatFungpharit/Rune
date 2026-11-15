@@ -509,9 +509,9 @@ impl App {
         };
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(Color::Green))
+            .border_style(Style::new().fg(theme::t().accent))
             .title(Span::styled(title, Style::new().bold()))
-            .title_bottom(Span::styled(hint, Style::new().dim()));
+            .title_bottom(frame_hint(&hint, r));
         let inner = block.inner(r);
         f.render_widget(block, r);
         let [list_area, preview_area] =
@@ -529,12 +529,12 @@ impl App {
         );
         let (shown, cursor) = a.filter.view(filter_row.width.saturating_sub(3) as usize);
         let filter_line = if a.filter.is_empty() {
-            Line::from(Span::styled("🔍 type a name or a path…", Style::new().dim()))
+            Line::from(Span::styled("🔍 type a name or a path…", theme::muted()))
         } else {
             Line::from(vec![Span::raw("🔍 "), Span::raw(shown.to_owned())])
         };
         f.render_widget(
-            Paragraph::new(filter_line).style(Style::new().bg(Color::Indexed(236))),
+            Paragraph::new(filter_line).style(Style::new().bg(theme::t().surface)),
             filter_row,
         );
         if a.chosen.is_none() {
@@ -562,9 +562,9 @@ impl App {
             let name = ellipsize(&format!("{}{}", e.name, if e.dir { "/" } else { "" }), name_w);
             let pad = (rows.width as usize).saturating_sub(name.width() + size.width() + 3);
             let style = if first + row == a.sel {
-                Style::new().bg(Color::Green).fg(Color::Black)
+                Style::new().bg(theme::t().accent_soft).fg(theme::t().text).bold()
             } else if e.dir {
-                Style::new().fg(Color::LightBlue)
+                Style::new().fg(theme::t().link)
             } else {
                 Style::new()
             };
@@ -572,7 +572,7 @@ impl App {
                 Paragraph::new(Line::from(vec![
                     Span::raw(format!("{icon} ")),
                     Span::styled(format!("{name}{}", " ".repeat(pad)), style),
-                    Span::styled(size, Style::new().dim()),
+                    Span::styled(size, theme::muted()),
                 ])),
                 Rect::new(rows.x, y, rows.width, 1),
             );
@@ -581,7 +581,7 @@ impl App {
             let msg = a.error.clone().unwrap_or_else(|| "nothing here".into());
             f.render_widget(
                 Paragraph::new(msg)
-                    .style(Style::new().dim())
+                    .style(theme::muted())
                     .wrap(Wrap { trim: true }),
                 rows,
             );
@@ -590,7 +590,7 @@ impl App {
         // Right: preview of the highlighted file, or the send dialog.
         let preview_block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().dim());
+            .border_style(theme::muted());
         let pv = preview_block.inner(preview_area);
         f.render_widget(preview_block, preview_area);
         let target = match &a.chosen {
@@ -616,7 +616,7 @@ impl App {
                     ));
                     lines.push(Line::from(Span::styled(
                         "Location & personal metadata are removed first.",
-                        Style::new().dim(),
+                        theme::muted(),
                     )));
                 }
                 MediaKind::Image => lines.push(Line::from(if c.original {
@@ -633,36 +633,36 @@ impl App {
             if c.kind == MediaKind::Video {
                 lines.push(Line::from(Span::styled(
                     "Sent without a preview frame (rune has no video decoder).",
-                    Style::new().dim(),
+                    theme::muted(),
                 )));
             }
             if self.replying.is_some() && !a.cover {
                 lines.push(Line::from(Span::styled(
                     "Media is sent without the reply quote (the reply stays pending for your next text).",
-                    Style::new().dim(),
+                    theme::muted(),
                 )));
             }
             lines.push(Line::raw(""));
             lines.push(if a.cover {
                 Line::from(Span::styled(
                     " Set as cover (Enter) ",
-                    Style::new().bg(Color::Green).fg(Color::Black).bold(),
+                    Style::new().bg(theme::t().accent).fg(theme::t().on_accent).bold(),
                 ))
             } else {
                 Line::from(vec![
                     Span::styled(
                         " Send (Enter) ",
-                        Style::new().bg(Color::Green).fg(Color::Black).bold(),
+                        Style::new().bg(theme::t().accent).fg(theme::t().on_accent).bold(),
                     ),
                     Span::raw("  "),
-                    Span::styled(" as file (f) ", Style::new().bg(Color::DarkGray)),
+                    Span::styled(" as file (f) ", Style::new().bg(theme::t().surface_hi)),
                 ])
             });
             text_h = lines.len() as u16 + 1;
             f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), pv);
         } else if let Some(e) = &a.error {
             f.render_widget(
-                Paragraph::new(e.as_str()).style(Style::new().fg(Color::LightRed)),
+                Paragraph::new(e.as_str()).style(Style::new().fg(theme::t().danger)),
                 pv,
             );
             text_h = 2;
@@ -683,15 +683,12 @@ impl App {
                 }
                 Some(Load::Failed(e)) => {
                     f.render_widget(
-                        Paragraph::new(format!("no preview: {e}")).style(Style::new().dim()),
+                        Paragraph::new(format!("no preview: {e}")).style(theme::muted()),
                         pic_area,
                     );
                 }
                 Some(Load::Loading) => {
-                    f.render_widget(
-                        Paragraph::new("loading preview…").style(Style::new().dim()),
-                        pic_area,
-                    );
+                    f.render_widget(Paragraph::new("loading preview…").style(theme::muted()), pic_area);
                 }
                 None => {
                     self.file_previews.insert(key.clone(), Load::Loading);
@@ -712,7 +709,7 @@ impl App {
                 } else {
                     "Pick a file. Photos are previewed here.\n\nTip: you can also drag a file onto the terminal or paste its path into the message line."
                 })
-                    .style(Style::new().dim())
+                    .style(theme::muted())
                     .wrap(Wrap { trim: true }),
                 pv,
             );

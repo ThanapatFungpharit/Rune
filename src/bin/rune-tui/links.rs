@@ -67,13 +67,7 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
     } else {
         "xdg-open"
     };
-    std::process::Command::new(opener)
-        .arg(url.trim())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map(drop)
+    crate::spawn_reaped(std::process::Command::new(opener).arg(url.trim()))
 }
 
 /// Contents of every QR code found in a picture (blocking; run off the UI

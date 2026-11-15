@@ -1,5 +1,5 @@
 //! Group albums. LINE's Chrome protocol cannot list albums, so this works
-//! from the album posts a chat receives ("X added photos to <album>"): they
+//! from the album posts a chat receives ("X added photos to «album»"): they
 //! are grouped by album, and picking a photo shows it in the viewer. Album
 //! posts are ordinary media messages otherwise (inline picture, `s`/`o`).
 

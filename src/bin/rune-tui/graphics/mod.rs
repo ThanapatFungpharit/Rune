@@ -4,5 +4,6 @@
 pub mod anim;
 pub mod avatar;
 pub mod cells;
+pub mod fetchq;
 pub mod piccache;
 pub mod picture;

@@ -1,10 +1,17 @@
-//! Profile page, laid out like LINE's: the cover photo as a band across the
-//! top (for groups, and users with LINE's default cover, the profile picture
-//! blurred and darkened instead), a round avatar, the name and status
-//! message, Chat / Photo / Cover buttons, and members for groups.
+//! Profile page, laid out like LINE's: the cover photo fills the whole page
+//! as its background (for groups, and users with LINE's default cover, the
+//! profile picture blurred instead), darkening towards the bottom so the
+//! text stays readable, with the round avatar set into it, the name and
+//! status message, Chat / Photo / Cover buttons, and members for groups.
+//!
+//! Text cannot sit on a picture, so the background is drawn the same way
+//! everywhere: every cell of the page takes the backdrop's colour there.
+//! Only the avatar is a picture (with the terminal's graphics when it has
+//! them); the corners around its circle are those same cell colours.
 
 use crate::*;
 use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
+use ratatui_image::FontSize;
 use rune::PictureSize;
 
 /// What background work hands the UI.
@@ -15,12 +22,12 @@ pub struct ProfileLoaded {
     photo: Option<Vec<u8>>,
     /// The cover photo as downloaded (users with a cover of their own).
     cover_photo: Option<Vec<u8>>,
-    avatar: Option<DynamicImage>,
-    cover: Option<DynamicImage>,
+    avatar: Option<RgbaImage>,
+    backdrop: Option<RgbaImage>,
 }
 
 pub struct ProfileData {
-    name: String,
+    pub name: String,
     status: String,
     /// Member mids, for groups.
     members: Vec<String>,
@@ -28,8 +35,12 @@ pub struct ProfileData {
     photo: Option<Vec<u8>>,
     /// The cover photo as downloaded, for `v`.
     cover_photo: Option<Vec<u8>>,
-    avatar: Option<Picture>,
-    cover: Option<Picture>,
+    /// The round profile picture.
+    avatar: Option<RgbaImage>,
+    /// What fills the page: the cover photo, or the blurred profile picture.
+    backdrop: Option<RgbaImage>,
+    /// The page as last laid out, rebuilt when its size changes.
+    scene: Option<(SceneKey, Scene)>,
 }
 
 /// Clickable things on the page.
@@ -58,54 +69,137 @@ pub fn round_avatar(img: &DynamicImage) -> DynamicImage {
     DynamicImage::ImageRgba8(out)
 }
 
-/// The middle 4:1 band of a cover photo, as LINE crops it behind the avatar.
-fn cover_band(img: &DynamicImage) -> DynamicImage {
-    let (w, h) = img.dimensions();
-    let ch = (w / 4).min(h).max(1);
-    let cw = (ch * 4).min(w);
-    let band = img.crop_imm((w - cw) / 2, (h - ch) / 2, cw, ch);
-    if cw > MAX_PICTURE {
-        band.resize(MAX_PICTURE, MAX_PICTURE, FilterType::Triangle)
+/// Largest backdrop kept, per side; no terminal page shows more.
+const MAX_BACKDROP: u32 = 1200;
+
+/// A cover photo as the page's backdrop (shrunk once, cropped when drawn).
+fn backdrop_from_cover(img: &DynamicImage) -> RgbaImage {
+    if img.width() > MAX_BACKDROP || img.height() > MAX_BACKDROP {
+        img.resize(MAX_BACKDROP, MAX_BACKDROP, FilterType::Triangle)
+            .to_rgba8()
     } else {
-        band
+        img.to_rgba8()
     }
 }
 
-/// A 4:1 band of the picture, blurred and darkened, to stand in for a cover.
-fn cover_from(img: &DynamicImage) -> DynamicImage {
-    let (w, h) = img.dimensions();
-    let ch = (w / 4).min(h).max(1);
-    let band = img.crop_imm(0, (h - ch) / 2, w, ch);
-    let small = band.resize_exact(160, 40, FilterType::Triangle).to_rgba8();
-    let mut out = image::imageops::blur(&small, 3.0);
-    for p in out.pixels_mut() {
-        let Rgba([r, g, b, _]) = *p;
-        *p = Rgba([
-            (f32::from(r) * 0.55) as u8,
-            (f32::from(g) * 0.55) as u8,
-            (f32::from(b) * 0.55) as u8,
-            255,
-        ]);
+/// The profile picture, blurred, to stand in for a cover.
+fn backdrop_from_picture(img: &DynamicImage) -> RgbaImage {
+    let small = img.resize_exact(96, 96, FilterType::Triangle).to_rgba8();
+    image::imageops::blur(&small, 4.0)
+}
+
+/// Plain backdrop for a profile with neither cover nor picture.
+fn plain_backdrop() -> RgbaImage {
+    RgbaImage::from_pixel(8, 8, Rgba([52, 58, 70, 255]))
+}
+
+/// Size of the page and where things sit on it, in cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SceneKey {
+    page: Size,
+    /// Where the text starts; the backdrop darkens from there on.
+    top_rows: u16,
+    /// The avatar's box, relative to the page.
+    avatar: Rect,
+    font: (u16, u16),
+}
+
+/// The page's background, laid out.
+struct Scene {
+    /// One colour per cell of the page, row by row.
+    cells: Vec<Color>,
+    /// The avatar over its box's cell colours.
+    avatar: Option<Picture>,
+}
+
+/// How much of the backdrop's brightness is kept `y` pixels down a page
+/// `h` pixels tall whose text starts at `text_y`: bright at the top, then
+/// dark enough behind the text that white reads well on any photo.
+fn shade(y: u32, text_y: u32, h: u32) -> f32 {
+    if y < text_y {
+        0.95 - 0.4 * y as f32 / text_y.max(1) as f32
+    } else {
+        0.55 - 0.2 * (y - text_y) as f32 / (h - text_y).max(1) as f32
     }
-    DynamicImage::ImageRgba8(out)
+}
+
+/// One colour per cell: the backdrop scaled to fill the page (cells twice
+/// as tall as wide) and shaded, row by row.
+fn page_cells(backdrop: &RgbaImage, key: SceneKey) -> Vec<[u8; 3]> {
+    let (cols, rows) = (u32::from(key.page.width), u32::from(key.page.height));
+    if cols == 0 || rows == 0 {
+        return Vec::new();
+    }
+    // 2×4 samples per cell, averaged down to one.
+    let (w, h) = (cols * 2, rows * 4);
+    let text_y = u32::from(key.top_rows) * 4;
+    let mut page = DynamicImage::ImageRgba8(backdrop.clone())
+        .resize_to_fill(w, h, FilterType::Triangle)
+        .to_rgba8();
+    for (_, y, p) in page.enumerate_pixels_mut() {
+        let k = shade(y, text_y, h);
+        for c in &mut p.0[..3] {
+            *c = (f32::from(*c) * k) as u8;
+        }
+    }
+    image::imageops::resize(&page, cols, rows, FilterType::Triangle)
+        .pixels()
+        .map(|p| [p.0[0], p.0[1], p.0[2]])
+        .collect()
+}
+
+/// The avatar's box in pixels: each cell's colour as a flat block, the
+/// round avatar over it, so the box's corners match the cells around it.
+fn avatar_tile(cells: &[[u8; 3]], key: SceneKey, avatar: &RgbaImage) -> RgbaImage {
+    let (fw, fh) = (u32::from(key.font.0), u32::from(key.font.1));
+    let b = key.avatar;
+    let cols = usize::from(key.page.width);
+    let mut tile = RgbaImage::from_fn(u32::from(b.width) * fw, u32::from(b.height) * fh, |x, y| {
+        let cx = usize::from(b.x) + (x / fw) as usize;
+        let cy = usize::from(b.y) + (y / fh) as usize;
+        let [r, g, bl] = cells.get(cy * cols + cx).copied().unwrap_or([0, 0, 0]);
+        Rgba([r, g, bl, 255])
+    });
+    let a = image::imageops::resize(avatar, tile.width(), tile.height(), FilterType::Lanczos3);
+    image::imageops::overlay(&mut tile, &a, 0, 0);
+    tile
+}
+
+/// Lay the page out: a colour for every cell, the avatar set into them.
+fn build_scene(
+    backdrop: &RgbaImage,
+    avatar: Option<&RgbaImage>,
+    key: SceneKey,
+    picker: Option<&Picker>,
+) -> Scene {
+    let cells = page_cells(backdrop, key);
+    let avatar = avatar
+        .filter(|_| !key.avatar.is_empty() && !cells.is_empty())
+        .map(|a| Picture::new(DynamicImage::ImageRgba8(avatar_tile(&cells, key, a)), picker));
+    Scene {
+        cells: cells.into_iter().map(|[r, g, b]| Color::Rgb(r, g, b)).collect(),
+        avatar,
+    }
 }
 
 /// Decode a profile's pictures (off the UI thread) into what the page shows.
+/// `small` stands in for the avatar while the full picture is not there.
 async fn decode_profile(
     name: String,
     status: String,
     members: Vec<String>,
     photo: Option<Vec<u8>>,
+    small: Option<Vec<u8>>,
     cover_photo: Option<Vec<u8>>,
 ) -> ProfileLoaded {
-    let (p, c) = (photo.clone(), cover_photo.clone());
-    let (avatar, cover) = tokio::task::spawn_blocking(move || {
+    let (p, c) = (photo.clone().or(small), cover_photo.clone());
+    let (avatar, backdrop) = tokio::task::spawn_blocking(move || {
         let pic = p.and_then(|b| image::load_from_memory(&b).ok());
-        let cover = c
+        let backdrop = c
             .and_then(|b| image::load_from_memory(&b).ok())
-            .map(|img| cover_band(&img))
-            .or_else(|| pic.as_ref().map(cover_from));
-        (pic.as_ref().map(round_avatar), cover)
+            .map(|img| backdrop_from_cover(&img))
+            .or_else(|| pic.as_ref().map(backdrop_from_picture));
+        (pic.as_ref().map(|p| round_avatar(p).to_rgba8()), backdrop)
     })
     .await
     .unwrap_or((None, None));
@@ -116,15 +210,18 @@ async fn decode_profile(
         photo,
         cover_photo,
         avatar,
-        cover,
+        backdrop,
     }
 }
 
 /// Fetch a profile (yours, a friend's or a group's) and its pictures.
 ///
-/// What the store remembers of it is shown first (when `show_cached`), then
-/// it is refreshed from LINE; pictures already in the store are not
-/// downloaded again, and the page is only redrawn when something changed.
+/// What the store remembers of it is shown first (when `show_cached`; the
+/// small picture the chat list uses stands in until the full one is there),
+/// then it is refreshed from LINE, picture and cover at once; pictures
+/// already in the store are not downloaded again. When something is on
+/// screen already (`shown`, or the stored copy), the page is only redrawn
+/// when something changed.
 pub fn spawn_profile(
     client: Client,
     tx: mpsc::UnboundedSender<AppEvent>,
@@ -132,20 +229,29 @@ pub fn spawn_profile(
     mid: String,
     me: String,
     show_cached: bool,
+    shown: bool,
 ) {
     tokio::spawn(async move {
+        let stored = |key: String| store.image(&key).ok().flatten();
         let cached = store.user(&mid).ok().flatten().filter(|u| !u.name.is_empty());
+        let shown = shown || (show_cached && cached.is_some());
         if show_cached && let Some(u) = &cached {
-            let photo = u
-                .picture
-                .as_deref()
-                .and_then(|p| store.image(&picture_key(p, PictureSize::Full)).ok().flatten());
-            let cover = u
-                .cover
-                .as_deref()
-                .and_then(|c| store.image(&cover_key(c)).ok().flatten());
-            let loaded =
-                decode_profile(u.name.clone(), u.status.clone(), u.members.clone(), photo, cover).await;
+            let pic = u.picture.as_deref();
+            let photo = pic.and_then(|p| stored(picture_key(p, PictureSize::Full)));
+            let small = match photo {
+                Some(_) => None,
+                None => pic.and_then(|p| stored(picture_key(p, PictureSize::Small))),
+            };
+            let cover = u.cover.as_deref().and_then(|c| stored(cover_key(c)));
+            let loaded = decode_profile(
+                u.name.clone(),
+                u.status.clone(),
+                u.members.clone(),
+                photo,
+                small,
+                cover,
+            )
+            .await;
             let _ = tx.send(AppEvent::Profile(mid.clone(), Ok(Box::new(loaded))));
         }
         let info = async {
@@ -189,7 +295,7 @@ pub fn spawn_profile(
             Ok(i) => i,
             Err(e) => {
                 // A stored copy is on screen already; keep it.
-                if !(show_cached && cached.is_some()) {
+                if !shown {
                     let _ = tx.send(AppEvent::Profile(mid, Err(e)));
                 } else {
                     tracing::debug!("profile refresh for {mid} failed: {e}");
@@ -198,47 +304,59 @@ pub fn spawn_profile(
             }
         };
         let path = path.filter(|p| !p.trim().is_empty());
-        let mut fresh = false;
-        let photo = match path.as_deref() {
-            Some(p) => cached_picture(&client, &store, p, PictureSize::Full)
-                .await
-                .map(|(b, new)| {
-                    fresh |= new;
-                    b
-                }),
-            None => None,
-        };
-        let (cover_path, cover_photo) = match cover_info {
-            Ok(Some(c)) => match c.custom_image().map(|o| o.path()) {
-                Some(cp) => {
-                    let key = cover_key(&cp);
-                    let bytes = match store.image(&key).ok().flatten() {
-                        Some(b) => Some(b),
-                        None => match client.download_cover(&c).await {
-                            Ok(Some(b)) => {
-                                let _ = store.put_image(&key, &b);
-                                fresh = true;
-                                Some(b)
-                            }
-                            Ok(None) => None,
-                            Err(e) => {
-                                tracing::debug!("cover download failed: {e}");
-                                None
-                            }
-                        },
-                    };
-                    (Some(cp), bytes)
-                }
-                None => (None, None),
-            },
-            Ok(None) => (None, None),
-            Err(()) => {
-                let cp = cached.as_ref().and_then(|u| u.cover.clone());
-                let bytes = cp
-                    .as_deref()
-                    .and_then(|c| store.image(&cover_key(c)).ok().flatten());
-                (cp, bytes)
+        // The chat list and message headers use the same picture: tell them
+        // (even when this page has nothing new to show).
+        let _ = tx.send(AppEvent::ProfilePicture(mid.clone(), path.clone()));
+        // Picture and cover download side by side; each says whether it was new.
+        let picture = async {
+            match path.as_deref() {
+                Some(p) => match cached_picture(&client, &store, p, PictureSize::Full).await {
+                    Some((b, new)) => (Some(b), new),
+                    None => (None, false),
+                },
+                None => (None, false),
             }
+        };
+        let cover = async {
+            match cover_info {
+                Ok(Some(c)) => match c.custom_image().map(|o| o.path()) {
+                    Some(cp) => {
+                        let key = cover_key(&cp);
+                        let (bytes, new) = match stored(key.clone()) {
+                            Some(b) => (Some(b), false),
+                            None => match client.download_cover(&c).await {
+                                Ok(Some(b)) => {
+                                    let _ = store.put_image(&key, &b);
+                                    (Some(b), true)
+                                }
+                                Ok(None) => (None, false),
+                                Err(e) => {
+                                    tracing::debug!("cover download failed: {e}");
+                                    (None, false)
+                                }
+                            },
+                        };
+                        (Some(cp), bytes, new)
+                    }
+                    None => (None, None, false),
+                },
+                Ok(None) => (None, None, false),
+                Err(()) => {
+                    let cp = cached.as_ref().and_then(|u| u.cover.clone());
+                    let bytes = cp.as_deref().and_then(|c| stored(cover_key(c)));
+                    (cp, bytes, false)
+                }
+            }
+        };
+        let ((photo, new_photo), (cover_path, cover_photo, new_cover)) = tokio::join!(picture, cover);
+        let fresh = new_photo || new_cover;
+        // A full picture that would not download: the small one the avatars
+        // use (stored, else downloaded).
+        let small = match (&photo, path.as_deref()) {
+            (None, Some(p)) => cached_picture(&client, &store, p, PictureSize::Small)
+                .await
+                .map(|(b, _)| b),
+            _ => None,
         };
         let row = UserRow {
             mid: mid.clone(),
@@ -258,10 +376,10 @@ pub fn spawn_profile(
         if !unchanged {
             let _ = store.upsert_user(&row);
         }
-        if unchanged && !fresh && show_cached {
+        if unchanged && !fresh && shown {
             return;
         }
-        let loaded = decode_profile(name, status, members, photo, cover_photo).await;
+        let loaded = decode_profile(name, status, members, photo, small, cover_photo).await;
         let _ = tx.send(AppEvent::Profile(mid, Ok(Box::new(loaded))));
     });
 }
@@ -293,7 +411,7 @@ impl App {
         self.needs_clear = true;
     }
 
-    fn fetch_profile(&self, mid: &str, show_cached: bool) {
+    pub fn fetch_profile(&self, mid: &str, show_cached: bool) {
         spawn_profile(
             self.client.clone(),
             self.tx.clone(),
@@ -301,6 +419,7 @@ impl App {
             mid.to_owned(),
             self.me.clone(),
             show_cached,
+            matches!(self.profiles.get(mid), Some(Load::Ready(_))),
         );
     }
 
@@ -363,11 +482,12 @@ impl App {
         }
         let slot = match res {
             Ok(p) => {
+                self.loaded(&Job::Profile(mid.clone()));
                 let p = *p;
                 // Member names come in through the usual name lookup.
                 self.want_names(p.members.iter().cloned());
                 if !p.name.is_empty() && mid != self.me {
-                    self.names.insert(mid.clone(), p.name.clone());
+                    self.learn_names(HashMap::from([(mid.clone(), p.name.clone())]));
                 }
                 Load::Ready(ProfileData {
                     name: p.name,
@@ -375,11 +495,15 @@ impl App {
                     members: p.members,
                     photo: p.photo,
                     cover_photo: p.cover_photo,
-                    avatar: p.avatar.map(|i| Picture::new(i, self.picker.as_ref())),
-                    cover: p.cover.map(|i| Picture::new(i, self.picker.as_ref())),
+                    avatar: p.avatar,
+                    backdrop: p.backdrop,
+                    scene: None,
                 })
             }
-            Err(e) => Load::Failed(e),
+            Err(e) => {
+                self.retry_later(Job::Profile(mid.clone()));
+                Load::Failed(e)
+            }
         };
         self.profiles.insert(mid, slot);
     }
@@ -532,13 +656,10 @@ impl App {
         };
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(Color::Green))
+            .border_style(Style::new().fg(theme::t().accent))
             .title(kind)
             // Its own keys, also under an overlay opened from it.
-            .title_bottom(Span::styled(
-                keymap::hint(keymap::Ctx::Profile, |_| true),
-                Style::new().dim(),
-            ));
+            .title_bottom(frame_hint(&keymap::hint(keymap::Ctx::Profile, |_| true), area));
         let inner = block.inner(area);
         f.render_widget(block, area);
         let accent = sender_color(&mid);
@@ -558,39 +679,76 @@ impl App {
                 return;
             }
             _ => {
-                f.render_widget(
-                    Paragraph::new("loading profile…").style(Style::new().dim()),
-                    inner,
-                );
+                f.render_widget(Paragraph::new("loading profile…").style(theme::muted()), inner);
                 return;
             }
         };
 
-        // Cover band, then the avatar centred beneath it.
-        let cover_h = (inner.height / 4).clamp(3, 8);
-        let [cover, rest] = Layout::vertical([Constraint::Length(cover_h), Constraint::Min(0)]).areas(inner);
-        match data.cover.as_mut() {
-            Some(c) => c.render(f, cover, cover.as_size(), 0, cell_mode, FilterType::Triangle),
-            None => f.render_widget(Block::new().style(Style::new().bg(accent)), cover),
-        }
-        let avatar_max = Size::new(20, (rest.height / 3).clamp(3, 10));
+        // The backdrop under the whole page, the avatar set into its upper
+        // part; both one picture, re-laid out only when the page changes size.
+        let picker = self.picker.as_ref();
+        let font = picker.map_or(
+            FontSize {
+                width: 10,
+                height: 20,
+            },
+            Picker::font_size,
+        );
+        let top_pad = (inner.height / 4).clamp(3, 8).min(inner.height);
+        let avatar_max = Size::new(20, (inner.height.saturating_sub(top_pad) / 3).clamp(3, 10));
         let avatar_size = data
             .avatar
             .as_ref()
-            .map_or(Size::new(10, 5), |a| a.size_for(avatar_max));
-        let [_, avatar_row, text] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(avatar_size.height),
-            Constraint::Min(0),
-        ])
-        .areas(rest);
-        let [avatar] = Layout::horizontal([Constraint::Length(avatar_size.width)])
-            .flex(Flex::Center)
-            .areas(avatar_row);
-        match data.avatar.as_mut() {
-            Some(a) => a.render(f, avatar, avatar_size, 0, cell_mode, FilterType::Lanczos3),
-            None => f.render_widget(
-                Paragraph::new(vec![Line::raw(""), Line::raw(""), Line::raw("👤")])
+            .map(|a| picture::fit(a.width(), a.height(), avatar_max, font));
+        let top_rows = (top_pad + avatar_size.map_or(0, |s| s.height)).min(inner.height);
+        let key = SceneKey {
+            page: inner.as_size(),
+            top_rows,
+            avatar: avatar_size.map_or(Rect::default(), |s| {
+                Rect::new(
+                    inner.width.saturating_sub(s.width) / 2,
+                    top_pad,
+                    s.width,
+                    s.height,
+                )
+            }),
+            font: (font.width, font.height),
+        };
+        if data.scene.as_ref().is_none_or(|(k, _)| *k != key) {
+            let plain;
+            let backdrop = match &data.backdrop {
+                Some(b) => b,
+                None => {
+                    plain = plain_backdrop();
+                    &plain
+                }
+            };
+            data.scene = Some((key, build_scene(backdrop, data.avatar.as_ref(), key, picker)));
+        }
+        if let Some((_, scene)) = data.scene.as_mut() {
+            let buf = f.buffer_mut();
+            let width = usize::from(inner.width.max(1));
+            for (i, c) in scene.cells.iter().enumerate() {
+                let (x, y) = (i % width, i / width);
+                if let Some(cell) = buf.cell_mut((inner.x + x as u16, inner.y + y as u16)) {
+                    cell.set_bg(*c);
+                }
+            }
+            if let Some(a) = scene.avatar.as_mut() {
+                let r = key.avatar;
+                let at = Rect::new(inner.x + r.x, inner.y + r.y, r.width, r.height);
+                a.render(f, at, at.as_size(), 0, cell_mode, FilterType::Lanczos3);
+            }
+        }
+        let mut text = Rect::new(inner.x, inner.y + top_rows, inner.width, inner.height - top_rows);
+        if avatar_size.is_none() && text.height > 6 {
+            // No picture (yet): a placeholder where it goes.
+            let [row, rest] = Layout::vertical([Constraint::Length(5), Constraint::Min(0)]).areas(text);
+            let [avatar] = Layout::horizontal([Constraint::Length(10)])
+                .flex(Flex::Center)
+                .areas(row);
+            f.render_widget(
+                Paragraph::new(vec![Line::raw(""), Line::raw("👤")])
                     .centered()
                     .block(
                         Block::bordered()
@@ -598,7 +756,8 @@ impl App {
                             .border_style(Style::new().fg(accent)),
                     ),
                 avatar,
-            ),
+            );
+            text = rest;
         }
 
         // Name, status, buttons.
@@ -607,11 +766,14 @@ impl App {
         } else {
             data.name.clone()
         };
-        let mut lines = vec![Line::raw(""), Line::styled(name, Style::new().bold()).centered()];
+        let mut lines = vec![
+            Line::raw(""),
+            Line::styled(name, Style::new().fg(theme::t().text).bold()).centered(),
+        ];
         let tw = usize::from(text.width.saturating_sub(4)).max(10);
         for l in wrap(data.status.trim(), tw).into_iter().take(3) {
             if !l.is_empty() {
-                lines.push(Line::styled(l, Style::new().dim()).centered());
+                lines.push(Line::styled(l, Style::new().fg(theme::t().muted)).centered());
             }
         }
         lines.push(Line::raw(""));
@@ -635,9 +797,9 @@ impl App {
         for (i, (r, (label, action))) in cells.iter().zip(&btns).enumerate() {
             let focused = i == focused_btn && sel.is_none();
             let style = if focused {
-                Style::new().fg(Color::Green).bold()
+                Style::new().fg(theme::t().accent).bold()
             } else {
-                Style::new()
+                Style::new().fg(theme::t().muted)
             };
             f.render_widget(
                 Paragraph::new(*label).style(style).block(
@@ -658,7 +820,10 @@ impl App {
         f.render_widget(
             Paragraph::new(vec![
                 Line::raw(""),
-                Line::styled(format!(" Members · {}", names.len()), Style::new().bold()),
+                Line::styled(
+                    format!(" Members · {}", names.len()),
+                    Style::new().fg(theme::t().text).bold(),
+                ),
             ]),
             title,
         );
@@ -667,7 +832,7 @@ impl App {
         for (row, (i, n)) in names.iter().enumerate().skip(first).take(height).enumerate() {
             let y = rows.y + row as u16;
             let style = if sel == Some(i) {
-                Style::new().bg(Color::DarkGray).bold()
+                Style::new().bg(theme::t().accent_soft).fg(theme::t().text).bold()
             } else {
                 Style::new()
             };
@@ -699,21 +864,66 @@ mod tests {
     }
 
     #[test]
-    fn cover_band_is_a_centred_4_to_1_crop() {
-        let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(1200, 900, image::Rgb([9, 9, 9])));
-        let c = cover_band(&img);
-        assert_eq!((c.width(), c.height()), (1200, 300));
-        let tall = DynamicImage::ImageRgb8(image::RgbImage::new(100, 1000));
-        assert_eq!(cover_band(&tall).dimensions(), (100, 25));
+    fn large_covers_are_shrunk_once() {
         let huge = DynamicImage::ImageRgb8(image::RgbImage::new(4000, 3000));
-        assert_eq!(cover_band(&huge).dimensions(), (MAX_PICTURE, MAX_PICTURE / 4));
+        assert_eq!(backdrop_from_cover(&huge).dimensions(), (MAX_BACKDROP, 900));
+        let small = DynamicImage::ImageRgb8(image::RgbImage::new(300, 200));
+        assert_eq!(backdrop_from_cover(&small).dimensions(), (300, 200));
+    }
+
+    fn key() -> SceneKey {
+        SceneKey {
+            page: Size::new(40, 30),
+            top_rows: 12,
+            avatar: Rect::new(15, 6, 10, 5),
+            font: (10, 20),
+        }
+    }
+
+    fn red_avatar() -> RgbaImage {
+        round_avatar(&DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            64,
+            64,
+            image::Rgb([250, 0, 0]),
+        )))
+        .to_rgba8()
     }
 
     #[test]
-    fn cover_is_a_dark_band() {
-        let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(300, 300, image::Rgb([200, 200, 200])));
-        let c = cover_from(&img).to_rgba8();
-        assert_eq!((c.width(), c.height()), (160, 40));
-        assert!(c.get_pixel(80, 20).0[0] < 120);
+    fn every_cell_gets_a_colour_darkening_downwards() {
+        let backdrop = RgbaImage::from_pixel(300, 100, Rgba([200, 200, 200, 255]));
+        let scene = build_scene(&backdrop, Some(&red_avatar()), key(), None);
+        assert_eq!(scene.cells.len(), 40 * 30);
+        let red = |c: Color| match c {
+            Color::Rgb(r, _, _) => r,
+            _ => panic!("cells are RGB"),
+        };
+        let top = red(scene.cells[0]);
+        let text = red(scene.cells[12 * 40]);
+        let bottom = red(scene.cells[40 * 30 - 1]);
+        assert!(top > text && text > bottom, "{top} {text} {bottom}");
+        assert!(
+            matches!(scene.avatar, Some(Picture::Cells(_))),
+            "no picker: drawn with cells"
+        );
+    }
+
+    #[test]
+    fn avatar_corners_are_the_cells_colours() {
+        let backdrop = RgbaImage::from_pixel(300, 100, Rgba([0, 0, 200, 255]));
+        let cells = page_cells(&backdrop, key());
+        let tile = avatar_tile(&cells, key(), &red_avatar());
+        assert_eq!(tile.dimensions(), (100, 100));
+        assert_eq!(tile.get_pixel(50, 50).0, [250, 0, 0, 255]);
+        // Top-left corner: exactly the colour of the cell it lies in.
+        let [r, g, b] = cells[6 * 40 + 15];
+        assert_eq!(tile.get_pixel(1, 1).0, [r, g, b, 255]);
+    }
+
+    #[test]
+    fn shade_darkens_downwards() {
+        assert!(shade(0, 100, 300) > shade(99, 100, 300));
+        assert!(shade(99, 100, 300) >= shade(100, 100, 300) - 0.01);
+        assert!(shade(100, 100, 300) > shade(299, 100, 300));
     }
 }
