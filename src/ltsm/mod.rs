@@ -4,7 +4,7 @@
 //! the QR-login Curve25519 key and all Letter Sealing (E2EE) primitives inside
 //! this C++/Emscripten module. Rather than re-deriving LINE's custom key
 //! derivation, we execute the *same* module and drive it the way
-//! `ltsmSandbox.js` does (see [`runtime`] for the import shims).
+//! `ltsmSandbox.js` does (see `runtime.rs` for the import shims).
 //!
 //! Signing (from the sandbox's `get_hmac` handler):
 //!

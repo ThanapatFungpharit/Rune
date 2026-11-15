@@ -93,6 +93,41 @@ pub struct StickerPackage {
     pub animated: bool,
 }
 
+/// An owned LINE emoji package (`getOwnedProductSummaries("sticonshop")`
+/// plus its public `meta.json`), whose emoji can be sent as reactions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmojiPackage {
+    pub id: String,
+    pub name: String,
+    /// `latestVersion`, sent as the reaction's `version`.
+    pub version: u32,
+    /// `sticonResourceType`, sent as the reaction's `resourceType`.
+    pub resource_type: i64,
+    /// `(emojiId, alt text)` in the shop's order.
+    pub emojis: Vec<(String, String)>,
+}
+
+impl EmojiPackage {
+    /// The emoji listed in a package's `meta.json` (`orders` and `altTexts`).
+    pub fn emojis_from_meta(meta: &Value) -> Vec<(String, String)> {
+        let alts = meta.get("altTexts");
+        meta.get("orders")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(|id| {
+                let alt = alts
+                    .and_then(|a| a.get(id))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                // Some alt texts carry no-break spaces (live).
+                (id.to_owned(), alt.replace('\u{a0}', " "))
+            })
+            .collect()
+    }
+}
+
 /// How long before LINE's suggested refresh time the refresher renews:
 /// a tenth of the token's refresh period, at most ten minutes.
 const MAX_REFRESH_LEAD_SECS: i64 = 600;
@@ -437,7 +472,16 @@ impl Client {
                 .await?;
             if let Some(map) = v.get("contacts").and_then(Value::as_object) {
                 for (mid, wrapper) in map {
-                    let c = wrapper.get("contact").unwrap_or(wrapper).clone();
+                    // A user that no longer exists comes back as only
+                    // `{snapshotTimeMillis, userStatus}` (live): no contact.
+                    let c = match wrapper.get("contact") {
+                        Some(c) => c.clone(),
+                        None if wrapper.get("mid").is_some() => wrapper.clone(),
+                        None => {
+                            tracing::debug!("getContactsV2: no contact for {mid}");
+                            continue;
+                        }
+                    };
                     // One odd entry must not lose the whole batch.
                     match parse(c) {
                         Ok(c) => drop(out.insert(mid.clone(), c)),
@@ -685,7 +729,7 @@ impl Client {
     /// `TalkException` 82; when Letter Sealing keys are loaded, text and
     /// location messages are then sealed and re-sent automatically, and later
     /// sends to that chat are sealed up front. Other content types (stickers,
-    /// contacts, flex) are always sent plain, like the extension.
+    /// contacts) are always sent plain, like the extension.
     pub async fn send_message(&self, msg: &OutgoingMessage) -> Result<Message> {
         let sealable = Self::is_sealable(msg) && self.e2ee_ready();
         if sealable && self.chat_is_sealed(&msg.to) {
@@ -722,11 +766,27 @@ impl Client {
     }
 
     pub async fn react(&self, message_id: &str, reaction: Reaction) -> Result<()> {
+        self.react_raw(message_id, json!({ "predefinedReactionType": reaction as i64 }))
+            .await
+    }
+
+    /// React with a LINE emoji from an owned package (`paidReactionType`,
+    /// accepted from this client live, 2026-11-15).
+    pub async fn react_emoji(&self, message_id: &str, package: &EmojiPackage, emoji_id: &str) -> Result<()> {
+        self.react_raw(
+            message_id,
+            json!({ "paidReactionType": {
+                "productId": package.id, "emojiId": emoji_id,
+                "resourceType": package.resource_type, "version": package.version.to_string() } }),
+        )
+        .await
+    }
+
+    async fn react_raw(&self, message_id: &str, reaction_type: Value) -> Result<()> {
         let seq = self.next_req_seq();
         self.talk(
             "react",
-            json!([{ "reqSeq": seq, "messageId": message_id,
-                     "reactionType": { "predefinedReactionType": reaction as i64 } }]),
+            json!([{ "reqSeq": seq, "messageId": message_id, "reactionType": reaction_type }]),
         )
         .await
         .map(drop)
@@ -910,6 +970,73 @@ impl Client {
         }
     }
 
+    /// LINE emoji packages this account owns (`getOwnedProductSummaries`
+    /// with `"sticonshop"`; every account has "LINE Basic Emoji"), each with
+    /// its emoji list from the sticker CDN's `meta.json`. A package whose
+    /// list cannot be fetched is left out; if all fail, the first error is returned.
+    pub async fn owned_emoji_packages(&self) -> Result<Vec<EmojiPackage>> {
+        const PAGE: i64 = 200;
+        let mut summaries = Vec::new();
+        let mut offset = 0;
+        loop {
+            let v = self
+                .call(
+                    "shop/thrift/ShopService/ShopService/getOwnedProductSummaries",
+                    json!(["sticonshop", offset, PAGE, { "language": "en", "country": "JP" }]),
+                )
+                .await?;
+            let list = v
+                .get("productList")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let total = v.get("totalSize").and_then(value_i64).unwrap_or(0);
+            offset += list.len() as i64;
+            let done = list.is_empty() || offset >= total;
+            summaries.extend(list);
+            if done {
+                break;
+            }
+        }
+        let mut out = Vec::new();
+        let mut first_err = None;
+        for p in summaries {
+            let id = match p.get("id") {
+                Some(Value::String(s)) => s.clone(),
+                Some(other) => other.to_string(),
+                None => continue,
+            };
+            let emojis = match self.emoji_meta(&id).await {
+                Ok(meta) => EmojiPackage::emojis_from_meta(&meta),
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                    continue;
+                }
+            };
+            if emojis.is_empty() {
+                continue;
+            }
+            out.push(EmojiPackage {
+                name: p
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                version: p.get("latestVersion").and_then(value_i64).unwrap_or(1).max(1) as u32,
+                resource_type: p["productTypeSummary"]["sticonSummary"]
+                    .get("sticonResourceType")
+                    .and_then(value_i64)
+                    .unwrap_or(1),
+                emojis,
+                id,
+            });
+        }
+        match first_err {
+            Some(e) if out.is_empty() => Err(e),
+            _ => Ok(out),
+        }
+    }
+
     // -- E2EE public keys (server side of Letter Sealing) ----------------------
 
     /// `negotiateE2EEPublicKey(mid)` -> `{publicKey:{keyId,keyData,...}, specVersion, allowedTypes}`.
@@ -925,5 +1052,26 @@ impl Client {
 
     pub(crate) async fn call_opts(&self, method: &str, args: Value, opts: CallOpts) -> Result<Value> {
         self.t.call_with(method, args, opts).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emojis_from_live_meta() {
+        // Shape of the CDN's meta.json for "LINE Basic Emoji" (live, 2026-11-15).
+        let meta = json!({"productId": "670e", "orders": ["002", "001", "051"],
+            "altTexts": {"001": "heart eyes Moon", "002": "pleading Moon", "051": "tearing\u{a0}Leonard"}});
+        assert_eq!(
+            EmojiPackage::emojis_from_meta(&meta),
+            [
+                ("002".to_owned(), "pleading Moon".to_owned()),
+                ("001".into(), "heart eyes Moon".into()),
+                ("051".into(), "tearing Leonard".into()),
+            ]
+        );
+        assert!(EmojiPackage::emojis_from_meta(&json!({})).is_empty());
     }
 }

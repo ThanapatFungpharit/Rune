@@ -271,20 +271,32 @@ impl Client {
     }
 
     /// GET an OBS object by path (`/r/{service}/{sid}/{oid}[/{tid}]`) or full
-    /// URL, authenticating like the extension: `/r/myhome/` with the channel
-    /// token, everything else with the encrypted access token.
+    /// URL on the OBS host, authenticating like the extension: `/r/myhome/`
+    /// with the channel token, everything else with the encrypted access
+    /// token. A URL on any other host is refused (the credentials would go
+    /// with it).
     pub async fn download_obs(&self, path: &str) -> Result<Vec<u8>> {
         let url = if path.starts_with("http") {
+            let parsed = url::Url::parse(path).map_err(|e| Error::Protocol(format!("bad OBS URL: {e}")))?;
+            let obs = url::Url::parse(&self.t.config.obs).map_err(|e| Error::Protocol(e.to_string()))?;
+            if parsed.origin() != obs.origin() {
+                return Err(Error::Protocol(format!(
+                    "refusing to send OBS credentials to {}",
+                    parsed.host_str().unwrap_or("")
+                )));
+            }
             path.to_owned()
-        } else {
+        } else if path.starts_with('/') {
             format!("{}{path}", self.t.config.obs)
+        } else {
+            return Err(Error::Protocol(format!("not an OBS path: {path:?}")));
         };
         let resp = if url.contains("/r/myhome/") {
             self.myhome_request(None, &url, &[]).await?
         } else {
             self.obs_request(None, &url, &[]).await?
         };
-        Ok(resp.bytes().await?.to_vec())
+        crate::media::read_body(resp, crate::media::MAX_DOWNLOAD).await
     }
 
     /// One OBS request authenticated with the channel token (renewed once on 401).

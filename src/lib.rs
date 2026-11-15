@@ -50,7 +50,7 @@ pub mod transport;
 
 pub use album::{AlbumEvent, AlbumMedia, AlbumPost, AlbumPostKind};
 pub use auth::{E2eeKey, LoginResult, QrLoginEvent, QrLoginOptions};
-pub use client::{Client, Reaction, ReadRange, StickerPackage};
+pub use client::{Client, EmojiPackage, Reaction, ReadRange, StickerPackage};
 pub use error::{ApiError, E2eeErrorKind, E2eeFailure, Error, Result};
 pub use events::{Event, OperationStream};
 pub use media::{MediaKind, MediaUpload, PictureSize, StickerImage};

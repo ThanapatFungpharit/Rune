@@ -28,6 +28,7 @@
 //!   (2 = V2), cached for `cacheTtlMillis`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aes::Aes256;
@@ -57,6 +58,40 @@ const TAG_LEN: usize = 32;
 const MAX_FILE: usize = 1 << 30;
 /// Images above 20 MiB are sent as files (`Hb`).
 const MAX_IMAGE: usize = 20 * 1024 * 1024;
+/// Largest download accepted: a 1 GiB file plus its sealing overhead
+/// (the HMAC tag, or a video's per-chunk hash list).
+pub(crate) const MAX_DOWNLOAD: usize = MAX_FILE + (MAX_FILE / CHUNK + 1) * TAG_LEN;
+/// Largest preview, profile picture or sticker accepted.
+pub(crate) const MAX_PICTURE_DOWNLOAD: usize = MAX_IMAGE;
+
+/// Read a response body, refusing one larger than `limit` bytes (by its
+/// `Content-Length` up front, else as it streams in), so a hostile or broken
+/// server cannot exhaust memory.
+pub(crate) async fn read_body(resp: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    use futures_util::StreamExt;
+    let too_big = |n: u64| {
+        Error::Protocol(format!(
+            "download refused: {n} bytes exceeds the {limit}-byte limit"
+        ))
+    };
+    if let Some(n) = resp.content_length()
+        && n > limit as u64
+    {
+        return Err(too_big(n));
+    }
+    // At most 1 MiB reserved up front (the claimed length may not be honest);
+    // the rest grows as data actually arrives.
+    let mut out = Vec::with_capacity(resp.content_length().unwrap_or(0).min(1 << 20) as usize);
+    let mut body = resp.bytes_stream();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk?;
+        if out.len() + chunk.len() > limit {
+            return Err(too_big((out.len() + chunk.len()) as u64));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
 
 type Aes256Ctr32 = ctr::Ctr32BE<Aes256>;
 type HmacSha256 = Hmac<Sha256>;
@@ -143,7 +178,7 @@ pub fn decrypt_blob(key_material: &[u8], blob: &[u8], chunked: bool) -> Result<V
 }
 
 /// `SE`: `X-Talk-Meta` for a message id — a tiny Thrift-binary struct
-/// (string field 4 = id, empty list<struct> field 27), base64, wrapped as
+/// (string field 4 = id, empty `list<struct>` field 27), base64, wrapped as
 /// `base64({"message": ...})`.
 pub fn talk_meta(message_id: &str) -> String {
     let id = message_id.as_bytes();
@@ -344,6 +379,26 @@ pub fn sticker_package_icon_url(package_id: &str) -> String {
     format!("{STICKER_CDN}/stickershop/v1/product/{package_id}/LINEStorePC/main.png")
 }
 
+/// LINE emoji ids (`productId`, `emojiId`) are hex / decimal; reactions
+/// carry whatever the reactor's client sent, so only plain ids go into URLs.
+fn is_plain_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// Public URL of a LINE emoji picture (a paid reaction's `productId` / `emojiId`),
+/// `None` for ids that are not plain alphanumerics.
+pub fn emoji_url(product_id: &str, emoji_id: &str) -> Option<String> {
+    (is_plain_id(product_id) && is_plain_id(emoji_id))
+        .then(|| format!("{STICKER_CDN}/sticonshop/v1/sticon/{product_id}/iPhone/{emoji_id}.png"))
+}
+
+/// Public URL of a LINE emoji package's `meta.json` (`{productId, orders: [id],
+/// altTexts: {id: text}}`, live).
+pub(crate) fn emoji_meta_url(product_id: &str) -> Option<String> {
+    is_plain_id(product_id)
+        .then(|| format!("{STICKER_CDN}/sticonshop/v1/{product_id}/sticon/iphone/meta.json"))
+}
+
 // -- image processing (the extension's canvas resizes) ------------------------------
 
 struct PreparedImage {
@@ -449,6 +504,9 @@ fn prepare_image(up: &MediaUpload) -> Result<PreparedImage> {
 #[derive(Debug, Default)]
 pub(crate) struct MediaState {
     obs_token: Option<String>,
+    /// Held while a new OBS token is fetched, so parallel downloads that all
+    /// find none (or all get a 401) share one `acquireEncryptedAccessToken`.
+    obs_fetch: Arc<tokio::sync::Mutex<()>>,
     flows: HashMap<String, (Instant, Value)>,
 }
 
@@ -471,8 +529,21 @@ impl Client {
         self.media.lock().unwrap()
     }
 
-    async fn obs_token(&self, renew: bool) -> Result<String> {
-        if !renew && let Some(t) = self.media().obs_token.clone() {
+    /// The cached OBS token, fetched if there is none or if the cached one is
+    /// `stale` (the one a request was just refused with). Concurrent callers
+    /// wait for one fetch instead of each making their own.
+    async fn obs_token(&self, stale: Option<&str>) -> Result<String> {
+        let usable = |m: &MediaState| m.obs_token.clone().filter(|t| Some(t.as_str()) != stale);
+        let lock = {
+            let m = self.media();
+            if let Some(t) = usable(&m) {
+                return Ok(t);
+            }
+            m.obs_fetch.clone()
+        };
+        let _fetching = lock.lock().await;
+        // Someone else may have fetched one while we waited.
+        if let Some(t) = usable(&self.media()) {
             return Ok(t);
         }
         let v = self
@@ -489,17 +560,18 @@ impl Client {
         Ok(tok)
     }
 
-    async fn obs_headers(&self, renew: bool) -> Result<HeaderMap> {
+    /// OBS auth headers, and the token they carry.
+    async fn obs_headers(&self, stale: Option<&str>) -> Result<(HeaderMap, String)> {
+        let token = self.obs_token(stale).await?;
         let mut h = HeaderMap::new();
-        let mut tok = HeaderValue::from_str(&self.obs_token(renew).await?)
-            .map_err(|e| Error::Protocol(e.to_string()))?;
+        let mut tok = HeaderValue::from_str(&token).map_err(|e| Error::Protocol(e.to_string()))?;
         tok.set_sensitive(true);
         h.insert("x-line-access", tok);
         h.insert("x-line-application", HeaderValue::from_static(APPLICATION_HEADER));
         if let Ok(v) = HeaderValue::from_str(&self.config().locale) {
             h.insert("accept-language", v);
         }
-        Ok(h)
+        Ok((h, token))
     }
 
     /// One OBS request with the extension's auth; renews the token once on 401/403.
@@ -509,9 +581,9 @@ impl Client {
         url: &str,
         extra: &[(&'static str, String)],
     ) -> Result<reqwest::Response> {
-        let mut renew = false;
+        let mut refused: Option<String> = None;
         loop {
-            let mut h = self.obs_headers(renew).await?;
+            let (mut h, used) = self.obs_headers(refused.as_deref()).await?;
             for (k, v) in extra {
                 h.insert(
                     *k,
@@ -528,8 +600,8 @@ impl Client {
             tracing::debug!(%url, post = post.is_some(), "OBS");
             let resp = req.headers(h).timeout(Duration::from_secs(300)).send().await?;
             let status = resp.status().as_u16();
-            if matches!(status, 401 | 403) && !renew {
-                renew = true;
+            if matches!(status, 401 | 403) && refused.is_none() {
+                refused = Some(used);
                 continue;
             }
             if status >= 400 {
@@ -554,16 +626,44 @@ impl Client {
         }
     }
 
-    async fn public_get(&self, url: &str) -> Result<Vec<u8>> {
-        let resp = self
-            .t
-            .http
-            .get(url)
+    /// Fetch a public (uncredentialed) URL. Message media links are chosen by
+    /// the sender, so apart from the configured OBS host itself only `https`
+    /// URLs with a host name are fetched, through the untrusted-fetch client:
+    /// every address the name (or a redirect's) resolves to must be public and
+    /// the connection goes to exactly those addresses. The body is capped at
+    /// `limit`, and an error status's body is never read.
+    async fn public_get(&self, url: &str, limit: usize) -> Result<Vec<u8>> {
+        let parsed = url::Url::parse(url).map_err(|e| Error::Protocol(format!("bad media URL: {e}")))?;
+        let on_obs = url::Url::parse(&self.t.config.obs).is_ok_and(|o| o.origin() == parsed.origin());
+        let refused = |what: &url::Url| {
+            Error::MediaUnavailable(format!(
+                "refusing to fetch media from {}://{} (only public https hosts)",
+                what.scheme(),
+                what.host_str().unwrap_or("")
+            ))
+        };
+        if !on_obs && !crate::transport::is_public_https(&parsed) {
+            return Err(refused(&parsed));
+        }
+        let http = if on_obs {
+            &self.t.http
+        } else {
+            &self.t.untrusted_http
+        };
+        let resp = http
+            .get(parsed.clone())
             .timeout(Duration::from_secs(120))
             .send()
-            .await?;
+            .await
+            .map_err(|e| {
+                if e.is_redirect() || crate::transport::is_non_public_destination(&e) {
+                    refused(&parsed)
+                } else {
+                    e.into()
+                }
+            })?;
         let status = resp.status().as_u16();
-        if status >= 400 {
+        if !resp.status().is_success() {
             return Err(crate::error::ApiError {
                 path: url.to_owned(),
                 status,
@@ -574,7 +674,7 @@ impl Client {
             }
             .into());
         }
-        Ok(resp.bytes().await?.to_vec())
+        read_body(resp, limit).await
     }
 
     /// The media flow LINE wants for `content_type` in `chat`: 2 = sealed (V2),
@@ -648,8 +748,13 @@ impl Client {
         } else {
             meta.get("DOWNLOAD_URL")
         };
+        let limit = if preview {
+            MAX_PICTURE_DOWNLOAD
+        } else {
+            MAX_DOWNLOAD
+        };
         if let Some(url) = public.filter(|u| u.starts_with("http")) {
-            return self.public_get(url).await;
+            return self.public_get(url, limit).await;
         }
         let pop = meta.get("OBS_POP").map(|p| format!("?p={p}")).unwrap_or_default();
         let key = meta.get("ENC_KM").filter(|k| !k.is_empty());
@@ -680,31 +785,51 @@ impl Client {
             Some(_) => vec![("x-talk-meta", talk_meta(&m.id))],
             None => vec![],
         };
-        let data = self
+        let resp = self
             .obs_request(None, &format!("{}{path}", self.t.config.obs), &extra)
-            .await?
-            .bytes()
             .await?;
+        let data = read_body(resp, limit).await?;
         match key {
             Some(k) => {
                 let km = B64
                     .decode(k)
                     .map_err(|e| Error::Protocol(format!("bad ENC_KM: {e}")))?;
-                decrypt_blob(&km, &data, m.content_type == content_type::VIDEO && !preview)
+                let chunked = m.content_type == content_type::VIDEO && !preview;
+                // HMAC + AES over up to 1 GiB: off the async workers, so other
+                // downloads (and the UI) keep going meanwhile.
+                tokio::task::spawn_blocking(move || decrypt_blob(&km, &data, chunked))
+                    .await
+                    .map_err(|e| Error::Protocol(format!("media decryption task failed: {e}")))?
             }
-            None => Ok(data.to_vec()),
+            None => Ok(data),
         }
     }
 
     /// Download a profile or group picture by its `picturePath` (public CDN).
     pub async fn download_picture(&self, picture_path: &str, size: PictureSize) -> Result<Vec<u8>> {
         let url = picture_url(picture_path, size).ok_or_else(|| Error::Protocol("no picture".into()))?;
-        self.public_get(&url).await
+        self.public_get(&url, MAX_PICTURE_DOWNLOAD).await
     }
 
     /// Download a sticker image (public CDN).
     pub async fn download_sticker(&self, sticker_id: &str, variant: StickerImage) -> Result<Vec<u8>> {
-        self.public_get(&sticker_url(sticker_id, variant)).await
+        self.public_get(&sticker_url(sticker_id, variant), MAX_PICTURE_DOWNLOAD)
+            .await
+    }
+
+    /// Download a LINE emoji picture (public CDN), e.g. a paid reaction's.
+    pub async fn download_emoji(&self, product_id: &str, emoji_id: &str) -> Result<Vec<u8>> {
+        let url = emoji_url(product_id, emoji_id)
+            .ok_or_else(|| Error::Protocol(format!("bad emoji id {product_id}/{emoji_id}")))?;
+        self.public_get(&url, MAX_PICTURE_DOWNLOAD).await
+    }
+
+    /// A LINE emoji package's `meta.json` (public CDN).
+    pub(crate) async fn emoji_meta(&self, product_id: &str) -> Result<Value> {
+        let url = emoji_meta_url(product_id)
+            .ok_or_else(|| Error::Protocol(format!("bad emoji package id {product_id}")))?;
+        let body = self.public_get(&url, 1 << 20).await?;
+        Ok(serde_json::from_slice(&body)?)
     }
 
     /// Upload one object; returns the `x-obs-oid` response header if present.
@@ -776,7 +901,16 @@ impl Client {
         getrandom::fill(&mut km).map_err(|e| Error::Protocol(format!("getrandom: {e}")))?;
         let km_b64 = B64.encode(km);
         let chunked = up.kind == MediaKind::Video;
-        let (blob, hashes) = encrypt_blob(&km, &data, chunked);
+        let size = data.len();
+        let preview = image.as_ref().map(|p| p.preview.clone()).or(up.preview.clone());
+        // Encryption is CPU work over up to 1 GiB: keep it off the async workers.
+        let (blob, hashes, pblob) = tokio::task::spawn_blocking(move || {
+            let (blob, hashes) = encrypt_blob(&km, &data, chunked);
+            let pblob = preview.map(|pv| encrypt_blob(&km, &pv, false).0);
+            (blob, hashes, pblob)
+        })
+        .await
+        .map_err(|e| Error::Protocol(format!("media encryption task failed: {e}")))?;
         let sid = up.kind.sealed_sid();
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -790,37 +924,44 @@ impl Client {
             )
             .await?
             .ok_or_else(|| Error::Protocol("OBS upload returned no x-obs-oid".into()))?;
-        let preview = image.as_ref().map(|p| p.preview.clone()).or(up.preview.clone());
-        if let Some(pv) = preview {
-            let (pblob, _) = encrypt_blob(&km, &pv, false);
-            self.obs_upload(
-                sid,
-                &format!("{oid}__ud-preview"),
-                &pblob,
-                obs_params("preview.jpg", "file", None),
-            )
-            .await?;
-            let thumb = image.as_ref().map(|p| p.thumb_info.clone());
-            if let Some(t) = thumb {
-                msg.content_metadata
-                    .insert("MEDIA_THUMB_INFO".into(), t.to_string());
+        // The preview and the chunk hashes hang off the object id; they go up together.
+        let preview_up = async {
+            if let Some(pblob) = &pblob {
+                self.obs_upload(
+                    sid,
+                    &format!("{oid}__ud-preview"),
+                    pblob,
+                    obs_params("preview.jpg", "file", None),
+                )
+                .await?;
             }
-        }
-        if let Some(h) = hashes {
-            self.obs_upload(
-                sid,
-                &format!("{oid}__ud-hash"),
-                &h,
-                obs_params("chunk-hash", "file", None),
-            )
-            .await?;
+            Ok::<_, Error>(())
+        };
+        let hash_up = async {
+            if let Some(h) = &hashes {
+                self.obs_upload(
+                    sid,
+                    &format!("{oid}__ud-hash"),
+                    h,
+                    obs_params("chunk-hash", "file", None),
+                )
+                .await?;
+            }
+            Ok::<_, Error>(())
+        };
+        tokio::try_join!(preview_up, hash_up)?;
+        if pblob.is_some()
+            && let Some(t) = image.as_ref().map(|p| p.thumb_info.clone())
+        {
+            msg.content_metadata
+                .insert("MEDIA_THUMB_INFO".into(), t.to_string());
         }
         let meta = &mut msg.content_metadata;
         meta.insert("ENC_KM".into(), km_b64);
         meta.insert("SID".into(), sid.into());
         meta.insert("OID".into(), oid);
         meta.insert("FILE_NAME".into(), name);
-        meta.insert("FILE_SIZE".into(), data.len().to_string());
+        meta.insert("FILE_SIZE".into(), size.to_string());
         self.send_sealed_required(&msg).await
     }
 
@@ -900,6 +1041,15 @@ mod tests {
             sticker_url("403", StickerImage::Static),
             "https://stickershop.line-scdn.net/stickershop/v1/sticker/403/android/sticker.png"
         );
+        assert_eq!(
+            emoji_url("670e0cce840a8236ddd4ee4c", "143").unwrap(),
+            "https://stickershop.line-scdn.net/sticonshop/v1/sticon/670e0cce840a8236ddd4ee4c/iPhone/143.png"
+        );
+        // Reactions carry whatever the reactor sent: nothing but plain ids goes into a URL.
+        for (p, e) in [("../x", "1"), ("670e", "1?a=b"), ("", "1"), ("670e", "a/b")] {
+            assert_eq!(emoji_url(p, e), None, "{p} {e}");
+        }
+        assert!(emoji_meta_url("670e/../..").is_none());
     }
 
     #[test]

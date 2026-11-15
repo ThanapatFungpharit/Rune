@@ -57,6 +57,16 @@ pub enum OpEvent<'a> {
 }
 
 impl Operation {
+    /// When the server recorded this operation (epoch ms, `createdTime`;
+    /// sent as a string, live 2026-11-15). For op 55 that is when the read
+    /// happened.
+    pub fn created_time(&self) -> Option<i64> {
+        self.extra
+            .get("createdTime")
+            .and_then(value_i64)
+            .filter(|t| *t > 0)
+    }
+
     /// Decode this operation (see [`OpEvent`]).
     pub fn event(&self) -> OpEvent<'_> {
         let p1 = self.param1.as_deref().filter(|s| !s.is_empty());

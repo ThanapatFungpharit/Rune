@@ -39,19 +39,36 @@ pub struct SseEvent {
     pub id: Option<String>,
 }
 
+/// Most bytes one event (its unfinished line plus its data lines) may hold.
+/// Operations are a few KB; this only stops a broken or hostile stream from
+/// growing memory without end.
+pub(crate) const MAX_SSE_EVENT: usize = 16 * 1024 * 1024;
+
 /// Incremental `text/event-stream` parser.
 #[derive(Debug, Default)]
 pub(crate) struct SseParser {
     buf: Vec<u8>,
     event: String,
     data: Vec<String>,
+    data_len: usize,
     id: Option<String>,
 }
 
 impl SseParser {
-    /// Feed bytes; returns the events completed by them.
-    pub(crate) fn feed(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
+    /// Feed bytes; returns the events completed by them, or `Err` when an
+    /// event grows past [`MAX_SSE_EVENT`] (the connection should be dropped).
+    pub(crate) fn feed(&mut self, chunk: &[u8]) -> std::result::Result<Vec<SseEvent>, usize> {
         self.buf.extend_from_slice(chunk);
+        let out = self.drain_lines();
+        let pending = self.buf.len() + self.data_len;
+        if pending > MAX_SSE_EVENT {
+            *self = SseParser::default();
+            return Err(pending);
+        }
+        Ok(out)
+    }
+
+    fn drain_lines(&mut self) -> Vec<SseEvent> {
         let mut out = Vec::new();
         while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
             let mut line: Vec<u8> = self.buf.drain(..=nl).collect();
@@ -74,6 +91,7 @@ impl SseParser {
                 }
                 self.event.clear();
                 self.data.clear();
+                self.data_len = 0;
                 continue;
             }
             if line.starts_with(':') {
@@ -85,7 +103,10 @@ impl SseParser {
             };
             match key {
                 "event" => self.event = value.to_owned(),
-                "data" => self.data.push(value.to_owned()),
+                "data" => {
+                    self.data_len += value.len() + 1;
+                    self.data.push(value.to_owned());
+                }
                 "id" => self.id = Some(value.to_owned()),
                 _ => {}
             }
@@ -181,7 +202,17 @@ impl OperationStream {
         let mut v = HeaderValue::from_str(&token).map_err(|e| Error::Protocol(e.to_string()))?;
         v.set_sensitive(true);
         h.insert("x-line-access", v);
-        let resp = self.client.t.get(&path, h, None).await?;
+        // Only the wait for the response head is bounded: a request timeout
+        // would also cut the (endless) body. Without it, a server that
+        // accepts the connection and never answers would hang the stream.
+        let resp = tokio::time::timeout(self.silence_timeout, self.client.t.get(&path, h, None))
+            .await
+            .map_err(|_| {
+                Error::Timeout(format!(
+                    "operation stream: no response within {:?}",
+                    self.silence_timeout
+                ))
+            })??;
         let status = resp.status().as_u16();
         if status != 200 {
             let text = resp.text().await.unwrap_or_default();
@@ -348,7 +379,14 @@ impl OperationStream {
             let (stream, parser) = self.conn.as_mut().expect("connected");
             let next = tokio::time::timeout(self.silence_timeout, stream.next()).await;
             let events = match next {
-                Ok(Some(Ok(bytes))) => parser.feed(&bytes),
+                Ok(Some(Ok(bytes))) => match parser.feed(&bytes) {
+                    Ok(events) => events,
+                    Err(size) => {
+                        tracing::warn!("operation stream event exceeds {size} bytes; reconnecting");
+                        self.reconnect_later();
+                        continue;
+                    }
+                },
                 Ok(Some(Err(e))) => {
                     tracing::warn!("operation stream read error: {e}");
                     self.drop_conn();
@@ -410,12 +448,41 @@ mod tests {
     #[test]
     fn parses_split_chunks_and_named_events() {
         let mut p = SseParser::default();
-        assert!(p.feed(b"event: ping\r\ndata: {}\r\n").is_empty());
-        let evs = p.feed(b"\r\n: comment\ndata: {\"operations\":\ndata: []}\n\n");
+        assert!(p.feed(b"event: ping\r\ndata: {}\r\n").unwrap().is_empty());
+        let evs = p
+            .feed(b"\r\n: comment\ndata: {\"operations\":\ndata: []}\n\n")
+            .unwrap();
         assert_eq!(evs.len(), 2);
         assert_eq!(evs[0].event, "ping");
         assert_eq!(evs[1].event, "message");
         assert_eq!(evs[1].data, "{\"operations\":\n[]}");
+    }
+
+    #[test]
+    fn oversized_events_are_refused_and_the_parser_starts_over() {
+        let mut p = SseParser::default();
+        // One endless line …
+        let chunk = vec![b'x'; 1024 * 1024];
+        let mut refused = false;
+        for _ in 0..=MAX_SSE_EVENT / chunk.len() {
+            if p.feed(&chunk).is_err() {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "an endless line must be refused");
+        // … or endless data lines without the blank line that ends the event.
+        let line = [b"data: ".as_slice(), &vec![b'y'; 1024 * 1024], b"\n"].concat();
+        let mut refused = false;
+        for _ in 0..=MAX_SSE_EVENT / line.len() + 1 {
+            if p.feed(&line).is_err() {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "an endless event must be refused");
+        // Afterwards it parses normally again.
+        assert_eq!(p.feed(b"data: 1\n\n").unwrap().len(), 1);
     }
 }
 

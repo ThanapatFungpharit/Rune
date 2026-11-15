@@ -78,8 +78,15 @@ Not yet observed live: the 119 refresh path, E2EE retry codes 83/84/99,
 creating a group key, an account key rotation, non-text sealed types.
 
 Observed: mids have the newer `U`/`C` + 43-char base64url form (authenticated,
-see Letter Sealing); `getServerTime`/`getLastOpRevision`/`createdTime` arrive
+see Letter Sealing) — about half contain `-` or `_`, so a mid check must allow
+them (`getChats`/`getContactsV2` serve them like any other); `getServerTime`/`getLastOpRevision`/`createdTime` arrive
 as JSON strings; `refreshApiRetryPolicy` was `{200 ms, 104857600 ms, ×2, 0.3}`.
+
+Observed (`getContactsV2`): non-friends (group members, `relation` 2) come back
+with `picturePath`/`pictureStatus` like friends (72 of 80 sampled); a user with
+no picture has `picturePath: ""` and no `pictureStatus`; a deleted account comes
+back as `{snapshotTimeMillis, userStatus}` with no `contact`. `getChats` returns
+nothing for a group we are no longer in.
 
 ## `X-Hmac` signing (verified, live)
 
@@ -295,6 +302,26 @@ preview JPEG yourself); animated/popup sticker variants (URLs not
 confirmed); grouped image messages (`GID`/`GSEQ`); re-forwarding via
 `/api/obs/copyForMessage`; resumable uploads (`range`).
 
+Client-side safeguards (rune's policy, not LINE's protocol): `DOWNLOAD_URL`
+/ `PREVIEW_URL` are chosen by the sender, so rune fetches them only from
+`https` URLs with a host name (no IP literals, no `localhost`), without
+credentials, through a separate client: every address the name resolves to
+(A and AAAA) must be globally reachable (no loopback, private, CGNAT,
+link-local/cloud-metadata, documentation, multicast or other special-purpose
+range, including IPv4-mapped, NAT64 and 6to4 forms of those), the connection
+goes to exactly the checked addresses (no re-resolution, so no DNS
+rebinding window; SNI, certificate checks and `Host` still use the name),
+no proxy is used, every redirect is checked the same way, and non-2xx
+responses are never read. Redirects of gateway/OBS requests (which
+carry the access token, and reqwest only strips standard auth headers) are
+followed across origins only to `*.line-apps.com` / `*.line-scdn.net` over
+`https`. Downloads are capped
+(20 MiB for previews, pictures and stickers; 1 GiB plus sealing overhead
+otherwise), and `download_obs` refuses full URLs off the OBS host. This
+policy has not been re-run against the live bot image above: a bot link
+served over plain `http` would now be refused (LINE's Messaging API
+requires `https` media URLs, so none is expected).
+
 Images sent as "original" (and profile covers) are scrubbed losslessly first
 (`src/exif.rs`: an EXIF whitelist, XMP/IPTC/text chunks dropped; the
 extension only zeroes GPS tags). A file whose structure cannot be parsed is
@@ -380,8 +407,10 @@ Parsing is therefore lenient: unknown `RESULT`/`GC_EVT_TYPE` values are kept
 verbatim (`CallOutcome::Other`), a missing `TYPE` reads as voice, and a record
 with talk time counts as answered. `cli watch` prints the raw metadata of call
 messages so the first real one can confirm or correct this table. Ops 50/51 are
-legacy and were never seen on the stream; the TUI only turns them into a
-status-line hint ("… is calling — answer on your phone").
+legacy and were never seen on the stream; the TUI turns op 50 into a
+status-line hint and a notification ("… is calling — answer on your phone").
+Call messages notify only when they are news: a group call started or an
+invitation to one, or a missed 1:1 call (not answered, declined or ended ones).
 
 ## Operations, read state, settings and stickers (live, 2026-11-14)
 
@@ -416,7 +445,15 @@ position) and `lastDeliveredMessageId`.
 **Read ranges.** `getMessageReadRange([[chatIds], syncReason])` is served but
 answered `[]` for 30 chats (6 user, 24 group) with sync reasons 1, 2, 3 and 4.
 Read state therefore comes from op 55 as it arrives (and is kept in the
-store); reads from before a client was listening are unknown. The reference
+store); reads from before a client was listening are unknown. Every
+operation carries `createdTime` (epoch ms as a string, live 2026-11-15;
+`Operation::created_time`); for op 55 that is when the read happened, so the
+store logs it per read position (`Store::read_times`). The TUI also treats a
+member's later message (text, media, sticker, contact, location — not call
+records or album notices) or reaction as having read the chat up to it: the
+LINE apps mark a chat read when it is opened, which sending or reacting
+normally needs (an inference, not verified live: a notification quick reply or a
+bot may not have read the chat). The reference
 documents the result as `[{chatId, ranges: {mid: [{startMessageId,
 endMessageId, startTime, endTime}]}}]`; `Client::message_read_ranges` parses that.
 
@@ -463,6 +500,25 @@ The list includes LINE's free default packages (`1`–`4`, `11537`–`11539`
 on the test account). Sending a sticker from a package you do not own is
 rejected with HTTP 400 (reported live, 2026-11-14), so the TUI's "Recent"
 tab only offers stickers whose `STKPKGID` is in this list.
+
+**LINE emoji reactions.** Besides the predefined reactions (`2` nice …
+`7` omg), `react` takes `{"paidReactionType": {productId, emojiId,
+resourceType, version}}` for an emoji of an owned LINE emoji package; the
+server accepted it from `CHROMEOS` 3.7.2 and returned the same object in
+`Message.reactions` (live, 2026-11-15, on a message in our own chat). Owned
+packages come from `getOwnedProductSummaries(["sticonshop", offset, limit,
+{language, country}])` — the same shape as stickers, with
+`productTypeSummary.sticonSummary: {sticonResourceType, availableForPhotoEdit,
+suggestVersion}` and no emoji ids (live). Every account owns "LINE Basic
+Emoji" (`670e0cce840a8236ddd4ee4c`, `grantedByDefault`, 211 emoji, version
+3). The emoji list is public: `stickershop/v1/{productId}/sticon/iphone/meta.json`
+on the sticker CDN is `{productId, orders: [emojiId], altTexts: {emojiId:
+text}}` (live; some alt texts contain U+00A0), and each emoji's picture is
+`sticonshop/v1/sticon/{productId}/iPhone/{emojiId}.png` (live). Reactions
+carry whatever the reactor's client sent, so `rune` puts only alphanumeric
+ids into these URLs. Basic Emoji `077`–`211` (faces, hands, objects, digits)
+have Unicode look-alikes (`ReactionKind::emoji`, matched by eye against the
+pictures); `001`–`076` are LINE characters.
 
 **Animated stickers.** Sticker messages carry `STKOPT`: `"A"` on animated
 ones (live; `"0"` or no key on static ones). The public sticker CDN serves

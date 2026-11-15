@@ -264,6 +264,25 @@ async fn contacts_are_batched_and_unwrapped() {
 }
 
 #[tokio::test]
+async fn contacts_skip_users_that_no_longer_exist() {
+    let server = MockServer::start().await;
+    // Live: a deleted account comes back without a `contact` object.
+    Mock::given(path("/api/talk/thrift/Talk/TalkService/getContactsV2"))
+        .respond_with(ok(json!({"contacts": {
+            "U_live-1": {"contact": {"mid": "U_live-1", "displayName": "Ann",
+                                     "picturePath": "", "pictureStatus": "0hpic"}},
+            "U_gone-2": {"snapshotTimeMillis": "1", "userStatus": 3},
+        }})))
+        .mount(&server)
+        .await;
+    let mids = vec!["U_live-1".to_owned(), "U_gone-2".to_owned()];
+    let got = logged_in(&server).contacts(&mids).await.unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got["U_live-1"].name(), "Ann");
+    assert_eq!(got["U_live-1"].picture().as_deref(), Some("/0hpic"));
+}
+
+#[tokio::test]
 async fn operation_stream_resumes_from_cursor_and_dedupes() {
     let server = MockServer::start().await;
     Mock::given(path("/api/talk/thrift/Talk/TalkService/getLastOpRevision"))
@@ -682,6 +701,35 @@ async fn unproductive_stream_connections_back_off() {
 }
 
 #[tokio::test]
+async fn a_stream_server_that_never_answers_is_abandoned_and_retried() {
+    let server = MockServer::start().await;
+    // The first connection is accepted but its response never comes in time …
+    Mock::given(method("GET"))
+        .and(path("/api/operation/receive"))
+        .respond_with(sse("data: []\n\n").set_delay(std::time::Duration::from_secs(60)))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    // … the next one delivers.
+    Mock::given(method("GET"))
+        .and(path("/api/operation/receive"))
+        .respond_with(sse(
+            "data: [{\"revision\":\"101\",\"type\":55,\"param1\":\"c1\"}]\n\n",
+        ))
+        .mount(&server)
+        .await;
+    let client = logged_in(&server);
+    let mut ops = client.operations(Some(100));
+    ops.silence_timeout = std::time::Duration::from_millis(300);
+    let op = tokio::time::timeout(std::time::Duration::from_secs(10), ops.next_operation())
+        .await
+        .expect("a silent server must not hang the stream")
+        .unwrap();
+    assert_eq!(op.revision, 101);
+    assert!(stream_opens(&server).await >= 2);
+}
+
+#[tokio::test]
 async fn stream_survives_a_failed_token_refresh() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -816,4 +864,38 @@ async fn a_failed_qr_login_frees_its_key() {
     let err = client.qr_login(opts, |_| {}).await.unwrap_err();
     assert!(err.api().is_some(), "{err:?}");
     assert!(client.with_ltsm(|l| format!("{l:?}")).contains("keys: 0"));
+}
+
+#[tokio::test]
+async fn reaction_wire_shapes() {
+    let server = MockServer::start().await;
+    Mock::given(path("/api/talk/thrift/Talk/TalkService/react"))
+        .respond_with(|req: &Request| {
+            let a: Value = serde_json::from_slice(&req.body).unwrap();
+            assert!(a[0]["reqSeq"].is_i64());
+            assert_eq!(a[0]["messageId"], "600");
+            let t = &a[0]["reactionType"];
+            // The live shape of a LINE emoji reaction (2026-11-15).
+            assert!(
+                *t == json!({"predefinedReactionType": 3})
+                    || *t
+                        == json!({"paidReactionType": {"productId": "670e", "emojiId": "143",
+                            "resourceType": 1, "version": "3"}}),
+                "{t}"
+            );
+            ok(Value::Null)
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let c = logged_in(&server);
+    c.react("600", rune::Reaction::Love).await.unwrap();
+    let pkg = rune::EmojiPackage {
+        id: "670e".into(),
+        name: "LINE Basic Emoji".into(),
+        version: 3,
+        resource_type: 1,
+        emojis: vec![("143".into(), "thumbs up".into())],
+    };
+    c.react_emoji("600", &pkg, "143").await.unwrap();
 }

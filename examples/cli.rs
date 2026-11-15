@@ -241,22 +241,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if albums.is_empty() {
                 println!("no album posts in the last {count} messages");
             }
-            for (id, name, posts) in &albums {
-                let photos: usize = posts.iter().map(|(p, _)| p.media.len()).sum();
-                println!("album {id} \"{name}\": {} posts, {photos} photos", posts.len());
-                for (p, from) in posts {
-                    for media in &p.media {
-                        print!("  {} {} from {from}", media.media_type, media.oid);
-                        if let Some(dir) = args.get(3) {
-                            let data = c.download_album_media(&p.chat, media).await?;
-                            let ext = if media.is_video() { "mp4" } else { "jpg" };
-                            let out = std::path::Path::new(dir).join(format!("{}.{ext}", media.oid));
-                            std::fs::write(&out, &data)?;
-                            print!(" -> {} ({} bytes)", out.display(), data.len());
-                        }
-                        println!();
+            // Photos download several at a time; lines print in album order.
+            use futures_util::StreamExt;
+            let jobs: Vec<_> = albums
+                .iter()
+                .flat_map(|(id, name, posts)| {
+                    let photos: usize = posts.iter().map(|(p, _)| p.media.len()).sum();
+                    let header = format!("album {id} \"{name}\": {} posts, {photos} photos", posts.len());
+                    std::iter::once((Some(header), None)).chain(
+                        posts
+                            .iter()
+                            .flat_map(|(p, from)| p.media.iter().map(move |m| (None, Some((p, from, m))))),
+                    )
+                })
+                .collect();
+            let dir = args.get(3).map(std::path::Path::new);
+            let c = &c;
+            let mut lines = futures_util::stream::iter(jobs)
+                .map(|(header, item)| async move {
+                    if let Some(h) = header {
+                        return Ok::<_, Box<dyn std::error::Error>>(h);
                     }
-                }
+                    let (p, from, media) = item.expect("header or item");
+                    let mut line = format!("  {} {} from {from}", media.media_type, media.oid);
+                    if let Some(dir) = dir {
+                        let data = c.download_album_media(&p.chat, media).await?;
+                        let ext = if media.is_video() { "mp4" } else { "jpg" };
+                        let out = dir.join(format!("{}.{ext}", media.oid));
+                        tokio::fs::write(&out, &data).await?;
+                        line += &format!(" -> {} ({} bytes)", out.display(), data.len());
+                    }
+                    Ok(line)
+                })
+                .buffered(6);
+            while let Some(line) = lines.next().await {
+                println!("{}", line?);
             }
         }
         Some("sticker") => {
@@ -379,6 +398,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Some("emojis") => {
+            // LINE emoji packages usable as reactions.
+            let (c, _) = load()?;
+            for p in c.owned_emoji_packages().await? {
+                let sample: Vec<_> = p
+                    .emojis
+                    .iter()
+                    .take(3)
+                    .map(|e| format!("{} {}", e.0, e.1))
+                    .collect();
+                println!(
+                    "{} v{} type {} — {} ({} emoji: {}, …)",
+                    p.id,
+                    p.version,
+                    p.resource_type,
+                    p.name,
+                    p.emojis.len(),
+                    sample.join(", ")
+                );
+            }
+        }
         Some("call") => {
             let (c, _) = load()?;
             let params: serde_json::Value = serde_json::from_str(args.get(2).map_or("[]", String::as_str))?;
@@ -389,7 +429,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => {
             eprintln!(
-                "usage: cli <login|refresh|e2ee-status|download CHAT ID OUT [preview]|send-image|send-file|send-video|send-audio MID PATH [MS]|picture MID|me OUT|sticker STKID OUT|whoami|chats|invites|accept CHAT|decline CHAT|send MID TEXT|reply CHAT MSGID TEXT|recent CHAT [N]|watch [REV]|call METHOD JSON>"
+                "usage: cli <login|refresh|e2ee-status|download CHAT ID OUT [preview]|send-image|send-file|send-video|send-audio MID PATH [MS]|picture MID|me OUT|sticker STKID OUT|emojis|whoami|chats|invites|accept CHAT|decline CHAT|send MID TEXT|reply CHAT MSGID TEXT|recent CHAT [N]|watch [REV]|call METHOD JSON>"
             );
             std::process::exit(2);
         }

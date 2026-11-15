@@ -236,7 +236,7 @@ impl Client {
         let resp = self
             .myhome_request(None, &url, &[("x-line-mid", chat.to_owned())])
             .await?;
-        Ok(resp.bytes().await?.to_vec())
+        crate::media::read_body(resp, crate::media::MAX_DOWNLOAD).await
     }
 
     /// The first photo of an album post (what [`Client::download_media`]

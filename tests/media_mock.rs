@@ -190,6 +190,163 @@ async fn plain_download_paths() {
     assert_eq!(client.download_media(&bot, false).await.unwrap(), b"U");
 }
 
+/// Parallel downloads share one OBS token fetch, and one renewal when that
+/// token is refused (not one `acquireEncryptedAccessToken` per download).
+#[tokio::test]
+async fn parallel_downloads_share_the_obs_token() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    Mock::given(path_regex(r"^/r/talk/m/\d+$"))
+        .respond_with(|req: &Request| {
+            let tok = req.headers.get("x-line-access").unwrap().to_str().unwrap();
+            if tok == "TOKEN-1" {
+                ResponseTemplate::new(401)
+            } else {
+                ResponseTemplate::new(200).set_body_bytes(req.url.path().as_bytes().to_vec())
+            }
+        })
+        .mount(&server)
+        .await;
+    let client = Client::with_tokens(
+        Config {
+            gateway: server.uri(),
+            obs: server.uri(),
+            ..Config::default()
+        },
+        Tokens {
+            access_token: Some("A".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let downloads = (0..8).map(|i| {
+        let client = client.clone();
+        tokio::spawn(async move {
+            let m = Message {
+                id: (100 + i).to_string(),
+                content_type: 14,
+                ..Default::default()
+            };
+            client.download_media(&m, false).await.unwrap()
+        })
+    });
+    for (i, d) in downloads.enumerate() {
+        assert_eq!(d.await.unwrap(), format!("/r/talk/m/{}", 100 + i).into_bytes());
+    }
+    let fetches = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().ends_with("acquireEncryptedAccessToken"))
+        .count();
+    assert_eq!(fetches, 2, "one fetch, one renewal");
+}
+
+/// Media links in a message are the sender's choice: rune must not fetch
+/// plain-http or private-network URLs, must not follow redirects off the OBS
+/// host with credentials, must not hand OBS credentials to another host, and
+/// must cap what it reads.
+#[tokio::test]
+async fn untrusted_media_links_and_oversized_bodies_are_refused() {
+    let server = MockServer::start().await;
+    let elsewhere = MockServer::start().await;
+    mount_token(&server).await;
+    Mock::given(path("/x.jpg"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"secret".to_vec()))
+        .mount(&elsewhere)
+        .await;
+    // A redirect from the OBS host to another one.
+    Mock::given(path("/r/talk/m/50"))
+        .respond_with(
+            ResponseTemplate::new(302).insert_header("location", format!("{}/x.jpg", elsewhere.uri())),
+        )
+        .mount(&server)
+        .await;
+    // A preview far larger than any picture.
+    Mock::given(path("/r/talk/m/51/preview"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 21 * 1024 * 1024]))
+        .mount(&server)
+        .await;
+    let client = Client::with_tokens(
+        Config {
+            gateway: server.uri(),
+            obs: server.uri(),
+            ..Config::default()
+        },
+        Tokens {
+            access_token: Some("A".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let with_url = |id: &str, key: &str, url: String| {
+        let mut m = Message {
+            id: id.into(),
+            content_type: 1,
+            ..Default::default()
+        };
+        m.content_metadata.insert(key.into(), url);
+        m
+    };
+    // Plain http on a host that is not OBS (and a private address at that).
+    let err = client
+        .download_media(
+            &with_url("44", "DOWNLOAD_URL", format!("{}/x.jpg", elsewhere.uri())),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, rune::Error::MediaUnavailable(_)), "{err:?}");
+    let err = client
+        .download_media(
+            &with_url("45", "PREVIEW_URL", "https://192.168.1.10/x.jpg".into()),
+            true,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, rune::Error::MediaUnavailable(_)), "{err:?}");
+    // IP literals are refused even when public (they would skip the resolver's check).
+    for url in [
+        "https://8.8.8.8/x.jpg",
+        "https://[::ffff:169.254.169.254]/x",
+        "https://0x7f.1/x",
+    ] {
+        let err = client
+            .download_media(&with_url("46", "PREVIEW_URL", url.into()), true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, rune::Error::MediaUnavailable(_)), "{url}: {err:?}");
+    }
+    // Redirected off the OBS host: refused.
+    let plain = Message {
+        id: "50".into(),
+        content_type: 1,
+        ..Default::default()
+    };
+    assert!(client.download_media(&plain, false).await.is_err());
+    // OBS credentials never go to another host.
+    assert!(
+        client
+            .download_obs(&format!("{}/x.jpg", elsewhere.uri()))
+            .await
+            .is_err()
+    );
+    assert!(client.download_obs("evil.example/r/x").await.is_err());
+    assert!(
+        elsewhere.received_requests().await.unwrap().is_empty(),
+        "nothing may reach the other host"
+    );
+    // A 21 MiB preview is more than any picture: refused, not buffered.
+    let big = Message {
+        id: "51".into(),
+        content_type: 1,
+        ..Default::default()
+    };
+    let err = client.download_media(&big, true).await.unwrap_err();
+    assert!(err.to_string().contains("limit"), "{err}");
+}
+
 /// Sealed (V2) media with real keys; our own mid stands in for the peer
 /// (ltsm.wasm rejects made-up mids). No traffic reaches LINE.
 ///

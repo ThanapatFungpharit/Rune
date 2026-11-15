@@ -280,20 +280,6 @@ impl OutgoingMessage {
         m
     }
 
-    /// A Flex message (`contents` is the Flex JSON container).
-    ///
-    /// LINE rejects these from this client: `sendMessage` fails with
-    /// TalkException 11 ("Incompatible app version", HTTP 400, live
-    /// 2026-11-14), whatever the chat. The extension only renders Flex.
-    pub fn flex(to: &str, alt_text: &str, contents: &Value) -> Self {
-        let mut m = Self::base(to, content_type::FLEX);
-        m.text = Some(String::new());
-        m.content_metadata
-            .insert("FLEX_JSON".into(), contents.to_string());
-        m.content_metadata.insert("ALT_TEXT".into(), alt_text.into());
-        m
-    }
-
     /// The wire JSON object.
     pub fn to_json(&self) -> Value {
         let mut o = Map::new();
@@ -359,6 +345,16 @@ impl Contact {
             .is_some_and(|s| s & contact_setting::NOTIFICATION_DISABLE != 0)
     }
 
+    /// The profile picture's path for `Client::download_picture` /
+    /// `media::picture_url`: `picturePath`, else `/{pictureStatus}`. `None`
+    /// when the user has no picture (or `getContactsV2` does not show it).
+    pub fn picture(&self) -> Option<String> {
+        picture_of(
+            &self.picture_path,
+            self.extra.get("pictureStatus").and_then(Value::as_str),
+        )
+    }
+
     /// Name as the client shows it (the user's override wins).
     pub fn name(&self) -> &str {
         self.display_name_overridden
@@ -366,6 +362,17 @@ impl Contact {
             .filter(|s| !s.is_empty())
             .unwrap_or(&self.display_name)
     }
+}
+
+/// A picture path from `picturePath`, else `pictureStatus` (the same
+/// picture without the leading `/`); `None` when both are empty.
+fn picture_of(path: &Option<String>, status: Option<&str>) -> Option<String> {
+    fn nonempty(s: Option<&str>) -> Option<&str> {
+        s.map(str::trim).filter(|s| !s.is_empty())
+    }
+    nonempty(path.as_deref())
+        .map(str::to_owned)
+        .or_else(|| nonempty(status).map(|s| format!("/{}", s.trim_start_matches('/'))))
 }
 
 /// A group chat or room from `getChats`.
@@ -391,14 +398,7 @@ impl Chat {
     /// `media::picture_url`: `picturePath`, else `/{pictureStatus}`.
     /// `None` when the group has no picture.
     pub fn picture(&self) -> Option<String> {
-        let nonempty = |s: &Option<String>| {
-            s.as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-        };
-        nonempty(&self.picture_path)
-            .or_else(|| nonempty(&self.picture_status).map(|s| format!("/{}", s.trim_start_matches('/'))))
+        picture_of(&self.picture_path, self.picture_status.as_deref())
     }
 
     /// Notifications for this group are turned off (`notificationDisabled`).
@@ -716,6 +716,20 @@ impl ReactionKind {
         })
     }
 
+    /// A Unicode emoji to draw for it: the built-in reactions, and the
+    /// "LINE Basic Emoji" pack's faces, hands and objects. `None` for other
+    /// LINE emoji (they only exist as pictures, see
+    /// [`emoji_url`](crate::media::emoji_url)).
+    pub fn emoji(&self) -> Option<&'static str> {
+        match self {
+            ReactionKind::Predefined(n) => crate::Reaction::from_i64(*n).map(crate::Reaction::emoji),
+            ReactionKind::Paid { product_id, emoji_id } if product_id == BASIC_EMOJI_PACKAGE => {
+                basic_emoji_glyph(emoji_id)
+            }
+            ReactionKind::Paid { .. } => None,
+        }
+    }
+
     /// The Thrift `ReactionType` object.
     pub fn to_json(&self) -> Value {
         match self {
@@ -725,6 +739,35 @@ impl ReactionKind {
             }
         }
     }
+}
+
+/// The "LINE Basic Emoji" package, which every account owns
+/// (`grantedByDefault`, live).
+pub const BASIC_EMOJI_PACKAGE: &str = "670e0cce840a8236ddd4ee4c";
+
+/// Unicode stand-ins for "LINE Basic Emoji" `077`–`211`, matched to the
+/// pictures on the sticker CDN (`001`–`076` are LINE characters).
+const BASIC_EMOJI_GLYPHS: [&str; 135] = [
+    // 077–110: faces
+    "🙂", "😌", "😃", "😂", "🥺", "😗", "😇", "🥰", "😝", "😎", "😶", "🙁", "😮", "😟", "🥹", "😔", "😭",
+    "😲", "😵", "💔", "😓", "😏", "😰", "😳", "😫", "😢", "😴", "🤤", "🥱", "🤭", "🤮", "😷", "😠", "😈",
+    // 111–142: the round character
+    "😊", "✌️", "👍", "🥹", "😍", "😆", "🤩", "🤔", "😢", "😇", "🌈", "👀", "🫡", "🙃", "🫠", "😨", "😧",
+    "😭", "😣", "🙇", "😞", "😡", "🫣", "🥳", "❓", "💃", "🙌", "💪", "🤸", "🏃", "🛌", "🦵",
+    // 143–156: hands
+    "👍", "👎", "🤞", "✌️", "👋", "🙏", "💪", "🫶", "👈", "👉", "🤘", "👌", "👊", "🫰",
+    // 157–201: animals, people, symbols, food, nature, things
+    "🐱", "🐶", "🎅", "👻", "🤡", "👽", "💩", "💰", "❤️", "💔", "🔥", "✨", "💧", "🎶", "🎵", "🎉", "🍎",
+    "🍌", "🥦", "🍞", "🍖", "🍔", "🍦", "🎂", "☕", "🥤", "🍺", "🌞", "⭐", "🌙", "🌸", "🪴", "🌲", "🌊",
+    "🗻", "🌍", "🚗", "🚑", "⚽", "🎤", "🎸", "🔨", "🕒", "✅", "❌",
+    // 202–211: digits (full-width: one code point, two columns)
+    "０", "１", "２", "３", "４", "５", "６", "７", "８", "９",
+];
+
+/// Unicode stand-in for a "LINE Basic Emoji" id (`"077"`…`"211"`).
+pub fn basic_emoji_glyph(emoji_id: &str) -> Option<&'static str> {
+    let n: usize = emoji_id.parse().ok()?;
+    BASIC_EMOJI_GLYPHS.get(n.checked_sub(77)?).copied()
 }
 
 /// One entry of `Message.reactions` (live shape: `{fromUserMid, atMillis, reactionType}`).
@@ -811,6 +854,18 @@ mod tests {
         assert_eq!(meta_only.reply_to(), Some("1"));
         let plain = msg(json!({"id": "5", "messageRelationType": 0}));
         assert_eq!((plain.reply_to(), plain.is_forwarded()), (None, false));
+    }
+
+    #[test]
+    fn contact_picture_falls_back_to_picture_status() {
+        let c: Contact = serde_json::from_value(json!({"mid":"U1","picturePath":"/0habc"})).unwrap();
+        assert_eq!(c.picture().as_deref(), Some("/0habc"));
+        let c: Contact =
+            serde_json::from_value(json!({"mid":"U1","picturePath":"","pictureStatus":"0hold"})).unwrap();
+        assert_eq!(c.picture().as_deref(), Some("/0hold"));
+        // Live shape for someone with no picture: an empty path, no status.
+        let c: Contact = serde_json::from_value(json!({"mid":"U1","picturePath":" "})).unwrap();
+        assert_eq!(c.picture(), None);
     }
 
     #[test]
@@ -953,6 +1008,36 @@ mod tests {
             rec(json!({"GC_EVT_TYPE": "X"})).outcome,
             CallOutcome::Other("X".into())
         );
+    }
+
+    #[test]
+    fn reaction_emoji() {
+        assert_eq!(ReactionKind::Predefined(2).emoji(), Some("👍"));
+        assert_eq!(ReactionKind::Predefined(99).emoji(), None);
+        let basic = |id: &str| ReactionKind::Paid {
+            product_id: BASIC_EMOJI_PACKAGE.into(),
+            emoji_id: id.into(),
+        };
+        // Checked against the CDN's pictures and alt texts.
+        for (id, glyph) in [
+            ("077", "🙂"),
+            ("099", "😰"),
+            ("143", "👍"),
+            ("165", "❤️"),
+            ("201", "❌"),
+            ("211", "９"),
+        ] {
+            assert_eq!(basic(id).emoji(), Some(glyph), "{id}");
+        }
+        // LINE characters, out of range, other packages: no stand-in.
+        for id in ["001", "076", "212", "x"] {
+            assert_eq!(basic(id).emoji(), None, "{id}");
+        }
+        let other = ReactionKind::Paid {
+            product_id: "5ac1bfd5040ab15980c9b435".into(),
+            emoji_id: "143".into(),
+        };
+        assert_eq!(other.emoji(), None);
     }
 
     #[test]

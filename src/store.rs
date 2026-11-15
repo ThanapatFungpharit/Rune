@@ -24,7 +24,9 @@
 //! owner-only permissions (0600) on Unix; protect it like `session.json`.
 //!
 //! [`Store::apply`] folds an [`Operation`] from the event stream into the
-//! store; call it for every operation, then [`Store::set_stream_revision`].
+//! store and records its revision as the stream position, atomically; call
+//! it for every operation (and [`Store::set_stream_revision`] for the
+//! `nextRevision` of `fullSync` control events).
 //!
 //! [`Client::operations`]: crate::Client::operations
 
@@ -101,7 +103,27 @@ CREATE TABLE IF NOT EXISTS read_marks (
     id_num INTEGER NOT NULL,
     PRIMARY KEY (chat, reader)
 );
+CREATE TABLE IF NOT EXISTS read_log (
+    chat TEXT NOT NULL,
+    reader TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    id_num INTEGER NOT NULL,
+    at INTEGER NOT NULL,
+    PRIMARY KEY (chat, reader, id_num)
+);
+CREATE TABLE IF NOT EXISTS pending_receipts (
+    chat TEXT PRIMARY KEY,
+    approved TEXT,
+    held TEXT
+);
 ";
+
+/// A chat's pending read receipt: (chat, approved, held); see
+/// [`Store::pending_receipts`].
+pub type PendingReceipt = (String, Option<String>, Option<String>);
+
+/// Read positions kept per reader and chat in `read_log` (the newest ones).
+const READ_LOG_PER_READER: i64 = 200;
 
 /// Schema 2's pins, keyed by account mid (only used while migrating from 1).
 const PINNED_SCHEMA_V2: &str = "
@@ -232,8 +254,19 @@ impl std::fmt::Debug for Store {
     }
 }
 
+/// Everything cached for the bound account (pins and settings are not).
+const ACCOUNT_DATA_WIPE: &str = "
+    DELETE FROM chats; DELETE FROM messages; DELETE FROM contacts; DELETE FROM read_marks; DELETE FROM read_log;
+    DELETE FROM users; DELETE FROM pending_receipts; DELETE FROM images;
+    DELETE FROM meta WHERE key = 'stream_rev' OR key LIKE 'cache.%';";
+
 fn db_err(e: rusqlite::Error) -> Error {
     Error::Protocol(format!("store: {e}"))
+}
+
+/// A JSON failure inside a database closure.
+fn json_err(e: serde_json::Error) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(e))
 }
 
 fn id_num(id: &str) -> i64 {
@@ -281,6 +314,9 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL").map_err(db_err)?;
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(db_err)?;
+        // Deleted rows hold private messages: overwrite them instead of
+        // leaving them readable in free pages (deletes are rare here).
+        conn.pragma_update(None, "secure_delete", "ON").map_err(db_err)?;
         Self::init(conn, Some(path.to_owned()))
     }
 
@@ -320,6 +356,16 @@ impl Store {
         tx.execute_batch(
             "DELETE FROM messages WHERE id_num < 0;
              DELETE FROM meta WHERE key = 'setting.import_dir';",
+        )
+        .map_err(db_err)?;
+        tx.execute(
+            "DELETE FROM read_log WHERE rowid IN (
+                 SELECT rowid FROM (
+                     SELECT rowid, ROW_NUMBER() OVER (PARTITION BY chat, reader ORDER BY id_num DESC) AS n
+                     FROM read_log
+                 ) WHERE n > ?1
+             )",
+            [READ_LOG_PER_READER],
         )
         .map_err(db_err)?;
         tx.execute(
@@ -586,12 +632,7 @@ impl Store {
             .map_err(db_err)?;
         let switched = old_owner.as_deref().is_some_and(|owner| owner != my_mid);
         if switched {
-            tx.execute_batch(
-                "DELETE FROM chats; DELETE FROM messages; DELETE FROM contacts; DELETE FROM read_marks;
-                 DELETE FROM users; DELETE FROM images;
-                 DELETE FROM meta WHERE key = 'stream_rev' OR key LIKE 'cache.%';",
-            )
-            .map_err(db_err)?;
+            tx.execute_batch(ACCOUNT_DATA_WIPE).map_err(db_err)?;
         }
         let now = now_ms();
         tx.execute(
@@ -612,23 +653,35 @@ impl Store {
         )
         .map_err(db_err)?;
         tx.commit().map_err(db_err)?;
+        if switched {
+            Self::flush_deleted(&conn);
+        }
         Ok(switched)
     }
 
     /// Delete the active pin profile's pins and all cached account data.
     /// Other pin profiles (of this or other accounts), their pins and
-    /// application settings are kept.
+    /// application settings are kept. All or nothing; afterwards the deleted
+    /// messages are gone from the file too (see [`Store::open`]).
     pub fn clear(&self) -> Result<()> {
         self.with(|c| {
-            let pin_profile = Self::current_pin_profile(c)?;
-            c.execute_batch(
-                "DELETE FROM chats; DELETE FROM messages; DELETE FROM contacts; DELETE FROM read_marks;
-                 DELETE FROM users; DELETE FROM images;
-                 DELETE FROM meta WHERE key = 'stream_rev' OR key LIKE 'cache.%';",
-            )?;
-            c.execute("DELETE FROM pinned_chats WHERE pin_profile = ?1", [pin_profile])?;
+            let tx = c.transaction()?;
+            let pin_profile = Self::current_pin_profile(&tx)?;
+            tx.execute_batch(ACCOUNT_DATA_WIPE)?;
+            tx.execute("DELETE FROM pinned_chats WHERE pin_profile = ?1", [pin_profile])?;
+            tx.commit()?;
+            Self::flush_deleted(c);
             Ok(())
         })
+    }
+
+    /// Move committed changes from the write-ahead log into the database and
+    /// empty the log, so deleted rows (zeroed by `secure_delete`) leave no
+    /// copy behind. Best effort: a busy reader only delays it.
+    fn flush_deleted(c: &Connection) {
+        if let Err(e) = c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())) {
+            tracing::debug!("store: checkpoint after delete failed: {e}");
+        }
     }
 
     // -- key/value -------------------------------------------------------------------
@@ -732,10 +785,21 @@ impl Store {
 
     /// Record the stream position. Never moves backwards.
     pub fn set_stream_revision(&self, rev: i64) -> Result<()> {
-        if rev <= 0 || self.stream_revision()?.is_some_and(|cur| cur >= rev) {
+        self.with(|c| Self::set_stream_revision_in(c, rev))
+    }
+
+    fn set_stream_revision_in(c: &Connection, rev: i64) -> rusqlite::Result<()> {
+        if rev <= 0 {
             return Ok(());
         }
-        self.set("stream_rev", &rev.to_string())
+        // Compared as numbers in SQL: never moves backwards.
+        c.execute(
+            "INSERT INTO meta (key, value) VALUES ('stream_rev', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value
+             WHERE CAST(meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)",
+            [rev.to_string()],
+        )
+        .map(drop)
     }
 
     // -- chats -----------------------------------------------------------------------
@@ -1050,49 +1114,62 @@ impl Store {
     }
 
     pub fn chat(&self, mid: &str) -> Result<Option<ChatRow>> {
-        self.with(|c| {
-            c.query_row(
-                &format!("SELECT {} FROM chats WHERE mid = ?1", Self::CHAT_COLS),
-                [mid],
-                Self::chat_from_row,
-            )
-            .optional()
-        })
+        self.with(|c| Self::chat_in(c, mid))
+    }
+
+    fn chat_in(c: &Connection, mid: &str) -> rusqlite::Result<Option<ChatRow>> {
+        c.query_row(
+            &format!("SELECT {} FROM chats WHERE mid = ?1", Self::CHAT_COLS),
+            [mid],
+            Self::chat_from_row,
+        )
+        .optional()
     }
 
     /// Insert or replace a chat row.
     pub fn upsert_chat(&self, ch: &ChatRow) -> Result<()> {
-        self.with(|c| {
-            c.execute(
-                &format!(
-                    "INSERT OR REPLACE INTO chats ({}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                    Self::CHAT_COLS
-                ),
-                params![
-                    ch.mid,
-                    ch.name,
-                    ch.picture,
-                    ch.preview,
-                    ch.last_message_id,
-                    ch.last_time,
-                    ch.unread,
-                    ch.invited,
-                    ch.muted,
-                    ch.last_seen
-                ],
-            )
-            .map(drop)
-        })
+        self.with(|c| Self::upsert_chat_in(c, ch))
+    }
+
+    fn upsert_chat_in(c: &Connection, ch: &ChatRow) -> rusqlite::Result<()> {
+        c.execute(
+            &format!(
+                "INSERT OR REPLACE INTO chats ({}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                Self::CHAT_COLS
+            ),
+            params![
+                ch.mid,
+                ch.name,
+                ch.picture,
+                ch.preview,
+                ch.last_message_id,
+                ch.last_time,
+                ch.unread,
+                ch.invited,
+                ch.muted,
+                ch.last_seen
+            ],
+        )
+        .map(drop)
     }
 
     /// Update `mid` with `f` (starting from an empty row when unknown).
     pub fn update_chat(&self, mid: &str, f: impl FnOnce(&mut ChatRow)) -> Result<ChatRow> {
-        let mut row = self.chat(mid)?.unwrap_or_else(|| ChatRow {
+        self.with(|c| {
+            let tx = c.transaction()?;
+            let row = Self::update_chat_in(&tx, mid, f)?;
+            tx.commit()?;
+            Ok(row)
+        })
+    }
+
+    fn update_chat_in(c: &Connection, mid: &str, f: impl FnOnce(&mut ChatRow)) -> rusqlite::Result<ChatRow> {
+        let mut row = Self::chat_in(c, mid)?.unwrap_or_else(|| ChatRow {
             mid: mid.to_owned(),
             ..Default::default()
         });
         f(&mut row);
-        self.upsert_chat(&row)?;
+        Self::upsert_chat_in(c, &row)?;
         Ok(row)
     }
 
@@ -1114,28 +1191,35 @@ impl Store {
     pub fn delete_chat(&self, mid: &str) -> Result<()> {
         self.with(|c| {
             let tx = c.transaction()?;
-            // The chat is gone for the account: unpin it from all its pin profiles.
-            let account = Self::active_profile(&tx)?;
-            let holders: Vec<i64> = {
-                let mut st = tx.prepare(
-                    "SELECT pin_profile FROM pinned_chats WHERE mid = ?2
-                     AND pin_profile IN (SELECT id FROM pin_profiles WHERE account = ?1)",
-                )?;
-                st.query_map(params![account, mid], |r| r.get(0))?
-                    .collect::<rusqlite::Result<_>>()?
-            };
-            tx.execute("DELETE FROM chats WHERE mid = ?1", [mid])?;
-            for profile in holders {
-                tx.execute(
-                    "DELETE FROM pinned_chats WHERE pin_profile = ?1 AND mid = ?2",
-                    params![profile, mid],
-                )?;
-                Self::renumber_pins(&tx, profile)?;
-            }
-            tx.execute("DELETE FROM messages WHERE chat = ?1", [mid])?;
-            tx.execute("DELETE FROM read_marks WHERE chat = ?1", [mid])?;
+            Self::delete_chat_in(&tx, mid)?;
             tx.commit()
         })
+    }
+
+    fn delete_chat_in(c: &Connection, mid: &str) -> rusqlite::Result<()> {
+        // The chat is gone for the account: unpin it from all its pin profiles.
+        let account = Self::active_profile(c)?;
+        let holders: Vec<i64> = {
+            let mut st = c.prepare(
+                "SELECT pin_profile FROM pinned_chats WHERE mid = ?2
+                 AND pin_profile IN (SELECT id FROM pin_profiles WHERE account = ?1)",
+            )?;
+            st.query_map(params![account, mid], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        c.execute("DELETE FROM chats WHERE mid = ?1", [mid])?;
+        for profile in holders {
+            c.execute(
+                "DELETE FROM pinned_chats WHERE pin_profile = ?1 AND mid = ?2",
+                params![profile, mid],
+            )?;
+            Self::renumber_pins(c, profile)?;
+        }
+        c.execute("DELETE FROM messages WHERE chat = ?1", [mid])?;
+        c.execute("DELETE FROM read_marks WHERE chat = ?1", [mid])?;
+        c.execute("DELETE FROM read_log WHERE chat = ?1", [mid])?;
+        c.execute("DELETE FROM pending_receipts WHERE chat = ?1", [mid])?;
+        Ok(())
     }
 
     /// Drop a chat's stored messages (keeps the chat).
@@ -1160,52 +1244,64 @@ impl Store {
 
     /// Store several messages of one chat in a transaction; returns how many were new.
     pub fn put_messages(&self, chat: &str, msgs: &[Message], e2ee_error: Option<&str>) -> Result<usize> {
-        let rows: Vec<(&Message, String)> = msgs
-            .iter()
-            .filter(|m| !m.id.is_empty())
-            .map(|m| Ok((m, serde_json::to_string(m)?)))
-            .collect::<Result<_>>()?;
+        let rows = Self::message_rows(msgs)?;
         self.with(|c| {
             let tx = c.transaction()?;
-            let mut new = 0;
-            {
-                let mut stored = tx.prepare("SELECT json FROM messages WHERE id = ?1")?;
-                let mut st = tx.prepare(
-                    "INSERT INTO messages (id, id_num, chat, sender, time, content_type, json, e2ee_error)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                     ON CONFLICT(id) DO UPDATE SET json = excluded.json,
-                         e2ee_error = excluded.e2ee_error, content_type = excluded.content_type",
-                )?;
-                for (m, json) in &rows {
-                    let old: Option<String> = stored.query_row([&m.id], |r| r.get(0)).optional()?;
-                    if old.is_none() {
-                        new += 1;
-                    }
-                    let kept = old
-                        .filter(|_| m.is_e2ee())
-                        .and_then(|old| keep_decrypted(&old, m))
-                        .transpose()
-                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-                    let (json, e2ee_error) = match &kept {
-                        Some(decrypted) => (decrypted, None),
-                        None => (json, e2ee_error),
-                    };
-                    let time = m.created_time.unwrap_or_else(now_ms);
-                    st.execute(params![
-                        m.id,
-                        id_num(&m.id),
-                        chat,
-                        m.from,
-                        time,
-                        m.content_type,
-                        json,
-                        e2ee_error
-                    ])?;
-                }
-            }
+            let new = Self::put_messages_in(&tx, chat, &rows, e2ee_error)?;
             tx.commit()?;
             Ok(new)
         })
+    }
+
+    /// The messages worth storing (they have an id) with their JSON.
+    fn message_rows(msgs: &[Message]) -> Result<Vec<(&Message, String)>> {
+        msgs.iter()
+            .filter(|m| !m.id.is_empty())
+            .map(|m| Ok((m, serde_json::to_string(m)?)))
+            .collect()
+    }
+
+    fn put_messages_in(
+        c: &Connection,
+        chat: &str,
+        rows: &[(&Message, String)],
+        e2ee_error: Option<&str>,
+    ) -> rusqlite::Result<usize> {
+        let mut new = 0;
+        let mut stored = c.prepare_cached("SELECT json FROM messages WHERE id = ?1")?;
+        let mut st = c.prepare_cached(
+            "INSERT INTO messages (id, id_num, chat, sender, time, content_type, json, e2ee_error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET json = excluded.json,
+                 e2ee_error = excluded.e2ee_error, content_type = excluded.content_type",
+        )?;
+        for (m, json) in rows {
+            let old: Option<String> = stored.query_row([&m.id], |r| r.get(0)).optional()?;
+            if old.is_none() {
+                new += 1;
+            }
+            let kept = old
+                .filter(|_| m.is_e2ee())
+                .and_then(|old| keep_decrypted(&old, m))
+                .transpose()
+                .map_err(json_err)?;
+            let (json, e2ee_error) = match &kept {
+                Some(decrypted) => (decrypted, None),
+                None => (json, e2ee_error),
+            };
+            let time = m.created_time.unwrap_or_else(now_ms);
+            st.execute(params![
+                m.id,
+                id_num(&m.id),
+                chat,
+                m.from,
+                time,
+                m.content_type,
+                json,
+                e2ee_error
+            ])?;
+        }
+        Ok(new)
     }
 
     fn message_from_row(r: &rusqlite::Row) -> rusqlite::Result<(String, Option<String>, bool)> {
@@ -1358,11 +1454,13 @@ impl Store {
 
     /// Mark a message as unsent; returns its chat if it was stored.
     pub fn mark_unsent(&self, id: &str) -> Result<Option<String>> {
-        self.with(|c| {
-            c.execute("UPDATE messages SET unsent = 1 WHERE id = ?1", [id])?;
-            c.query_row("SELECT chat FROM messages WHERE id = ?1", [id], |r| r.get(0))
-                .optional()
-        })
+        self.with(|c| Self::mark_unsent_in(c, id))
+    }
+
+    fn mark_unsent_in(c: &Connection, id: &str) -> rusqlite::Result<Option<String>> {
+        c.execute("UPDATE messages SET unsent = 1 WHERE id = ?1", [id])?;
+        c.query_row("SELECT chat FROM messages WHERE id = ?1", [id], |r| r.get(0))
+            .optional()
     }
 
     /// Record `from`'s reaction (`None` removes it). Returns the updated
@@ -1374,23 +1472,42 @@ impl Store {
         kind: Option<ReactionKind>,
         at: i64,
     ) -> Result<Option<Message>> {
-        let Some(mut sm) = self.message(message_id)? else {
+        self.with(|c| {
+            let tx = c.transaction()?;
+            let m = Self::set_reaction_in(&tx, message_id, from, kind, at)?;
+            tx.commit()?;
+            Ok(m)
+        })
+    }
+
+    fn set_reaction_in(
+        c: &Connection,
+        message_id: &str,
+        from: &str,
+        kind: Option<ReactionKind>,
+        at: i64,
+    ) -> rusqlite::Result<Option<Message>> {
+        let json: Option<String> = c
+            .query_row("SELECT json FROM messages WHERE id = ?1", [message_id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let Some(json) = json else {
             return Ok(None);
         };
-        let mut r = sm.message.reactions();
+        let mut message: Message = serde_json::from_str(&json).map_err(json_err)?;
+        let mut r = message.reactions();
         apply_reaction(&mut r, from, kind, at);
-        sm.message.extra.insert(
+        message.extra.insert(
             "reactions".into(),
             serde_json::Value::Array(r.iter().map(|x| x.to_json()).collect()),
         );
-        let json = serde_json::to_string(&sm.message)?;
-        self.with(|c| {
-            c.execute(
-                "UPDATE messages SET json = ?2 WHERE id = ?1",
-                params![message_id, json],
-            )
-        })?;
-        Ok(Some(sm.message))
+        let json = serde_json::to_string(&message).map_err(json_err)?;
+        c.execute(
+            "UPDATE messages SET json = ?2 WHERE id = ?1",
+            params![message_id, json],
+        )?;
+        Ok(Some(message))
     }
 
     /// Stickers seen in any chat, most recent first, without duplicates.
@@ -1425,16 +1542,56 @@ impl Store {
 
     // -- read marks ------------------------------------------------------------------
 
-    /// `reader` has read `chat` up to `message_id` (kept only if newer).
-    pub fn set_read_mark(&self, chat: &str, reader: &str, message_id: &str) -> Result<()> {
-        self.with(|c| {
+    /// `reader` has read `chat` up to `message_id` (kept only if newer), at
+    /// `at` (epoch ms) if known: the time goes into the read log, which
+    /// [`Store::read_times`] answers from.
+    pub fn set_read_mark(&self, chat: &str, reader: &str, message_id: &str, at: Option<i64>) -> Result<()> {
+        self.with(|c| Self::set_read_mark_in(c, chat, reader, message_id, at))
+    }
+
+    fn set_read_mark_in(
+        c: &Connection,
+        chat: &str,
+        reader: &str,
+        message_id: &str,
+        at: Option<i64>,
+    ) -> rusqlite::Result<()> {
+        let num = id_num(message_id);
+        c.execute(
+            "INSERT INTO read_marks (chat, reader, message_id, id_num) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(chat, reader) DO UPDATE SET message_id = excluded.message_id,
+                 id_num = excluded.id_num WHERE excluded.id_num > read_marks.id_num",
+            params![chat, reader, message_id, num],
+        )?;
+        if let Some(at) = at {
+            // The same position reported again (another device, a replay)
+            // keeps its first time.
             c.execute(
-                "INSERT INTO read_marks (chat, reader, message_id, id_num) VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(chat, reader) DO UPDATE SET message_id = excluded.message_id,
-                     id_num = excluded.id_num WHERE excluded.id_num > read_marks.id_num",
-                params![chat, reader, message_id, id_num(message_id)],
-            )
-            .map(drop)
+                "INSERT INTO read_log (chat, reader, message_id, id_num, at) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(chat, reader, id_num) DO UPDATE SET at = MIN(at, excluded.at)",
+                params![chat, reader, message_id, num, at],
+            )?;
+            // Bounded while running too, not only at the next open: a busy
+            // group adds a position per reader per message read.
+            c.execute(
+                "DELETE FROM read_log WHERE chat = ?1 AND reader = ?2 AND id_num < (
+                     SELECT id_num FROM read_log WHERE chat = ?1 AND reader = ?2
+                     ORDER BY id_num DESC LIMIT 1 OFFSET ?3)",
+                params![chat, reader, READ_LOG_PER_READER - 1],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Reader → when they first read `chat` as far as `message_id` (epoch ms),
+    /// for readers whose read receipts covering it were logged.
+    pub fn read_times(&self, chat: &str, message_id: &str) -> Result<HashMap<String, i64>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT reader, MIN(at) FROM read_log WHERE chat = ?1 AND id_num >= ?2 GROUP BY reader",
+            )?;
+            st.query_map(params![chat, id_num(message_id)], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect()
         })
     }
 
@@ -1443,6 +1600,32 @@ impl Store {
         self.with(|c| {
             let mut st = c.prepare("SELECT reader, message_id FROM read_marks WHERE chat = ?1")?;
             st.query_map([chat], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
+        })
+    }
+
+    /// Read receipts not acknowledged yet: (chat, approved, held) — read
+    /// with receipts on and still to be sent, read with them off and held.
+    pub fn pending_receipts(&self) -> Result<Vec<PendingReceipt>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT chat, approved, held FROM pending_receipts ORDER BY chat")?;
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect()
+        })
+    }
+
+    /// Store a chat's pending read receipt; both `None` removes it.
+    pub fn set_pending_receipt(&self, chat: &str, approved: Option<&str>, held: Option<&str>) -> Result<()> {
+        self.with(|c| {
+            if approved.is_none() && held.is_none() {
+                c.execute("DELETE FROM pending_receipts WHERE chat = ?1", [chat])?;
+            } else {
+                c.execute(
+                    "INSERT INTO pending_receipts (chat, approved, held) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(chat) DO UPDATE SET approved = excluded.approved, held = excluded.held",
+                    params![chat, approved, held],
+                )?;
+            }
+            Ok(())
         })
     }
 
@@ -1595,29 +1778,52 @@ impl Store {
 
     // -- sync ------------------------------------------------------------------------
 
-    /// Fold one operation into the store and advance the stream position.
+    /// Fold one operation into the store and advance the stream position,
+    /// all in one transaction: an interrupted run leaves either everything
+    /// or nothing of the operation behind, and replaying it is harmless.
     ///
     /// `preview` turns a message into its chat-list summary. Messages from
     /// others raise the chat's unread count; reading on any device clears it.
     pub fn apply(&self, op: &Operation, my_mid: &str, preview: impl Fn(&Message) -> String) -> Result<()> {
-        match op.event() {
+        let event = op.event();
+        let rows = match &event {
+            OpEvent::Message(m) => Self::message_rows(std::slice::from_ref(*m))?,
+            _ => Vec::new(),
+        };
+        self.with(|c| {
+            let tx = c.transaction()?;
+            Self::apply_in(&tx, &event, &rows, op, my_mid, preview)?;
+            Self::set_stream_revision_in(&tx, op.revision)?;
+            tx.commit()
+        })
+    }
+
+    fn apply_in(
+        c: &Connection,
+        event: &OpEvent,
+        rows: &[(&Message, String)],
+        op: &Operation,
+        my_mid: &str,
+        preview: impl Fn(&Message) -> String,
+    ) -> rusqlite::Result<()> {
+        match *event {
             OpEvent::Message(m) => {
                 let chat = m.chat_mid(my_mid).to_owned();
                 let err = op.e2ee_error.as_ref().map(|e| e.detail.as_str());
-                if self.put_message(&chat, m, err)? {
+                if Self::put_messages_in(c, &chat, rows, err)? == 1 {
                     let mine = m.from == my_mid;
                     let time = m.created_time.unwrap_or_else(now_ms);
-                    self.update_chat(&chat, |c| {
-                        if time >= c.last_time {
-                            c.last_time = time;
-                            c.last_message_id = Some(m.id.clone());
-                            c.preview = preview(m);
+                    Self::update_chat_in(c, &chat, |row| {
+                        if time >= row.last_time {
+                            row.last_time = time;
+                            row.last_message_id = Some(m.id.clone());
+                            row.preview = preview(m);
                         }
                         if mine {
-                            c.unread = 0;
-                            c.last_seen = Some(m.id.clone());
+                            row.unread = 0;
+                            row.last_seen = Some(m.id.clone());
                         } else {
-                            c.unread += 1;
+                            row.unread += 1;
                         }
                     })?;
                 }
@@ -1626,45 +1832,45 @@ impl Store {
                 chat,
                 reader,
                 message_id,
-            } => self.set_read_mark(chat, reader, message_id)?,
+            } => Self::set_read_mark_in(c, chat, reader, message_id, op.created_time())?,
             OpEvent::ChatChecked { chat, message_id } => {
-                if self.chat(chat)?.is_some() {
-                    self.update_chat(chat, |c| {
-                        let newest = c
+                if Self::chat_in(c, chat)?.is_some() {
+                    Self::update_chat_in(c, chat, |row| {
+                        let newest = row
                             .last_message_id
                             .as_deref()
                             .is_none_or(|l| message_id_cmp(message_id, l).is_ge());
                         if newest {
-                            c.unread = 0;
+                            row.unread = 0;
                         }
-                        c.last_seen = Some(message_id.to_owned());
+                        row.last_seen = Some(message_id.to_owned());
                     })?;
                 }
             }
             OpEvent::Unsent { message_id, .. } => {
-                self.mark_unsent(message_id)?;
+                Self::mark_unsent_in(c, message_id)?;
             }
             OpEvent::Reaction {
                 message_id,
                 from,
-                reaction,
+                ref reaction,
                 ..
             } => {
-                self.set_reaction(message_id, from, reaction, now_ms())?;
+                Self::set_reaction_in(c, message_id, from, reaction.clone(), now_ms())?;
             }
-            OpEvent::LeftChat { chat } => self.delete_chat(chat)?,
+            OpEvent::LeftChat { chat } => Self::delete_chat_in(c, chat)?,
             OpEvent::InvitationAnswered { chat, accepted } => {
                 if accepted {
-                    if self.chat(chat)?.is_some() {
-                        self.update_chat(chat, |c| c.invited = false)?;
+                    if Self::chat_in(c, chat)?.is_some() {
+                        Self::update_chat_in(c, chat, |row| row.invited = false)?;
                     }
                 } else {
-                    self.delete_chat(chat)?;
+                    Self::delete_chat_in(c, chat)?;
                 }
             }
             _ => {}
         }
-        self.set_stream_revision(op.revision)
+        Ok(())
     }
 }
 
@@ -1884,6 +2090,76 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("rune-{tag}-{}-{unique}.db", std::process::id()))
+    }
+
+    #[test]
+    fn an_interrupted_apply_leaves_nothing_behind_and_replays_in_full() {
+        let s = Store::open_in_memory().unwrap();
+        s.bind_account("Ume").unwrap();
+        s.set_stream_revision(10).unwrap();
+        let incoming = op(
+            11,
+            json!({"type": 26, "message": msg("100", "Ua", "Ume", 1000, "hello")}),
+        );
+        // The chat-list update fails half-way through the operation.
+        s.with(|c| {
+            c.execute_batch(
+                "CREATE TRIGGER fail BEFORE INSERT ON chats BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+        })
+        .unwrap();
+        assert!(s.apply(&incoming, "Ume", preview).is_err());
+        assert!(!s.has_message("100").unwrap(), "the message must roll back too");
+        assert_eq!(s.stream_revision().unwrap(), Some(10), "not marked as processed");
+        // Replayed once the problem is gone: counted as new, with its chat row.
+        s.with(|c| c.execute_batch("DROP TRIGGER fail;")).unwrap();
+        s.apply(&incoming, "Ume", preview).unwrap();
+        let chat = s.chat("Ua").unwrap().unwrap();
+        assert_eq!((chat.unread, chat.preview.as_str()), (1, "hello"));
+        assert_eq!(s.stream_revision().unwrap(), Some(11));
+        // Replaying it again changes nothing.
+        s.apply(&incoming, "Ume", preview).unwrap();
+        assert_eq!(s.chat("Ua").unwrap().unwrap().unread, 1);
+    }
+
+    #[test]
+    fn stream_revision_never_moves_backwards() {
+        let s = Store::open_in_memory().unwrap();
+        s.set_stream_revision(9).unwrap();
+        s.set_stream_revision(100).unwrap();
+        s.set_stream_revision(99).unwrap();
+        s.set_stream_revision(0).unwrap();
+        assert_eq!(s.stream_revision().unwrap(), Some(100));
+    }
+
+    #[test]
+    fn cleared_messages_are_gone_from_the_file() {
+        let path = temp_db("wipe");
+        let s = Store::open(&path).unwrap();
+        s.bind_account("Ume").unwrap();
+        let marker = "SECRET-MARKER-7f3a";
+        let msgs: Vec<Message> = (0..200)
+            .map(|i| msg(&i.to_string(), "Ua", "Ume", i, &format!("{marker} {i}")))
+            .collect();
+        s.put_messages("Ua", &msgs, None).unwrap();
+        s.clear().unwrap();
+        assert_eq!(s.message_count("Ua").unwrap(), 0);
+        let on_disk = |p: &Path| std::fs::read(p).unwrap_or_default();
+        let wal = PathBuf::from(format!("{}-wal", path.display()));
+        for bytes in [on_disk(&path), on_disk(&wal)] {
+            assert!(
+                !bytes.windows(marker.len()).any(|w| w == marker.as_bytes()),
+                "deleted message text is still in the file"
+            );
+        }
+        drop(s);
+        for p in [
+            path.clone(),
+            wal,
+            PathBuf::from(format!("{}-shm", path.display())),
+        ] {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     #[test]
@@ -2314,5 +2590,117 @@ mod tests {
             s.recent_stickers(10).unwrap(),
             [("11537".into(), "a".into(), 2), ("11537".into(), "b".into(), 2)]
         );
+    }
+
+    #[test]
+    fn read_times_keep_the_first_read_of_each_message() {
+        let s = Store::open_in_memory().unwrap();
+        let read = |rev: i64, reader: &str, id: &str, at: &str| {
+            s.apply(
+                &op(
+                    rev,
+                    json!({"type": 55, "param1": "Cg", "param2": reader, "param3": id, "createdTime": at}),
+                ),
+                "Ume",
+                preview,
+            )
+            .unwrap()
+        };
+        read(1, "Ua", "100", "1000");
+        read(2, "Ua", "100", "1500"); // same position again (another device)
+        read(3, "Ua", "300", "3000");
+        read(4, "Ub", "300", "3500");
+        // Without a time: the mark moves, the log does not.
+        s.apply(
+            &op(
+                5,
+                json!({"type": 55, "param1": "Cg", "param2": "Uc", "param3": "300"}),
+            ),
+            "Ume",
+            preview,
+        )
+        .unwrap();
+        assert_eq!(s.read_marks("Cg").unwrap()["Uc"], "300");
+        let t = s.read_times("Cg", "100").unwrap();
+        assert_eq!((t["Ua"], t["Ub"], t.get("Uc")), (1000, 3500, None));
+        let t = s.read_times("Cg", "200").unwrap();
+        assert_eq!((t["Ua"], t["Ub"]), (3000, 3500), "a later read covers it");
+        assert!(s.read_times("Cg", "301").unwrap().is_empty());
+
+        s.delete_chat("Cg").unwrap();
+        assert!(s.read_times("Cg", "100").unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_log_is_pruned_per_reader() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rune-readlog-{}-{unique}.db", std::process::id()));
+        {
+            let s = Store::open(&path).unwrap();
+            for i in 1..=READ_LOG_PER_READER + 5 {
+                s.set_read_mark("Cg", "Ua", &i.to_string(), Some(i)).unwrap();
+            }
+            s.set_read_mark("Cg", "Ub", "1", Some(1)).unwrap();
+            let t = s.read_times("Cg", "1").unwrap();
+            assert_eq!(t["Ua"], 6, "kept to the newest positions while running");
+            let kept: i64 = s
+                .with(|c| {
+                    c.query_row("SELECT COUNT(*) FROM read_log WHERE reader = 'Ua'", [], |r| {
+                        r.get(0)
+                    })
+                })
+                .unwrap();
+            assert_eq!(kept, READ_LOG_PER_READER);
+        }
+        let s = Store::open(&path).unwrap();
+        let t = s.read_times("Cg", "1").unwrap();
+        assert_eq!(t["Ua"], 6, "the oldest positions are dropped on open");
+        assert_eq!(t["Ub"], 1, "other readers keep theirs");
+        drop(s);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn pending_receipts_survive_a_restart_and_go_with_the_chat() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rune-receipts-{}-{unique}.db", std::process::id()));
+        {
+            let s = Store::open(&path).unwrap();
+            s.bind_account("UA").unwrap();
+            s.set_pending_receipt("Ca", Some("10"), None).unwrap();
+            s.set_pending_receipt("Cb", None, Some("20")).unwrap();
+            s.set_pending_receipt("Cc", Some("30"), Some("31")).unwrap();
+            s.set_pending_receipt("Cc", Some("31"), None).unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.pending_receipts().unwrap(),
+            vec![
+                ("Ca".into(), Some("10".into()), None),
+                ("Cb".into(), None, Some("20".into())),
+                ("Cc".into(), Some("31".into()), None),
+            ]
+        );
+        s.set_pending_receipt("Ca", None, None).unwrap();
+        s.delete_chat("Cb").unwrap();
+        assert_eq!(s.pending_receipts().unwrap().len(), 1);
+        // Another account's receipts are never sent from this one.
+        assert!(s.bind_account("UB").unwrap());
+        assert!(s.pending_receipts().unwrap().is_empty());
+        s.set_pending_receipt("Cd", Some("1"), None).unwrap();
+        s.clear().unwrap();
+        assert!(s.pending_receipts().unwrap().is_empty());
+        drop(s);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 }
