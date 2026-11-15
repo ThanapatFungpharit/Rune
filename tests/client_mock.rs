@@ -649,3 +649,171 @@ async fn owned_stickers_and_read_ranges() {
         ("Ua", "12", 120)
     );
 }
+
+fn sse(body: &'static str) -> ResponseTemplate {
+    ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_string(body)
+}
+
+async fn stream_opens(server: &MockServer) -> usize {
+    let requests = server.received_requests().await.unwrap();
+    requests
+        .iter()
+        .filter(|r| r.url.path() == "/api/operation/receive")
+        .count()
+}
+
+#[tokio::test]
+async fn unproductive_stream_connections_back_off() {
+    let server = MockServer::start().await;
+    // Accepted, then closed at once without a single event.
+    Mock::given(method("GET"))
+        .and(path("/api/operation/receive"))
+        .respond_with(sse(""))
+        .mount(&server)
+        .await;
+    let client = logged_in(&server);
+    let mut ops = client.operations(Some(100));
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(1500), ops.next_event()).await;
+    // At 0 s, then after 1 s of backoff (the next one would wait 2 s more).
+    let opened = stream_opens(&server).await;
+    assert!((1..=3).contains(&opened), "opened {opened} times in 1.5 s");
+}
+
+#[tokio::test]
+async fn stream_survives_a_failed_token_refresh() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/operation/receive"))
+        .respond_with(sse("event: talkException\ndata: {\"code\":119}\n\n"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/operation/receive"))
+        .respond_with(sse(
+            "data: [{\"revision\":\"101\",\"type\":55,\"param1\":\"c1\"}]\n\n",
+        ))
+        .mount(&server)
+        .await;
+    // The refresh hits a server error: retrying later may help, so the stream goes on.
+    Mock::given(path("/api/auth/tokenRefresh"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let client = logged_in(&server);
+    let mut ops = client.operations(Some(100));
+    let op = tokio::time::timeout(std::time::Duration::from_secs(10), ops.next_operation())
+        .await
+        .expect("no hang")
+        .expect("the stream must not stop on a transient refresh failure");
+    assert_eq!(op.revision, 101);
+}
+
+#[tokio::test]
+async fn an_operation_that_stops_the_stream_is_delivered_again_on_resume() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/operation/receive"))
+        .respond_with(sse(concat!(
+            "data: [{\"revision\":\"101\",\"type\":55,\"param1\":\"c1\"},",
+            "{\"revision\":\"102\",\"type\":26,\"message\":{\"id\":\"5\",\"from\":\"uA\",\"to\":\"uB\",",
+            "\"contentType\":0,\"chunks\":[\"AAAA\",\"AAAA\",\"AAAA\"]}}]\n\n"
+        )))
+        .mount(&server)
+        .await;
+    // Logged in without our mid: decrypting 102 fails with a session error.
+    let tokens = Tokens {
+        access_token: Some("ACCESS-1".into()),
+        ..Default::default()
+    };
+    let client = Client::with_tokens(config(&server), tokens).unwrap();
+    let mut ops = client.operations(Some(100));
+    ops.decrypt = true;
+    let err = ops.next_event().await.unwrap_err();
+    assert!(matches!(err, Error::LoginRequired), "{err:?}");
+    assert_eq!(ops.local_rev, Some(101), "102 was not delivered");
+    // 101 was handled before the error and is still delivered.
+    assert!(matches!(ops.next_event().await, Ok(rune::Event::Operation(op)) if op.revision == 101));
+}
+
+#[tokio::test]
+async fn refresh_retries_end_even_when_the_policy_never_backs_off() {
+    let server = MockServer::start().await;
+    Mock::given(path("/api/auth/tokenRefresh"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_json(json!({"code": 10202, "message": "AUTH_RETRY_REQUIRED"})),
+        )
+        .mount(&server)
+        .await;
+    let tokens = Tokens {
+        access_token: Some("ACCESS-1".into()),
+        refresh_token: Some("REFRESH-1".into()),
+        refresh_api_retry_policy: serde_json::from_value(json!({
+            "initialDelayInMillis": 0, "maxDelayInMillis": 1000, "multiplier": 1, "jitterRate": 0
+        }))
+        .ok(),
+        ..Default::default()
+    };
+    let client = Client::with_tokens(config(&server), tokens).unwrap();
+    let res = tokio::time::timeout(std::time::Duration::from_secs(10), client.refresh_token())
+        .await
+        .expect("gives up instead of retrying forever");
+    assert!(matches!(res, Err(Error::Reauth(_))), "{res:?}");
+}
+
+#[tokio::test]
+async fn token_refresher_does_not_spin_on_an_already_due_token() {
+    let server = MockServer::start().await;
+    // LINE's clock is behind ours: every new token already looks due.
+    Mock::given(path("/api/auth/tokenRefresh"))
+        .respond_with(ok(json!({"tokenV3IssueResult": {
+            "accessToken": "ACCESS-2", "refreshToken": "REFRESH-2",
+            "tokenIssueTimeEpochSec": (now_sec() - 7200).to_string(), "durationUntilRefreshInSec": "3600"}})))
+        .mount(&server)
+        .await;
+    let tokens = Tokens {
+        access_token: Some("ACCESS-1".into()),
+        refresh_token: Some("REFRESH-1".into()),
+        token_issue_time_epoch_sec: Some(now_sec() - 7200),
+        duration_until_refresh_in_sec: Some(3600),
+        ..Default::default()
+    };
+    let client = Client::with_tokens(config(&server), tokens).unwrap();
+    let task = client.spawn_token_refresher();
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    task.abort();
+    let n = server.received_requests().await.unwrap().len();
+    assert_eq!(n, 1, "refreshed {n} times in a second");
+}
+
+#[tokio::test]
+async fn a_failed_qr_login_frees_its_key() {
+    let server = MockServer::start().await;
+    let svc = "/api/talk/thrift/LoginQrCode/SecondaryQrCodeLoginService";
+    let notice = "/api/talk/thrift/LoginQrCode/SecondaryQrCodeLoginPermitNoticeService";
+    Mock::given(path(format!("{svc}/createSession")))
+        .respond_with(ok(json!({"authSessionId": "S1"})))
+        .mount(&server)
+        .await;
+    Mock::given(path(format!("{svc}/createQrCode")))
+        .respond_with(ok(json!({"callbackUrl": "https://line.me/R/au/lgn/sq/S1",
+                                 "longPollingIntervalSec": 1, "longPollingMaxCount": 1})))
+        .mount(&server)
+        .await;
+    // The scan is refused (not a 410 "poll again").
+    Mock::given(path(format!("{notice}/checkQrCodeVerified")))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({"code": 10051, "data": {"code": 20}})))
+        .mount(&server)
+        .await;
+    let client = Client::new(config(&server)).unwrap();
+    let opts = QrLoginOptions {
+        wait: std::time::Duration::from_secs(1),
+        ..Default::default()
+    };
+    let err = client.qr_login(opts, |_| {}).await.unwrap_err();
+    assert!(err.api().is_some(), "{err:?}");
+    assert!(client.with_ltsm(|l| format!("{l:?}")).contains("keys: 0"));
+}

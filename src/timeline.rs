@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::client::Client;
-use crate::error::{ApiError, Error, Result};
+use crate::error::{ApiError, Error, Result, talk_code};
 use crate::models::{MidType, value_i64};
 
 /// The timeline channel the extension issues its channel token for.
@@ -167,7 +167,8 @@ impl Client {
             let text = resp.text().await?;
             match crate::transport::decode(&full, status, &text) {
                 Ok(v) => return Ok(v),
-                Err(e) if e.must_refresh_token() && !refreshed => {
+                // `ApiError::must_refresh_token` only looks at talk paths.
+                Err(e) if e.talk_code == Some(talk_code::MUST_REFRESH_V3_TOKEN) && !refreshed => {
                     refreshed = true;
                     self.refresh_token().await?;
                 }

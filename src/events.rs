@@ -115,6 +115,8 @@ pub struct OperationStream {
     queue: VecDeque<Event>,
     failures: u32,
     got_event: bool,
+    /// Wait this long before reopening (set when a connection was unproductive).
+    reconnect_delay: Option<Duration>,
     /// Reopen the connection when nothing arrives for this long.
     pub silence_timeout: Duration,
     /// Cap for the exponential reconnect backoff (starts at 1 s).
@@ -136,6 +138,7 @@ impl Client {
             queue: VecDeque::new(),
             failures: 0,
             got_event: false,
+            reconnect_delay: None,
             // The server pings every 20 s (observed live); the extension tears the
             // stream down after interval + 10 s spare without an event.
             silence_timeout: Duration::from_secs(30),
@@ -194,16 +197,15 @@ impl OperationStream {
         Ok(())
     }
 
-    fn note_revision(&mut self, rev: i64) -> bool {
-        if rev <= 0 {
-            return true;
-        }
-        match self.local_rev {
-            Some(cur) if rev <= cur => false,
-            _ => {
-                self.local_rev = Some(rev);
-                true
-            }
+    /// Whether `rev` was delivered already (resume / duplicate).
+    fn seen(&self, rev: i64) -> bool {
+        rev > 0 && self.local_rev.is_some_and(|cur| rev <= cur)
+    }
+
+    /// Advance the cursor to `rev` (never backwards).
+    fn note_revision(&mut self, rev: i64) {
+        if rev > 0 && !self.seen(rev) {
+            self.local_rev = Some(rev);
         }
     }
 
@@ -232,13 +234,16 @@ impl OperationStream {
                             continue;
                         }
                     };
-                    if !self.note_revision(op.revision) {
+                    if self.seen(op.revision) {
                         continue; // already delivered (resume / duplicate)
                     }
                     self.client.note_operation(&op);
                     if self.decrypt {
                         Self::decrypt_in_place(&self.client, &mut op).await?;
                     }
+                    // Only now: an operation that stopped the stream is
+                    // delivered again when it resumes from `local_rev`.
+                    self.note_revision(op.revision);
                     self.queue.push_back(Event::Operation(Box::new(op)));
                 }
             }
@@ -254,8 +259,15 @@ impl OperationStream {
             "talkException" => {
                 let code = data.get("code").and_then(value_i64);
                 if code == Some(talk_code::MUST_REFRESH_V3_TOKEN) {
-                    self.client.refresh_token().await?;
-                    self.conn = None;
+                    match self.client.refresh_token().await {
+                        Ok(()) => self.conn = None,
+                        Err(e @ (Error::Reauth(_) | Error::LoginRequired)) => return Err(e),
+                        // A network hiccup: reconnect (with backoff) and try again.
+                        Err(e) => {
+                            tracing::warn!("token refresh for the operation stream failed: {e}");
+                            self.reconnect_later();
+                        }
+                    }
                 } else if matches!(
                     code,
                     Some(
@@ -314,6 +326,12 @@ impl OperationStream {
                 return Ok(ev);
             }
             if self.conn.is_none()
+                && let Some(wait) = self.reconnect_delay.take()
+            {
+                tracing::debug!("reopening the operation stream in {wait:?}");
+                tokio::time::sleep(wait).await;
+            }
+            if self.conn.is_none()
                 && let Err(e) = self.open().await
             {
                 if matches!(e, Error::LoginRequired | Error::Reauth(_))
@@ -370,9 +388,17 @@ impl OperationStream {
     fn drop_conn(&mut self) {
         // A connection that delivered nothing counts as a failure (backoff);
         // a productive one reconnects immediately, like the extension.
-        if !self.got_event {
-            self.failures += 1;
+        if self.got_event {
+            self.conn = None;
+        } else {
+            self.reconnect_later();
         }
+    }
+
+    /// Close the connection and reopen it after the backoff.
+    fn reconnect_later(&mut self) {
+        self.reconnect_delay = Some(self.backoff());
+        self.failures += 1;
         self.conn = None;
     }
 }

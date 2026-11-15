@@ -183,6 +183,8 @@ pub(crate) struct Transport {
 
 const OK: &str = "OK";
 pub(crate) const TOKEN_REFRESH_PATH: &str = "/api/auth/tokenRefresh";
+/// Most `tokenRefresh` retries on code 10202, whatever the server's policy says.
+const MAX_REFRESH_RETRIES: u32 = 8;
 
 impl Transport {
     pub(crate) fn new(config: Config, tokens: Tokens, ltsm: Ltsm) -> Result<Self> {
@@ -401,6 +403,7 @@ impl Transport {
             (rt, t.refresh_api_retry_policy.clone())
         };
         let mut delay_ms = policy.as_ref().map_or(0.0, |p| p.initial_delay_in_millis);
+        let mut retries = 0;
         loop {
             let opts = CallOpts {
                 require_auth: false,
@@ -424,7 +427,10 @@ impl Transport {
                     let Some(p) = &policy else {
                         return Err(Error::Api(e));
                     };
-                    if delay_ms >= p.max_delay_in_millis {
+                    // The attempt cap also ends policies whose delay never
+                    // grows (initial delay 0, multiplier 1, NaN).
+                    retries += 1;
+                    if delay_ms >= p.max_delay_in_millis || retries > MAX_REFRESH_RETRIES {
                         return Err(Error::Reauth("token refresh retry budget exhausted".into()));
                     }
                     let jitter = 1.0 + p.jitter_rate * (2.0 * rand_unit() - 1.0);

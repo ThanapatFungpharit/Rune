@@ -193,3 +193,34 @@ async fn album_post_media_needs_the_group_mid() {
 fn path_regex_reqid() -> wiremock::matchers::PathRegexMatcher {
     wiremock::matchers::path_regex(r"^/r/myhome/c/reqid-[0-9a-f-]{36}$")
 }
+
+#[tokio::test]
+async fn timeline_calls_refresh_the_access_token_when_asked() {
+    let server = MockServer::start().await;
+    mount_basics(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/timeline/homeId"))
+        .and(header("x-line-access", "ACCESS-1"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "code": 10051, "message": "RESPONSE_ERROR", "data": {"name": "TalkException", "code": 119}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/auth/tokenRefresh"))
+        .respond_with(ok(
+            json!({"tokenV3IssueResult": {"accessToken": "ACCESS-2", "refreshToken": "REFRESH-2"}}),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/timeline/homeId"))
+        .and(header("x-line-access", "ACCESS-2"))
+        .respond_with(ok(json!("HOME-1")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert_eq!(client(&server).timeline_home_id(ME).await.unwrap(), "HOME-1");
+}

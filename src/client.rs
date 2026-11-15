@@ -286,8 +286,20 @@ impl Client {
                 Ok(()) => {
                     failures = 0;
                     rx.mark_unchanged();
-                    if refresh_wait(&self.tokens(), now_epoch_sec()).is_some() {
+                    let next = refresh_wait(&self.tokens(), now_epoch_sec());
+                    if next.is_some() {
                         probed_unknown = false;
+                    }
+                    // A renewed token that is already due (clock skew, a zero
+                    // period) must not turn into back-to-back refreshes.
+                    if next.is_some_and(|w| w.is_zero()) {
+                        tracing::warn!(
+                            "the renewed token is already due for renewal; waiting {REFRESH_SLICE:?}"
+                        );
+                        tokio::select! {
+                            _ = tokio::time::sleep(REFRESH_SLICE) => {}
+                            r = rx.changed() => if r.is_err() { return Ok(()) },
+                        }
                     }
                 }
                 Err(e @ (Error::Reauth(_) | Error::LoginRequired)) => return Err(e),

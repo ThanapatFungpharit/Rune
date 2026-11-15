@@ -193,16 +193,47 @@ impl Client {
         let attempts = max_count.max((opts.wait.as_secs() / interval) as u32 + 1);
 
         // The QR secret: a Curve25519 key generated inside the secure module.
-        let (curve_key, public_key) = self.with_ltsm(|l| -> Result<_> {
-            let k = l.generate_curve_key()?;
-            Ok((k, l.public_key(k)?))
-        })?;
+        let curve_key = self.with_ltsm(|l| l.generate_curve_key())?;
+        let result = self
+            .qr_login_with_key(
+                &opts,
+                &mut on_event,
+                &session,
+                callback,
+                interval,
+                attempts,
+                curve_key,
+            )
+            .await;
+        // Freed however the login ended (a timeout or a refused scan included).
+        let released = self.with_ltsm(|l| l.release_key(curve_key));
+        let result = result?;
+        released?;
+        if !result.e2ee_keys.is_empty() {
+            self.load_e2ee_keys(&result.e2ee_keys)?;
+        }
+        Ok(result)
+    }
+
+    /// The rest of [`qr_login`](Self::qr_login), from showing the QR code on.
+    #[allow(clippy::too_many_arguments)]
+    async fn qr_login_with_key(
+        &self,
+        opts: &QrLoginOptions,
+        on_event: &mut impl FnMut(QrLoginEvent),
+        session: &str,
+        callback: &str,
+        interval: u64,
+        attempts: u32,
+        curve_key: crate::ltsm::KeyHandle,
+    ) -> Result<LoginResult> {
+        let public_key = self.with_ltsm(|l| l.public_key(curve_key))?;
         on_event(QrLoginEvent::QrUrl(append_qr_secret(callback, &public_key)?));
 
         // The scan poll retries on 410 only, like the extension.
         self.long_poll(
             &format!("{QR_NOTICE}/checkQrCodeVerified"),
-            &session,
+            session,
             interval * 1000,
             attempts,
             &[410],
@@ -236,7 +267,7 @@ impl Client {
             }
             self.long_poll(
                 &format!("{QR_NOTICE}/checkPinCodeVerified"),
-                &session,
+                session,
                 PIN_POLL_LST_MS,
                 attempts,
                 &[408, 410],
@@ -289,10 +320,6 @@ impl Client {
         };
         if let Some(o) = raw.as_object_mut() {
             o.remove("metaData");
-        }
-        self.with_ltsm(|l| l.release_key(curve_key))?;
-        if !e2ee_keys.is_empty() {
-            self.load_e2ee_keys(&e2ee_keys)?;
         }
         Ok(LoginResult {
             mid,
