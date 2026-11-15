@@ -354,7 +354,7 @@ struct PreparedImage {
     name: String,
 }
 
-fn jpeg(img: &image::DynamicImage, quality: u8) -> Result<Vec<u8>> {
+pub(crate) fn jpeg(img: &image::DynamicImage, quality: u8) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     // The canvas paints white under transparent pixels before encoding JPEG.
     let rgb = image::DynamicImage::ImageRgb8(flatten_white(img));
@@ -405,21 +405,28 @@ fn prepare_image(up: &MediaUpload) -> Result<PreparedImage> {
         .map_or(up.name.as_str(), |(s, _)| s)
         .to_owned();
     if up.original {
-        let ext = up
-            .name
-            .rsplit_once('.')
-            .map(|(_, e)| e.to_ascii_lowercase())
-            .unwrap_or_else(|| "jpg".into());
-        let data = crate::exif::scrub(&up.data);
-        let info = json!({ "category": "original", "fileSize": data.len(), "extension": ext,
-                           "animated": false, "width": w, "height": h });
-        return Ok(PreparedImage {
-            data,
-            preview,
-            thumb_info,
-            content_info: Some(info),
-            name: up.name.clone(),
-        });
+        if let Some(data) = crate::exif::scrub(&up.data) {
+            let ext = up
+                .name
+                .rsplit_once('.')
+                .map(|(_, e)| e.to_ascii_lowercase())
+                .unwrap_or_else(|| "jpg".into());
+            let info = json!({ "category": "original", "fileSize": data.len(), "extension": ext,
+                               "animated": false, "width": w, "height": h });
+            return Ok(PreparedImage {
+                data,
+                preview,
+                thumb_info,
+                content_info: Some(info),
+                name: up.name.clone(),
+            });
+        }
+        // Its metadata (GPS and all) could not be removed: never send it as
+        // is; a re-encoded copy carries no metadata.
+        tracing::warn!(
+            "cannot strip the metadata of {}; sending a resized copy instead of the original",
+            up.name
+        );
     }
     let (mw, mh) = fit(w, h, "maxPixel", 1280, 1280);
     let main = if (mw, mh) == (w, h) {
@@ -947,5 +954,37 @@ mod vector_tests {
             );
             assert_eq!(decrypt_blob(&km, &blob, chunked).unwrap(), data);
         }
+    }
+}
+
+#[cfg(test)]
+mod original_tests {
+    use super::*;
+
+    #[test]
+    fn an_original_whose_metadata_cannot_be_stripped_is_sent_re_encoded() {
+        let full = crate::exif::tests::jpeg_with_exif();
+        // Junk before a marker: decoders skip it, the scrubber cannot walk it.
+        let exif_end = 4 + u16::from_be_bytes([full[4], full[5]]) as usize;
+        let broken = [&full[..exif_end], b"\x00\x00junk", &full[exif_end..]].concat();
+        assert!(image::load_from_memory(&broken).is_ok(), "decodable");
+        let up = MediaUpload {
+            original: true,
+            ..MediaUpload::image(broken, "photo.jpg")
+        };
+        let p = prepare_image(&up).unwrap();
+        assert!(p.content_info.is_none(), "not sent as an original");
+        let s = String::from_utf8_lossy(&p.data);
+        assert!(!s.contains("SN12345") && !s.contains("Bob") && !s.contains("Exif"));
+        assert!(image::load_from_memory(&p.data).is_ok());
+
+        // A clean original is still sent as one, scrubbed.
+        let up = MediaUpload {
+            original: true,
+            ..MediaUpload::image(full, "photo.jpg")
+        };
+        let p = prepare_image(&up).unwrap();
+        assert!(p.content_info.is_some());
+        assert!(!String::from_utf8_lossy(&p.data).contains("SN12345"));
     }
 }

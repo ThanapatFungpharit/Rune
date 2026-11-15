@@ -16,7 +16,9 @@
 //! * WebP: the `EXIF` chunk is scrubbed, `XMP ` is dropped.
 //!
 //! Colour profiles (ICC) are kept. Other formats are returned unchanged.
-//! Anything malformed is dropped rather than passed through.
+//! Anything malformed is dropped rather than passed through; a JPEG, PNG or
+//! WebP whose structure cannot be walked at all gives `None`, never the
+//! original bytes with their metadata.
 
 /// IFD0 tags kept: Make, Model, Orientation, X/YResolution, ResolutionUnit,
 /// Software, DateTime, YCbCrPositioning.
@@ -34,16 +36,19 @@ const EXIF_KEEP: &[u16] = &[
 
 const TAG_EXIF_IFD: u16 = 0x8769;
 
-/// Strip privacy-sensitive metadata from a JPEG, PNG or WebP file.
-pub(crate) fn scrub(data: &[u8]) -> Vec<u8> {
+/// Strip privacy-sensitive metadata from a JPEG, PNG or WebP file (other
+/// formats are returned as they are). `None` when the file claims to be one
+/// of these but cannot be parsed: its metadata could not be removed, so the
+/// caller must not send it as is (re-encode the pixels instead).
+pub(crate) fn scrub(data: &[u8]) -> Option<Vec<u8>> {
     if data.starts_with(&[0xFF, 0xD8]) {
-        scrub_jpeg(data).unwrap_or_else(|| data.to_vec())
+        scrub_jpeg(data)
     } else if data.starts_with(b"\x89PNG\r\n\x1a\n") {
-        scrub_png(data).unwrap_or_else(|| data.to_vec())
+        scrub_png(data)
     } else if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
-        scrub_webp(data).unwrap_or_else(|| data.to_vec())
+        scrub_webp(data)
     } else {
-        data.to_vec()
+        Some(data.to_vec())
     }
 }
 
@@ -270,8 +275,15 @@ fn scrub_jpeg(d: &[u8]) -> Option<Vec<u8>> {
             // Entropy-coded data: copy up to the next real marker.
             let start = i;
             loop {
-                if *d.get(i)? == 0xFF {
-                    let n = *d.get(i + 1)?;
+                let Some(&b) = d.get(i) else {
+                    // A truncated file (no EOI): its metadata segments are
+                    // behind us already, so keep the scan data and end it.
+                    out.extend_from_slice(&d[start..]);
+                    out.extend_from_slice(&[0xFF, 0xD9]);
+                    return Some(out);
+                };
+                if b == 0xFF {
+                    let n = *d.get(i + 1).unwrap_or(&0x00);
                     if n != 0x00 && !(0xD0..=0xD7).contains(&n) && n != 0xFF {
                         break;
                     }
@@ -377,7 +389,7 @@ fn scrub_webp(d: &[u8]) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A little-endian TIFF with Make, Orientation, Artist (dropped), a GPS
@@ -465,7 +477,7 @@ mod tests {
         xmp.extend_from_slice(xmp_body);
         let input = [&plain[..2], &exif, &xmp, &plain[2..], b"SECONDIMAGE-SN12345"].concat();
 
-        let out = scrub(&input);
+        let out = scrub(&input).unwrap();
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains("Exif") && s.contains("Canon"));
         assert!(!s.contains("SN12345") && !s.contains("gps") && !s.contains("Bob"));
@@ -473,6 +485,46 @@ mod tests {
         let a = image::load_from_memory(&out).unwrap().to_rgb8();
         let b = image::load_from_memory(&plain).unwrap().to_rgb8();
         assert_eq!(a, b, "pixels untouched");
+    }
+
+    /// A small JPEG with the sample EXIF (Artist, serial number, GPS pointer) after SOI.
+    pub(crate) fn jpeg_with_exif() -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(8, 8, image::Rgb([200, 10, 10]));
+        let mut plain = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut plain, 90)
+            .encode_image(&img)
+            .unwrap();
+        let tiff = sample_tiff();
+        let mut exif = vec![0xFF, 0xE1];
+        exif.extend_from_slice(&((2 + 6 + tiff.len()) as u16).to_be_bytes());
+        exif.extend_from_slice(b"Exif\0\0");
+        exif.extend_from_slice(&tiff);
+        [&plain[..2], &exif, &plain[2..]].concat()
+    }
+
+    #[test]
+    fn truncated_jpeg_is_still_scrubbed() {
+        let full = jpeg_with_exif();
+        // Cut inside the scan data: no EOI.
+        let cut = &full[..full.len() - 6];
+        let out = scrub(cut).expect("a truncated JPEG still loses its metadata");
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("Canon") && !s.contains("SN12345") && !s.contains("Bob"));
+        assert!(out.ends_with(&[0xFF, 0xD9]));
+    }
+
+    #[test]
+    fn unparsable_files_never_come_back_with_their_metadata() {
+        let full = jpeg_with_exif();
+        // Garbage where the next marker should be, right after the EXIF segment.
+        let exif_end = 4 + u16::from_be_bytes([full[4], full[5]]) as usize;
+        let broken = [&full[..exif_end], b"\x00\x00junk", &full[exif_end..]].concat();
+        assert_eq!(scrub(&broken), None);
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&[0, 0, 0, 40, b't', b'E', b'X', b't']); // chunk longer than the file
+        assert_eq!(scrub(&png), None);
+        // Formats without a scrubber pass through.
+        assert_eq!(scrub(b"GIF89a...").as_deref(), Some(&b"GIF89a..."[..]));
     }
 
     #[test]
@@ -496,7 +548,7 @@ mod tests {
             &plain[33..],
         ]
         .concat();
-        let out = scrub(&input);
+        let out = scrub(&input).unwrap();
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains("eXIf") && s.contains("Canon"));
         assert!(!s.contains("GPS 13.7") && !s.contains("SN12345"));

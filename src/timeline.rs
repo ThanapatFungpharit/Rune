@@ -226,7 +226,15 @@ impl Client {
         let me = self.my_mid().ok_or(Error::LoginRequired)?;
         let region = self.region().await?;
         let oid = format!("reqid-{}", crate::media::random_uuid());
-        let data = crate::exif::scrub(image);
+        let data = match crate::exif::scrub(image) {
+            Some(d) => d,
+            // Metadata that cannot be stripped: upload a re-encoded copy without it.
+            None => {
+                let img = image::load_from_memory(image)
+                    .map_err(|e| Error::Protocol(format!("unsupported cover image: {e}")))?;
+                crate::media::jpeg(&img, 90)?
+            }
+        };
         let params = B64.encode(json!({ "ver": "2.0", "name": file_name, "type": "image" }).to_string());
         self.myhome_request(
             Some((&data, params)),
