@@ -211,7 +211,7 @@ fn str_list(v: &Value) -> Vec<String> {
 impl Client {
     /// A client that is not logged in yet.
     ///
-    /// Compiles the bundled `ltsm.wasm` (≈0.3 s in release builds); do this
+    /// Finds and compiles the user's `ltsm.wasm` (`ltsm::load_wasm`) (≈0.3 s in release builds); do this
     /// once and clone the client.
     pub fn new(config: Config) -> Result<Self> {
         Self::with_tokens(config, Tokens::default())

@@ -14,7 +14,12 @@
 //! X-Hmac   = base64(new Hmac(key).digest(utf8(path + body)))
 //! ```
 
+mod locate;
 mod runtime;
+
+pub use locate::{
+    LTSM_ENV, LTSM_SHA256, WasmProblem, check as check_wasm, default_install_path, load as load_wasm,
+};
 
 use std::collections::HashMap;
 use std::fmt;
@@ -24,10 +29,6 @@ use base64::engine::general_purpose::STANDARD as B64;
 use sha2::{Digest, Sha256};
 
 use runtime::{Arg, EmVal, Object, Ret, Runtime};
-
-/// The `ltsm.wasm` shipped with LINE Chrome 3.7.2
-/// (sha256 `58bb4e189ab9bbd7d72ed415258da36afd50e306cb019bab75329d4f5f1b65b3`).
-pub const LTSM_WASM: &[u8] = include_bytes!("../../assets/ltsm.wasm");
 
 /// Extension origin the module is told it runs under.
 pub const DEFAULT_ORIGIN: &str = "chrome-extension://ophjlpahpchlmihnnnihgmmeilfjmjjc";
@@ -133,9 +134,10 @@ impl fmt::Debug for Ltsm {
 }
 
 impl Ltsm {
-    /// Load the bundled module under the default extension origin.
+    /// Load the user's `ltsm.wasm` (see [`load_wasm`]) under the default extension origin.
     pub fn new() -> Result<Self> {
-        Self::with_origin(LTSM_WASM, DEFAULT_ORIGIN)
+        let wasm = load_wasm().map_err(|e| LtsmError(e.to_string()))?;
+        Self::with_origin(&wasm, DEFAULT_ORIGIN)
     }
 
     /// Load a specific `ltsm.wasm` build for one of the known origins.

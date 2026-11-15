@@ -469,9 +469,28 @@ and `Tokens`' `Debug` output is redacted.
   overhead for files). Requests carrying the access token follow redirects
   to other hosts only within `*.line-apps.com` / `*.line-scdn.net`. A host
   name that *resolves* to a private address is not caught.
-- The secure module is LINE's binary (`assets/ltsm.wasm`, from extension
-  3.7.2, sha256 `58bb4e18…`). It runs sandboxed in wasmtime. Its only host
-  access is to random bytes and to a fixed origin string.
+- The secure module is LINE's binary (`ltsm.wasm`, from extension 3.7.2,
+  sha256 `58bb4e18…`). rune does not ship it; see
+  [Getting `ltsm.wasm`](#getting-ltsmwasm). It runs sandboxed in wasmtime.
+  Its only host access is to random bytes and to a fixed origin string.
+
+## Getting `ltsm.wasm`
+
+rune signs every request with LINE's own secure module but does not
+distribute it, because it is LINE's code. Each user supplies the copy from
+their own LINE Chrome extension, version 3.7.2 (sha256
+`58bb4e189ab9bbd7d72ed415258da36afd50e306cb019bab75329d4f5f1b65b3`; other
+builds are refused, since the host is written for this one). rune looks, in
+order, at:
+
+1. `$RUNE_LTSM`, if set (then nowhere else);
+2. `$XDG_DATA_HOME/rune/ltsm.wasm` (`~/.local/share/rune/ltsm.wasm`);
+3. `assets/ltsm.wasm` in the current directory (development; gitignored);
+4. the installed extension in Chrome, Chromium, Brave, Edge and Vivaldi profiles.
+
+Without it, `rune-tui` shows where it looked and exits; the library's
+`Ltsm::new` / `Client::new` return an error (`rune::ltsm::load_wasm` gives
+the typed `WasmProblem`). The tests need it too, as `assets/ltsm.wasm`.
 
 ## Tests
 

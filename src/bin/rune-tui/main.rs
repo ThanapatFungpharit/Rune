@@ -6744,6 +6744,58 @@ async fn login(path: &str) -> Result<Session, Box<dyn std::error::Error>> {
     Ok(s)
 }
 
+/// The full-screen page shown when `ltsm.wasm` is missing: what is wrong and how
+/// to fix it, until a key is pressed. Without a terminal (or if drawing fails)
+/// the explanation goes to stderr instead.
+fn show_missing_wasm(problem: &rune::ltsm::WasmProblem) {
+    use crossterm::event::{Event, KeyEventKind, read};
+    let help = problem.help();
+    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        eprintln!("{help}");
+        return;
+    }
+    let mut terminal = ratatui::init();
+    let lines: Vec<Line> = help
+        .lines()
+        .enumerate()
+        .map(|(i, l)| match i {
+            0 => Line::styled(
+                l.to_owned(),
+                Style::default()
+                    .fg(theme::t().danger)
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            ),
+            _ if l.starts_with("  ") => Line::styled(l.to_owned(), theme::muted()),
+            _ => Line::raw(l.to_owned()),
+        })
+        .chain([
+            Line::raw(""),
+            Line::styled("Press any key to quit.", theme::muted()),
+        ])
+        .collect();
+    let drawn = terminal.draw(|f| {
+        let block = Block::bordered()
+            .title(" rune — secure module needed ")
+            .border_style(Style::default().fg(theme::t().border));
+        f.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(ratatui::widgets::Wrap { trim: false }),
+            f.area(),
+        );
+    });
+    if drawn.is_ok() {
+        while let Ok(ev) = read() {
+            if matches!(ev, Event::Key(k) if k.kind == KeyEventKind::Press) {
+                break;
+            }
+        }
+    }
+    ratatui::restore();
+    // Kept on screen after the alternate screen is gone, so the paths can be copied.
+    eprintln!("{help}");
+}
+
 /// The saved session at `path`, or `None` when there is none yet (log in).
 /// An unreadable or damaged file is an error, never replaced by a new login:
 /// it holds the device certificate and the Letter Sealing keys.
@@ -6953,6 +7005,11 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
     };
     if let Some(log) = &opts.log {
         init_log(log).map_err(|e| format!("cannot open the log file {}: {e}", log.display()))?;
+    }
+    // LINE's secure module is the user's own copy; without it nothing can be signed.
+    if let Err(problem) = rune::ltsm::load_wasm() {
+        show_missing_wasm(&problem);
+        return Err(problem.to_string().into());
     }
     let path = opts.session.clone();
     let session = match read_session(&path)? {

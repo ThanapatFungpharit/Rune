@@ -49,7 +49,9 @@ the 2.3 MB wasm unoptimized takes ~15 s per `Ltsm::new()`.
 ## Architecture
 
 **Signing / crypto via LINE's own wasm.** Every gateway request needs an
-`X-Hmac` computed inside `assets/ltsm.wasm` (embedded with `include_bytes!`).
+`X-Hmac` computed inside LINE's `ltsm.wasm`, which is never shipped: `src/ltsm/locate.rs` finds the
+user's own copy at run time (`$RUNE_LTSM`, `~/.local/share/rune/`, `./assets/` — gitignored, the tests use it —
+then installed Chrome-family extensions), accepting only sha256 `58bb4e18…`; `rune-tui` shows `WasmProblem::help` and exits without it.
 `src/ltsm/runtime.rs` hosts it in wasmtime by re-implementing the 40 minified
 Emscripten imports from `ltsmSandbox.js` (`a.a`…`a.N`): syscall stubs,
 `EM_ASM` random snippets (addresses hard-coded), a fake `window.location.origin`,
