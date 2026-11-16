@@ -444,7 +444,7 @@ static CHAT_SEARCH: &[Binding] = &[
 static COMPOSE: &[Binding] = &[
     binding!(Cmd::Confirm, "send", true; key(Enter)),
     // Ctrl-j is the line feed every terminal sends; Shift-Enter needs the
-    // keyboard protocol, and some terminals keep Alt-Enter for themselves.
+    // keyboard protocol or modifyOtherKeys, and some terminals keep Alt-Enter.
     binding!(Cmd::NewLine, "new line", true; shift(Enter), alt(Enter), ctrl('j')),
     binding!(Cmd::Back, "back (a reply is cancelled first)", true; key(Esc)),
     binding!(Cmd::Up, "previous line (on the first: select messages)", true; key(Up)),
@@ -1003,6 +1003,45 @@ impl Keymap {
     /// The hinted bindings of `ctx` whose command `available` allows right
     /// now (the main menu first: everything else can be found from it).
     pub fn hint(&self, ctx: Ctx, available: impl Fn(Cmd) -> bool) -> String {
+        match held() {
+            m if m.is_empty() => self.plain_hint(ctx, available),
+            m => self.held_hint(ctx, m, available),
+        }
+    }
+
+    /// While `mods` are held: every binding of `ctx` whose key uses all of
+    /// them (see [`mods_used`]), whether hinted normally or not.
+    pub fn held_hint(&self, ctx: Ctx, mods: KeyModifiers, available: impl Fn(Cmd) -> bool) -> String {
+        held_text(mods, self.held_entries(ctx, mods, available))
+    }
+
+    /// The entries of [`Keymap::held_hint`] (`"Ctrl-t reply"`), in table order.
+    pub fn held_entries(&self, ctx: Ctx, mods: KeyModifiers, available: impl Fn(Cmd) -> bool) -> Vec<String> {
+        let mut entries: Vec<String> = Vec::new();
+        for (t, b) in all(ctx) {
+            if !available(b.cmd) {
+                continue;
+            }
+            let keys: Vec<Key> = self
+                .keys_for(t, b)
+                .iter()
+                .copied()
+                .filter(|&k| mods_used(k).contains(mods))
+                // A key an earlier binding takes (a stored clash) does not do this.
+                .filter(|k| self.resolve(ctx, &KeyEvent::new(k.code, k.mods)) == Some(b.cmd))
+                .collect();
+            if keys.is_empty() {
+                continue;
+            }
+            let entry = format!("{} {}", display_keys(&keys), b.help);
+            if !entries.contains(&entry) {
+                entries.push(entry);
+            }
+        }
+        entries
+    }
+
+    fn plain_hint(&self, ctx: Ctx, available: impl Fn(Cmd) -> bool) -> String {
         let mut shown: Vec<(Table, &Binding)> = all(ctx)
             .filter(|&(t, b)| b.hint && available(b.cmd) && !self.keys_for(t, b).is_empty())
             .collect();
@@ -1013,8 +1052,12 @@ impl Keymap {
                 let keys = self.keys_for(t, b);
                 let keys = match b.cmd {
                     Cmd::Digit(_) => "1…9".to_owned(),
-                    // The full list (with Ctrl-j) is on the help screen.
-                    Cmd::NewLine if keys == b.keys => "Shift/Alt-Enter".to_owned(),
+                    // The full list is on the help screen. Shift-Enter once the
+                    // terminal is known to tell it from Enter; until then Ctrl-j,
+                    // which always arrives (Alt-Enter is left out: some terminals,
+                    // WezTerm among them, keep it for themselves).
+                    Cmd::NewLine if keys == b.keys && shift_enter() => display_key(shift(Enter)),
+                    Cmd::NewLine if keys == b.keys => display_key(ctrl('j')),
                     _ => display_keys(keys),
                 };
                 format!("{keys} {}", b.help)
@@ -1279,6 +1322,87 @@ fn bindable(code: KeyCode) -> bool {
 thread_local! {
     /// The keymap the UI (which runs on one thread) answers keys with.
     static ACTIVE: RefCell<Rc<Keymap>> = RefCell::new(Rc::new(Keymap::default()));
+}
+
+thread_local! {
+    /// The modifiers (Ctrl, Alt, Shift) held down on their own right now, as far as the
+    /// terminal reports it: hints then list what those modifiers reach.
+    static HELD: std::cell::Cell<KeyModifiers> = const { std::cell::Cell::new(KeyModifiers::NONE) };
+    /// Whether the terminal reports Shift-Enter apart from Enter (it speaks the
+    /// kitty keyboard protocol, or a Shift-Enter has arrived through
+    /// modifyOtherKeys). Until then the hints name `Ctrl-j`, which always works.
+    static SHIFT_ENTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the terminal reports Ctrl, Alt and Shift pressed on their own
+    /// (the kitty keyboard protocol), which the held-key hints need.
+    static LONE_MODIFIERS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Note whether the terminal reports modifiers pressed on their own.
+pub fn set_lone_modifiers(reported: bool) {
+    LONE_MODIFIERS.with(|s| s.set(reported));
+}
+
+pub fn lone_modifiers() -> bool {
+    LONE_MODIFIERS.with(|s| s.get())
+}
+
+/// Note whether the terminal tells Shift-Enter apart from Enter.
+pub fn set_shift_enter(known: bool) {
+    SHIFT_ENTER.with(|s| s.set(known));
+}
+
+pub fn shift_enter() -> bool {
+    SHIFT_ENTER.with(|s| s.get())
+}
+
+/// Ctrl and Alt: the modifiers that make a key a chord rather than typing.
+pub const CHORD_MODS: KeyModifiers = KeyModifiers::CONTROL.union(KeyModifiers::ALT);
+
+/// The modifiers bindings use, so holding one reveals its shortcuts.
+pub const HELD_MODS: KeyModifiers = CHORD_MODS.union(KeyModifiers::SHIFT);
+
+/// The modifiers pressing `key` takes: its own, plus Shift for a key that says
+/// Shift itself (a capital letter, Shift-Tab). Shifted symbols (`?`) depend on
+/// the keyboard layout and are left out.
+pub fn mods_used(key: Key) -> KeyModifiers {
+    let mut mods = key.mods & HELD_MODS;
+    match key.code {
+        KeyCode::BackTab => mods |= KeyModifiers::SHIFT,
+        KeyCode::Char(c) if c.is_uppercase() => mods |= KeyModifiers::SHIFT,
+        _ => {}
+    }
+    mods
+}
+
+/// Note which modifiers are held (Ctrl, Alt and Shift count).
+pub fn set_held(mods: KeyModifiers) {
+    HELD.with(|h| h.set(mods & HELD_MODS));
+}
+
+pub fn held() -> KeyModifiers {
+    HELD.with(|h| h.get())
+}
+
+/// See [`Keymap::held_entries`].
+pub fn held_entries(ctx: Ctx, mods: KeyModifiers, available: impl Fn(Cmd) -> bool) -> Vec<String> {
+    active().held_entries(ctx, mods, available)
+}
+
+/// The hint while `mods` are held: `entries`, or that there are none.
+pub fn held_text(mods: KeyModifiers, entries: Vec<String>) -> String {
+    if !entries.is_empty() {
+        return entries.join(HINT_SEP);
+    }
+    let name: Vec<&str> = [
+        (KeyModifiers::CONTROL, "Ctrl"),
+        (KeyModifiers::ALT, "Alt"),
+        (KeyModifiers::SHIFT, "Shift"),
+    ]
+    .into_iter()
+    .filter(|&(m, _)| mods.contains(m))
+    .map(|(_, n)| n)
+    .collect();
+    format!("no {} shortcuts here", name.join("-"))
 }
 
 /// Answer keys with `map` from now on.
@@ -1717,8 +1841,14 @@ mod tests {
             resolve(Ctx::Form, &event(KeyCode::Enter, KeyModifiers::SHIFT)),
             None
         );
-        let hint = hint(Ctx::Compose, |_| true);
-        assert!(hint.contains("Enter send · Shift/Alt-Enter new line"), "{hint}");
+        // The hint names a key the terminal can send.
+        set_shift_enter(false);
+        let legacy = hint(Ctx::Compose, |_| true);
+        assert!(legacy.contains("Enter send · Ctrl-j new line"), "{legacy}");
+        set_shift_enter(true);
+        let full = hint(Ctx::Compose, |_| true);
+        set_shift_enter(false);
+        assert!(full.contains("Enter send · Shift-Enter new line"), "{full}");
         assert!(
             help_lines(Ctx::Compose)
                 .iter()
@@ -2163,5 +2293,95 @@ mod tests {
         );
         install(Keymap::default());
         assert_eq!(global(Cmd::MainMenu), "Ctrl-x");
+    }
+}
+
+#[cfg(test)]
+mod held_tests {
+    use super::*;
+
+    #[test]
+    fn holding_a_modifier_lists_what_it_reaches() {
+        let map = Keymap::default();
+        let ctrl = map.held_hint(Ctx::Compose, KeyModifiers::CONTROL, |_| true);
+        assert!(!ctrl.is_empty());
+        for entry in ctrl.split(HINT_SEP) {
+            assert!(entry.starts_with("Ctrl-"), "{entry}");
+        }
+        set_held(KeyModifiers::CONTROL);
+        assert_eq!(map.hint(Ctx::Compose, |_| true), ctrl);
+        set_held(KeyModifiers::SUPER);
+        assert_eq!(held(), KeyModifiers::NONE, "bindings never use Super");
+        assert_eq!(
+            map.hint(Ctx::Compose, |_| true),
+            map.plain_hint(Ctx::Compose, |_| true)
+        );
+
+        // Shift: keys that name it, and capital letters, which say it themselves.
+        let shift = map.held_hint(Ctx::Compose, KeyModifiers::SHIFT, |_| true);
+        assert!(shift.contains("Shift-Enter"), "{shift}");
+        let messages = map.held_hint(Ctx::Messages, KeyModifiers::SHIFT, |_| true);
+        for entry in shift.split(HINT_SEP).chain(messages.split(HINT_SEP)) {
+            let keys = entry.split(' ').next().unwrap();
+            assert!(
+                keys.split('/')
+                    .all(|k| k.contains("Shift-") || k.chars().any(char::is_uppercase)),
+                "{entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn held_modifiers_reach_every_key_that_uses_them() {
+        assert_eq!(
+            mods_used(Key::of(&KeyEvent::from(KeyCode::Char('K')))),
+            KeyModifiers::SHIFT
+        );
+        assert_eq!(
+            mods_used(Key::of(&KeyEvent::from(KeyCode::BackTab))),
+            KeyModifiers::SHIFT
+        );
+        assert_eq!(
+            mods_used(Key::of(&KeyEvent::from(KeyCode::Char('?')))),
+            KeyModifiers::NONE
+        );
+        let ctrl_shift_x = Key {
+            code: KeyCode::Char('X'),
+            mods: KeyModifiers::CONTROL,
+        };
+        assert_eq!(
+            mods_used(ctrl_shift_x),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        );
+
+        // Holding Ctrl reaches Ctrl-Shift keys too; holding both, only those.
+        let mut map = Keymap::default();
+        let reply = (Table::Own(Ctx::Messages), Cmd::Reply);
+        map.set(reply.0, reply.1, vec![ctrl_shift_x]);
+        assert!(
+            map.held_hint(Ctx::Messages, KeyModifiers::CONTROL, |_| true)
+                .contains("Ctrl-Shift-x reply")
+        );
+        let both = map.held_hint(Ctx::Messages, KeyModifiers::CONTROL | KeyModifiers::SHIFT, |_| {
+            true
+        });
+        assert!(both.contains("Ctrl-Shift-x reply"), "{both}");
+        assert!(!both.contains("Ctrl-x "), "{both}");
+        // A stored clash: the key goes to the binding found first, so only it lists the key.
+        let mut clash = Keymap::default();
+        let first = all(Ctx::Messages)
+            .find(|(t, _)| *t == Table::Own(Ctx::Messages))
+            .unwrap();
+        let quit_keys = clash.keys(Table::Global, Cmd::Quit).to_vec();
+        clash.set(Table::Own(Ctx::Messages), first.1.cmd, quit_keys.clone());
+        let ctrl = clash.held_hint(Ctx::Messages, KeyModifiers::CONTROL, |_| true);
+        let quit = display_keys(&quit_keys);
+        assert!(ctrl.contains(&format!("{quit} {}", first.1.help)), "{ctrl}");
+        assert!(!ctrl.contains(&format!("{quit} quit")), "{ctrl}");
+
+        assert_eq!(
+            held_text(KeyModifiers::CONTROL | KeyModifiers::SHIFT, vec![]),
+            "no Ctrl-Shift shortcuts here"
+        );
     }
 }

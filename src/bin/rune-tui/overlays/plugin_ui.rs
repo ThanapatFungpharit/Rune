@@ -1336,13 +1336,25 @@ impl App {
 
     pub fn draw_plugin_view(&mut self, f: &mut Frame, area: Rect, v: &mut PluginView, hint: String) {
         let view = &v.view;
+        // While a modifier is held, only the keys that use it (as far as their names say).
+        let held = keymap::held();
         let keys: Vec<String> = view
             .keys
             .iter()
+            .filter(|k| {
+                held.is_empty()
+                    || k.key.split('/').any(|name| {
+                        keymap::parse_key(name).is_some_and(|key| keymap::mods_used(key).contains(held))
+                    })
+            })
             .map(|k| format!("{} {}", k.key, k.help))
             .collect();
         let hint = if keys.is_empty() {
             hint
+        } else if !held.is_empty() && keymap::held_entries(keymap::Ctx::PluginView, held, |_| true).is_empty()
+        {
+            // rune's own part would only say it has none.
+            format!(" {} ", keys.join(" · "))
         } else {
             format!(" {} · {} ", keys.join(" · "), hint.trim())
         };
@@ -1414,16 +1426,16 @@ impl App {
         {
             lines.extend(v.view.keys.iter().map(|k| (k.key.clone(), k.help.clone())));
         }
-        if matches!(
-            ctx,
-            Ctx::ChatList | Ctx::ChatSearch | Ctx::Compose | Ctx::Messages | Ctx::Viewer
-        ) {
+        if crate::plugin_keys_answer(ctx) {
             lines.extend(self.plugins.keys_help());
         }
         if ctx == Ctx::Compose {
             lines.extend(self.plugins.commands_help());
         }
         lines.push((String::new(), String::new()));
+        if !keymap::lone_modifiers() && ctx != Ctx::Keys {
+            lines.extend(lone_modifiers_note().into_iter().map(|l| (String::new(), l)));
+        }
         lines.push((
             String::new(),
             if ctx == Ctx::Keys {
@@ -1434,4 +1446,17 @@ impl App {
         ));
         lines
     }
+}
+
+/// Why holding Ctrl, Alt or Shift does not change the hints: the terminal
+/// reports them only with another key (no kitty keyboard protocol).
+pub fn lone_modifiers_note() -> Vec<String> {
+    let mut note = vec![
+        "Holding Ctrl, Alt or Shift does not show their keys in this terminal:".to_owned(),
+        "it reports them only with another key (no kitty keyboard protocol).".to_owned(),
+    ];
+    if std::env::var("TERM_PROGRAM").is_ok_and(|t| t == "WezTerm") {
+        note.push("WezTerm turns it on with `config.enable_kitty_keyboard = true`.".to_owned());
+    }
+    note
 }

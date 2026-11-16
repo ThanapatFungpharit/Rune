@@ -295,8 +295,14 @@ click a chat or a picture, scroll with the wheel. Pass `--no-mouse` to leave
 the mouse to the terminal (Shift-drag selects text in most terminals anyway);
 `c` on a selected message copies its text.
 
-`Enter` sends and `Shift-Enter` starts a new line (`Alt-Enter` or `Ctrl-j`
-where the terminal does not report `Shift-Enter`). Nothing half-written
+`Enter` sends and `Shift-Enter` starts a new line. Terminals tell
+`Shift-Enter` from `Enter` through the kitty keyboard protocol or xterm's
+modifyOtherKeys, which rune turns on itself (WezTerm and xterm have it; tmux
+only with `set -g extended-keys on`);
+in others use `Ctrl-j`, which every terminal sends — the status line names it
+until a `Shift-Enter` arrives, which is remembered for that terminal
+(`Alt-Enter` works too where the terminal does not keep it, as WezTerm does
+for full screen). Nothing half-written
 goes out by accident: pasted text keeps its line breaks and waits for your
 `Enter` — also in terminals without bracketed paste, which type a paste out
 as keys (a burst of keys read at once is a paste, and its `Enter`s are line
@@ -305,6 +311,11 @@ not a command is never sent, whatever follows it (start with `//` to send
 it as text; a path like `/usr/bin` is text); and each chat
 keeps its own draft (and reply), shown as `✎ …` in the chat list and kept
 across restarts, so switching chats never sends one chat's text to another.
+
+Holding `Ctrl`, `Alt` or `Shift` switches the status-line hints to what that
+key reaches. Only terminals with the kitty keyboard protocol report a modifier
+held on its own (WezTerm turns it on with `config.enable_kitty_keyboard = true`,
+which a program cannot do for it); elsewhere the help screen (`?`) says so.
 
 Navigation has three levels, each one key away from anywhere in the main
 view (also while typing):

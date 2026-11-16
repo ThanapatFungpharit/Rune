@@ -689,6 +689,9 @@ struct App {
     /// The key being handled came in a burst of keys: a paste typed out by a
     /// terminal without bracketed paste. Its Enters are line breaks, not sends.
     pasting: bool,
+    /// The modifier keys down right now, each side on its own (reported only
+    /// with the full keyboard protocol): `keymap::held` follows them.
+    held_keys: Vec<crossterm::event::ModifierKeyCode>,
     /// Loads that failed, waiting to be tried again.
     retry: RetryQueue,
     /// Read receipts not acknowledged yet (see `receipts.rs`); mirrored in
@@ -1774,6 +1777,26 @@ fn status_line(status: &str, hint: &str, width: usize) -> (Option<String>, Strin
     (Some(message), keymap::fit_hint(hint, left))
 }
 
+/// The modifier a modifier key gives (none for those bindings never use).
+fn modifier_of(key: crossterm::event::ModifierKeyCode) -> KeyModifiers {
+    use crossterm::event::ModifierKeyCode as M;
+    match key {
+        M::LeftControl | M::RightControl => KeyModifiers::CONTROL,
+        M::LeftAlt | M::RightAlt => KeyModifiers::ALT,
+        M::LeftShift | M::RightShift => KeyModifiers::SHIFT,
+        _ => KeyModifiers::NONE,
+    }
+}
+
+/// Where plugins' `Alt-<letter/digit>` keys are dispatched.
+fn plugin_keys_answer(ctx: keymap::Ctx) -> bool {
+    use keymap::Ctx;
+    matches!(
+        ctx,
+        Ctx::ChatList | Ctx::ChatSearch | Ctx::Compose | Ctx::Messages | Ctx::Viewer
+    )
+}
+
 /// A frame's bottom title for `hint`, fitted between the corners of `frame`.
 fn frame_hint(hint: &str, frame: Rect) -> Span<'static> {
     Span::styled(
@@ -2528,6 +2551,7 @@ impl App {
             replying: None,
             drafts: HashMap::new(),
             pasting: false,
+            held_keys: Vec::new(),
             retry: RetryQueue::default(),
             receipts: Receipts::default(),
             receipt_tasks: HashMap::new(),
@@ -3013,6 +3037,9 @@ impl App {
     fn on_focus(&mut self, focused: bool) {
         self.focused = focused;
         if !focused {
+            // The release of a key held while leaving never arrives.
+            self.held_keys.clear();
+            self.sync_held();
             return;
         }
         let Some(open) = self.open.clone() else {
@@ -5201,11 +5228,82 @@ impl App {
     }
 
     fn on_key(&mut self, k: KeyEvent) {
+        let Some(k) = self.note_modifiers(k) else {
+            return;
+        };
         if k.kind == KeyEventKind::Press {
             self.expire_status();
         }
         self.handle_key(k);
         self.settle_modal();
+    }
+
+    /// Follow which modifiers are held (the hints show what they reach) and
+    /// turn what the full keyboard protocol reports into the presses the rest
+    /// of the app expects: a repeat is a press, releases and lone modifiers
+    /// are dropped, and Caps Lock changes the case of letters again (the
+    /// protocol reports the key, not the text).
+    fn note_modifiers(&mut self, mut k: KeyEvent) -> Option<KeyEvent> {
+        use crossterm::event::KeyEventState;
+        if let KeyCode::Modifier(m) = k.code {
+            if modifier_of(m).is_empty() {
+                return None;
+            }
+            if k.kind == KeyEventKind::Release {
+                self.held_keys.retain(|&h| h != m);
+            } else if !self.held_keys.contains(&m) {
+                self.held_keys.push(m);
+            }
+            self.sync_held();
+            return None;
+        }
+        // Another key's modifiers say which are up again (a release can be
+        // lost, say to a window manager's shortcut); they never add one, so a
+        // terminal without modifier events never shows held hints. crossterm
+        // folds Shift into a character (and drops the flag): there it says nothing.
+        let mut down = k.modifiers;
+        if matches!(k.code, KeyCode::Char(_) | KeyCode::BackTab) {
+            down |= KeyModifiers::SHIFT;
+        }
+        self.held_keys.retain(|&h| down.contains(modifier_of(h)));
+        self.sync_held();
+        // Shift-Enter arrived as itself: the terminal tells it from Enter
+        // (kitty protocol or modifyOtherKeys), so the hints offer it, from the
+        // start next time in this terminal too.
+        if k.code == KeyCode::Enter && k.modifiers.contains(KeyModifiers::SHIFT) && !keymap::shift_enter() {
+            keymap::set_shift_enter(true);
+            let _ = self.store.set(&shift_enter_key(), "1"); // a cache: best effort
+        }
+        match k.kind {
+            KeyEventKind::Release => return None,
+            KeyEventKind::Repeat => k.kind = KeyEventKind::Press,
+            KeyEventKind::Press => {}
+        }
+        if k.state.contains(KeyEventState::CAPS_LOCK)
+            && !k.modifiers.intersects(keymap::CHORD_MODS)
+            && let KeyCode::Char(c) = k.code
+            && c.is_alphabetic()
+        {
+            // Shift undoes Caps Lock (crossterm has already applied Shift).
+            let shift = keymap::held().contains(KeyModifiers::SHIFT);
+            if c.is_lowercase() != shift {
+                let flipped = if shift {
+                    c.to_lowercase().next()
+                } else {
+                    c.to_uppercase().next()
+                };
+                k.code = KeyCode::Char(flipped.unwrap_or(c));
+            }
+        }
+        Some(k)
+    }
+
+    fn sync_held(&self) {
+        keymap::set_held(
+            self.held_keys
+                .iter()
+                .fold(KeyModifiers::NONE, |m, &h| m | modifier_of(h)),
+        );
     }
 
     /// Remember when the status message changed (called before each frame).
@@ -5286,14 +5384,7 @@ impl App {
         // Alt-<letter or digit>: plugin keys (rune binds none of them).
         if cmd.is_none()
             && let Some(c) = keymap::is_plugin_key(&k)
-            && matches!(
-                ctx,
-                keymap::Ctx::ChatList
-                    | keymap::Ctx::ChatSearch
-                    | keymap::Ctx::Compose
-                    | keymap::Ctx::Messages
-                    | keymap::Ctx::Viewer
-            )
+            && plugin_keys_answer(ctx)
             && self.plugin_key(c)
         {
             return;
@@ -5949,7 +6040,20 @@ impl App {
 
     /// The status-line hint for what has the keys now.
     fn hint(&self) -> String {
-        keymap::hint(self.key_context(), |cmd| self.available(cmd))
+        let ctx = self.key_context();
+        let held = keymap::held();
+        // Holding Alt also shows the plugins' Alt keys where they answer (see `on_key`).
+        if held == KeyModifiers::ALT && plugin_keys_answer(ctx) {
+            let mut entries = keymap::held_entries(ctx, held, |cmd| self.available(cmd));
+            entries.extend(
+                self.plugins
+                    .keys_help()
+                    .into_iter()
+                    .map(|(k, h)| format!("{k} {h}")),
+            );
+            return keymap::held_text(held, entries);
+        }
+        keymap::hint(ctx, |cmd| self.available(cmd))
     }
 
     fn open_help(&mut self, ctx: keymap::Ctx) {
@@ -6018,8 +6122,10 @@ impl App {
         // only says how to get help, so nothing is listed twice.
         let overlay = self.overlay_open();
         let help = keymap::help_key(self.key_context());
-        let hint = match self.hint() {
-            keys if !overlay && !keys.is_empty() => format!("{help}{}{keys}", keymap::HINT_SEP),
+        let hint = match (!overlay).then(|| self.hint()) {
+            // While a modifier is held, only what it reaches.
+            Some(keys) if !keymap::held().is_empty() => keys,
+            Some(keys) if !keys.is_empty() => format!("{help}{}{keys}", keymap::HINT_SEP),
             _ => help.to_owned(),
         };
         let (message, hint) = status_line(&self.status, &hint, status.width as usize);
@@ -7275,7 +7381,10 @@ const BURST_GAP: Duration = Duration::from_millis(15);
 fn is_paste_burst(batch: &[Option<std::io::Result<TermEvent>>], continued: bool) -> bool {
     let presses = batch
         .iter()
-        .filter(|ev| matches!(ev, Some(Ok(TermEvent::Key(k))) if k.kind == KeyEventKind::Press))
+        .filter(|ev| {
+            matches!(ev, Some(Ok(TermEvent::Key(k)))
+                if k.kind != KeyEventKind::Release && !matches!(k.code, KeyCode::Modifier(_)))
+        })
         .count();
     presses > 0 && (continued || presses >= BURST_KEYS)
 }
@@ -7414,9 +7523,25 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
             std::io::stdout(),
             crossterm::event::PushKeyboardEnhancementFlags(
                 crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    // Reports Ctrl/Alt pressed and released on their own, for the hints.
+                    | crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                    | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | crossterm::event::KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
             )
         )
         .is_ok();
+    // Without that protocol, xterm's modifyOtherKeys still tells Shift-Enter from
+    // Enter where the terminal has it (WezTerm with `enable_kitty_keyboard` off,
+    // xterm, tmux with `extended-keys on`): it arrives as `ESC [27;2;13~`, which
+    // the patched crossterm in vendor/ reads. Terminals without it ignore the
+    // request. Whether it took is
+    // learnt from the first Shift-Enter (`App::note_modifiers`).
+    if !keyboard_enhancement {
+        set_modify_other_keys(true);
+    }
+    // modifyOtherKeys gave a Shift-Enter in this terminal before: it will again.
+    keymap::set_shift_enter(keyboard_enhancement || store.get(&shift_enter_key()).ok().flatten().is_some());
+    keymap::set_lone_modifiers(keyboard_enhancement);
     let mouse = opts.mouse && crossterm::execute!(std::io::stdout(), EnableMouseCapture).is_ok();
     let _ = crossterm::execute!(std::io::stdout(), EnableBracketedPaste, EnableFocusChange);
     // ratatui's panic hook restores raw mode and the screen; switch the
@@ -7478,10 +7603,32 @@ fn disable_terminal_modes(keyboard_enhancement: bool, mouse: bool) {
     let _ = crossterm::execute!(out, DisableBracketedPaste, DisableFocusChange);
     if keyboard_enhancement {
         let _ = crossterm::execute!(out, crossterm::event::PopKeyboardEnhancementFlags);
+    } else {
+        set_modify_other_keys(false);
     }
     if mouse {
         let _ = crossterm::execute!(out, DisableMouseCapture);
     }
+}
+
+/// Where it is remembered that this terminal (`TERM_PROGRAM`, else `TERM`)
+/// reports Shift-Enter through modifyOtherKeys.
+fn shift_enter_key() -> String {
+    let term = std::env::var("TERM_PROGRAM")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .or_else(|| std::env::var("TERM").ok())
+        .unwrap_or_default();
+    format!("cache.shift-enter.{term}")
+}
+
+/// Turn xterm's modifyOtherKeys on (level 1: only keys that otherwise send the
+/// same bytes as another, such as Shift-Enter) or back to the terminal's default.
+fn set_modify_other_keys(on: bool) {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(if on { b"\x1b[>4;1m" } else { b"\x1b[>4m" });
+    let _ = out.flush();
 }
 
 #[cfg(test)]
@@ -8601,6 +8748,36 @@ mod tests {
         a.open_chat("Ub".into());
         a.open_chat("Ua".into());
         assert!(a.unread_divider.is_none());
+    }
+
+    #[test]
+    fn a_shift_enter_is_remembered_for_the_terminal() {
+        let mut a = unread_app(Some("1"), 2);
+        a.focus = Focus::Input;
+        keymap::set_shift_enter(false);
+        assert!(keymap::hint(keymap::Ctx::Compose, |_| true).contains("Ctrl-j new line"));
+        type_text(&mut a, "a");
+        key_with_modifiers(&mut a, KeyCode::Enter, KeyModifiers::SHIFT);
+        type_text(&mut a, "b");
+        assert_eq!(a.input.as_str(), "a\nb");
+        assert!(keymap::hint(keymap::Ctx::Compose, |_| true).contains("Shift-Enter new line"));
+        assert_eq!(a.store.get(&shift_enter_key()).unwrap().as_deref(), Some("1"));
+        keymap::set_shift_enter(false);
+    }
+
+    #[test]
+    fn help_says_when_held_modifiers_cannot_be_shown() {
+        let a = unread_app(Some("1"), 2);
+        let has_note = |a: &App| {
+            a.help_lines(keymap::Ctx::Compose, None)
+                .iter()
+                .any(|(_, d)| d.contains("no kitty keyboard protocol"))
+        };
+        assert!(!has_note(&a), "the terminal reports them");
+        keymap::set_lone_modifiers(false);
+        let without = has_note(&a);
+        keymap::set_lone_modifiers(true);
+        assert!(without);
     }
 
     #[test]
@@ -11041,6 +11218,105 @@ mod tests {
         m.sel = m.items.iter().position(|(l, _)| l.contains("Plugins")).unwrap();
         key(a, KeyCode::Enter);
         assert!(matches!(&a.modal, Some(Modal::Settings(_))), "Settings › Plugins");
+    }
+
+    /// A lone modifier as the full keyboard protocol reports it.
+    fn modifier(a: &mut App, m: crossterm::event::ModifierKeyCode, held: KeyModifiers, kind: KeyEventKind) {
+        a.on_key(KeyEvent::new_with_kind(KeyCode::Modifier(m), held, kind));
+    }
+
+    #[tokio::test]
+    async fn holding_a_modifier_shows_what_it_reaches() {
+        use crossterm::event::ModifierKeyCode as M;
+        let dir = plugins::tests::TempDir::new("held");
+        plugins::tests::snippets(&dir.0);
+        let mut a = plugin_app(&dir.0);
+        enable_now(&mut a, "snippets");
+        a.open_chat("Ua".into());
+        a.focus = Focus::Input;
+        let plain = a.hint();
+
+        modifier(&mut a, M::LeftControl, KeyModifiers::CONTROL, KeyEventKind::Press);
+        let ctrl = a.hint();
+        assert!(
+            ctrl.split(keymap::HINT_SEP).all(|e| e.starts_with("Ctrl-")),
+            "{ctrl}"
+        );
+        assert!(screen(&mut a).contains(&ctrl[..ctrl.find(keymap::HINT_SEP).unwrap_or(ctrl.len())]));
+        // Nothing was typed, and the release brings the usual hint back.
+        assert!(a.input.as_str().is_empty());
+        modifier(
+            &mut a,
+            M::LeftControl,
+            KeyModifiers::CONTROL,
+            KeyEventKind::Release,
+        );
+        assert_eq!(a.hint(), plain);
+
+        // Alt also reaches the plugins' keys.
+        modifier(&mut a, M::LeftAlt, KeyModifiers::ALT, KeyEventKind::Press);
+        assert!(a.hint().contains("Alt-s"), "{}", a.hint());
+        assert!(!a.hint().contains("Ctrl-"), "{}", a.hint());
+        // Losing focus forgets it (the release goes to another window).
+        a.on_focus(false);
+        assert_eq!(a.hint(), plain);
+        a.on_focus(true);
+
+        // Shift too, and it stays held while a capital is typed (crossterm
+        // reports `A` without the Shift flag).
+        modifier(&mut a, M::LeftShift, KeyModifiers::SHIFT, KeyEventKind::Press);
+        let shift = a.hint();
+        assert!(shift.contains("Shift-Enter"), "{shift}");
+        key(&mut a, KeyCode::Char('A'));
+        assert_eq!(a.input.as_str(), "A");
+        assert_eq!(a.hint(), shift);
+        // Both Shift keys: letting go of one leaves Shift held.
+        modifier(&mut a, M::RightShift, KeyModifiers::SHIFT, KeyEventKind::Press);
+        modifier(&mut a, M::LeftShift, KeyModifiers::SHIFT, KeyEventKind::Release);
+        assert_eq!(a.hint(), shift);
+        // While held, the status line lists only what the modifier reaches.
+        let s: Vec<char> = screen(&mut a).chars().collect();
+        let last: String = s[s.len() - 100..].iter().collect();
+        assert!(last.starts_with("Shift-"), "{last}");
+        modifier(&mut a, M::RightShift, KeyModifiers::SHIFT, KeyEventKind::Release);
+        assert_eq!(a.hint(), plain);
+    }
+
+    #[tokio::test]
+    async fn held_hints_never_stick() {
+        use crossterm::event::{KeyEventState, ModifierKeyCode as M};
+        let mut a = app();
+        a.open_chat("Ua".into());
+        a.focus = Focus::Input;
+        let plain = a.hint();
+
+        // A terminal that reports no modifier keys on their own: a chord
+        // alone never switches the hints.
+        key_with_modifiers(&mut a, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        assert_eq!(a.hint(), plain);
+
+        // A release that never came: the next key without Ctrl says it is up.
+        modifier(&mut a, M::LeftControl, KeyModifiers::CONTROL, KeyEventKind::Press);
+        assert_ne!(a.hint(), plain);
+        key(&mut a, KeyCode::Char('a'));
+        assert_eq!(a.hint(), plain);
+        assert_eq!(a.input.as_str(), "a");
+
+        // Caps Lock capitalizes, and Shift undoes it.
+        let caps = |c| {
+            KeyEvent::new_with_kind_and_state(
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+                KeyEventKind::Press,
+                KeyEventState::CAPS_LOCK,
+            )
+        };
+        a.on_key(caps('b'));
+        modifier(&mut a, M::LeftShift, KeyModifiers::SHIFT, KeyEventKind::Press);
+        a.on_key(caps('C'));
+        modifier(&mut a, M::LeftShift, KeyModifiers::SHIFT, KeyEventKind::Release);
+        a.on_key(caps('1'));
+        assert_eq!(a.input.as_str(), "aBc1");
     }
 
     #[tokio::test]

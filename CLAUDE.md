@@ -234,7 +234,7 @@ key always kept — `main::status_line`, `frame_hint` for overlay frames), and
 the keymap tests pin one meaning per key and no redundant alternatives. `keymap::COMMANDS`
 lists the message line's `/` commands for its help screen — keep it in step with `App::submit`.
 `Ctrl-x` (main menu) is hinted first in every main view.
-Geometry lives in `layout.rs` (`panes` — one pane at a time below `SPLIT_MIN_W`, the focused one —, `popup`/`sheet` for every overlay box with shared margins, `bubble_width`, the too-small guard); never size a view by hand-picked percentages. `input.rs` is the cursor-editing field (multi-line on the message line: word-wrapped
+Geometry lives in `layout.rs` (`panes` — one pane at a time below `SPLIT_MIN_W`, the focused one —, `popup`/`sheet` for every overlay box with shared margins, `bubble_width`, the too-small guard); never size a view by hand-picked percentages. Holding Ctrl/Alt/Shift (reported through the kitty keyboard protocol: `App::note_modifiers` keeps each modifier key down in `App::held_keys`; other keys' modifiers only clear one, never add it — crossterm drops Shift from characters — so terminals without modifier events keep the usual hints) switches hints to every binding whose key uses all held modifiers (`keymap::held_hint`, `mods_used`: capitals and Shift-Tab count as Shift; a key an earlier binding takes is left out; the status line drops its help key meanwhile; holding Alt adds the plugins' `Alt` keys where they answer, `plugin_keys_answer`). `input.rs` is the cursor-editing field (multi-line on the message line: word-wrapped
 rows, `↑`/`↓` between them; Shift/Alt-Enter or Ctrl-j insert a line break); every text field (message line, forms,
 chat search, people picker, file filter) edits through `TextInput::edit` with the
 shared `TEXT_EDIT` keys (the file browser switches to `Ctx::AttachFilter` while a
@@ -258,7 +258,14 @@ line break instead of sending). `ratatui-image` is built without its default
 `chafa` feature (needs a system C library). Thai/Lao SARA AM (`ำ`) joins its letter into one two-column ratatui cell that
 WezTerm and other grapheme-aware terminals draw one column wide, shifting the row's marks: `App::draw`
 ends with `split_spacing_marks`, which re-lays such cells as `cell_safe` text (NIKHAHIT + SARA AA, one
-column per cell), and `wrap`/`TextInput::rows` never break before it (`joins_previous`).
+column per cell), and `wrap`/`TextInput::rows` never break before it (`joins_previous`). Without the kitty keyboard protocol `main::start` turns on
+xterm's modifyOtherKeys (`set_modify_other_keys`, undone in `disable_terminal_modes`) so Shift-Enter
+arrives as `ESC [27;2;13~`; crossterm drops those, so `vendor/crossterm` (`[patch.crates-io]`, CRLF
+files — keep their line endings) parses them (`vendor/crossterm/RUNE-PATCH.md`). The new-line hint
+names `Ctrl-j` until Shift-Enter is known to work (`keymap::set_shift_enter`: kitty protocol, or a
+Shift-Enter seen — remembered per `TERM_PROGRAM`/`TERM` as `cache.shift-enter.<term>`). Held-modifier
+hints need the kitty protocol too: without it (`keymap::lone_modifiers`) the help screen adds
+`plugin_ui::lone_modifiers_note`.
 
 **Plugins (`src/bin/rune-tui/plugins/`, `overlays/plugin_ui.rs`, `plugin-sdk/`;
 contract in `docs/PLUGINS.md`).** WebAssembly modules run by their own wasmtime
