@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Rune
+GenericName=LINE Chat Client
+Comment=Unofficial terminal client for LINE
+Exec=rune-tui
+TryExec=rune-tui
+Icon=rune-tui
+Terminal=true
+Categories=Network;InstantMessaging;Chat;ConsoleOnly;
+Keywords=LINE;chat;messenger;terminal;

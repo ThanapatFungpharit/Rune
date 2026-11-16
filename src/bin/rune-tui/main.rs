@@ -1,7 +1,7 @@
 //! `rune-tui` — a terminal chat client built on the `rune` library.
 //!
 //! ```sh
-//! cargo run --release --features tui --bin rune-tui [session.json]
+//! cargo run --release --features tui --bin rune-tui [SESSION]
 //! ```
 //!
 //! Options (`--help` lists them; see `cli.rs`, which refuses unknown ones):
@@ -7219,10 +7219,21 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
         show_missing_wasm(&problem);
         return Err(problem.to_string().into());
     }
-    let path = opts.session.clone();
+    let session_path = cli::session_path(opts.session.as_deref(), cli::data_home());
+    let path = session_path.to_string_lossy().into_owned();
     let session = match read_session(&path)? {
         Some(s) => s,
-        None => login(&path).await?,
+        None => {
+            // The default lives in rune's data directory, which may not exist yet;
+            // it will hold keys and messages, so only its owner may look inside.
+            // (A directory the user named is theirs: left as it is.)
+            if opts.session.is_none()
+                && let Some(dir) = session_path.parent().filter(|d| !d.as_os_str().is_empty())
+            {
+                make_private_dir(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+            }
+            login(&path).await?
+        }
     };
     let client = session.into_client(Config::default())?;
     let (tx, rx) = mpsc::unbounded_channel();

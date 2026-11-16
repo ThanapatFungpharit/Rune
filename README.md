@@ -83,6 +83,63 @@ OkLine, which reports testing them live; `rune` has not exercised those calls
 itself yet. The first live run (2026-11-13) is summarized in
 [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
+## Install
+
+`rune-tui`, the terminal chat app, installs like any other command-line
+program. You need a Rust toolchain (1.97 or newer; `rustup update`) and a C
+compiler (SQLite is compiled in); Linux and macOS are supported.
+
+```sh
+git clone https://github.com/ThanapatFungpharit/Rune.git && cd Rune
+make install                          # into ~/.local: no root needed
+```
+
+That installs
+
+| File                                                  | What                                      |
+|-------------------------------------------------------|-------------------------------------------|
+| `~/.local/bin/rune-tui`                               | the program                               |
+| `~/.local/share/man/man1/rune-tui.1`                  | `man rune-tui`                            |
+| `~/.local/share/applications/rune-tui.desktop`        | *Rune* in your desktop's app launcher (opens in a terminal) |
+| `~/.local/share/icons/hicolor/scalable/apps/rune-tui.svg` | its icon                              |
+
+Then run `rune-tui` from any directory (if `~/.local/bin` is not on your
+`PATH`, `make install` says so). The first start shows a QR code to scan
+with the LINE app on your phone.
+
+Other ways:
+
+```sh
+sudo make install PREFIX=/usr/local   # for every user (run `make` first, as yourself)
+make uninstall                        # with the same PREFIX as the install
+cargo install --locked --path . --features tui --bin rune-tui   # just the binary, into ~/.cargo/bin
+```
+
+Packagers: `make build`, then `make install PREFIX=/usr DESTDIR="$pkgdir"`
+(installs the license to `share/licenses/rune/`; desktop and icon caches are
+refreshed only when `DESTDIR` is empty).
+
+rune-tui needs LINE's `ltsm.wasm`, which is not distributed with it: when the
+LINE Chrome extension is installed in Chrome, Chromium, Brave, Edge or Vivaldi
+it is found there; otherwise see [Getting `ltsm.wasm`](#getting-ltsmwasm).
+
+Your data lives outside the install and is never touched by `make install`
+or `make uninstall`:
+
+| Path                                   | What                                                    |
+|----------------------------------------|---------------------------------------------------------|
+| `~/.local/share/rune/session.json`     | your login: tokens and Letter Sealing keys (`0600`)    |
+| `~/.local/share/rune/session.db`       | decrypted messages, contacts, settings (`0600`)        |
+| `~/.local/share/rune/plugins/`         | plugins                                                 |
+| `~/.config/rune/keys.json`             | your keyboard shortcuts                                 |
+| `~/.cache/rune/view/`                  | media you opened (pruned at start)                      |
+
+(`$XDG_DATA_HOME`, `$XDG_CONFIG_HOME` and `$XDG_CACHE_HOME` move them; the
+`rune` folder in the data directory is created owner-only.) A session path
+given on the command line overrides the default, and a `./session.json` in
+the current directory is still used while the default does not exist, so
+setups from before rune could be installed keep their login.
+
 ## Usage
 
 ```rust
@@ -146,7 +203,7 @@ loop {
 ### Terminal chat app (`rune-tui`)
 
 ```sh
-cargo run --release --features tui --bin rune-tui            # uses ./session.json, QR login if missing
+cargo run --release --features tui --bin rune-tui            # default session (see Install), QR login if missing
 cargo run --release --features tui --bin rune-tui -- --no-read-receipts
 cargo run --release --features tui --bin rune-tui -- --no-graphics   # draw pictures with text only
 cargo run --release --features tui --bin rune-tui -- --no-mouse   # keyboard only
@@ -481,7 +538,7 @@ and `Tokens`' `Debug` output is redacted.
 - `session.json` holds the access and refresh tokens, the device certificate
   and your Letter Sealing **private keys**. `Session::save` writes it with mode
   `0600`. Never commit it (it is in `.gitignore`).
-- The TUI's `session.db` holds your messages decrypted (mode `0600`).
+- The TUI's `session.db` (next to the session) holds your messages decrypted (mode `0600`).
   Deleted rows are overwritten (`secure_delete`), and `~/.cache/rune/view/`
   (copies of media you opened, folder `0700`) is pruned at start-up. Media
   you save goes to `~/Downloads/rune/` with your usual file permissions.

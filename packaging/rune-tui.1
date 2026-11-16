@@ -1,0 +1,104 @@
+.TH RUNE-TUI 1 "2026-11-16" "rune" "User Commands"
+.SH NAME
+rune-tui \- unofficial terminal chat client for LINE
+.SH SYNOPSIS
+.B rune-tui
+[\fIOPTIONS\fR] [\fISESSION\fR]
+.SH DESCRIPTION
+.B rune-tui
+is an unofficial, third-party LINE client for the terminal. It is not
+developed by, affiliated with, or endorsed by LY Corporation, and using it
+may conflict with LINE's Terms of Use.
+.PP
+.I SESSION
+is the saved login. When it does not exist,
+.B rune-tui
+logs in by QR code (scan it with the LINE app) and writes it, mode 0600.
+It holds your tokens and Letter Sealing keys: keep it private.
+.PP
+Inside the app, \fBCtrl\-x\fR opens the main menu and \fB?\fR lists the keys
+of the screen you are on.
+.SH OPTIONS
+.TP
+.B \-\-no\-read\-receipts
+Never mark chats as read; others see no read receipt.
+.TP
+.B \-\-no\-graphics
+Draw pictures with text instead of the terminal's image protocol (Kitty,
+Sixel, iTerm2).
+.TP
+.BI \-\-cells " MODE"
+Glyphs for text pictures:
+.BR quadrant " (default), " sextant " or " half .
+.TP
+.B \-\-no\-mouse
+Leave the mouse to the terminal (for text selection).
+.TP
+.BI \-\-db " PATH"
+The local message store (default: \fISESSION\fR with the extension
+\fB.db\fR).
+.TP
+.B \-\-no\-store
+Keep nothing on disk (an in-memory store).
+.TP
+.BI \-\-log " PATH"
+Append diagnostics to \fIPATH\fR (mode 0600). \fBRUST_LOG\fR sets the
+level (default \fBinfo\fR). Tokens and message text are never logged.
+.TP
+.BI \-\-plugins " DIR"
+Where plugins are installed (default: \fI$XDG_DATA_HOME/rune/plugins\fR).
+.TP
+.B \-\-no\-plugins
+Start no plugin this run; they stay enabled.
+.TP
+.B \-\-default\-keys
+Use the default keyboard shortcuts this run; yours stay saved.
+.TP
+.BR \-h ", " \-\-help
+Show the options.
+.TP
+.BR \-V ", " \-\-version
+Show the version.
+.SH FILES
+.TP
+.I $XDG_DATA_HOME/rune/session.json
+The default \fISESSION\fR (\fI~/.local/share/rune/\fR when
+\fBXDG_DATA_HOME\fR is unset). When it does not exist but
+\fI./session.json\fR does, that one is used.
+.TP
+.I $XDG_DATA_HOME/rune/session.db
+The local message store: chats, decrypted messages, contacts, settings.
+.TP
+.I $XDG_DATA_HOME/rune/ltsm.wasm
+LINE's secure module, which signs every request. It is not distributed with
+rune: it is taken from the LINE Chrome extension (version 3.7.2) installed in
+Chrome, Chromium, Brave, Edge or Vivaldi, or from this path, or from
+\fB$RUNE_LTSM\fR.
+.TP
+.I $XDG_DATA_HOME/rune/plugins/
+Installed plugins.
+.TP
+.I $XDG_CONFIG_HOME/rune/keys.json
+Your keyboard shortcuts.
+.TP
+.I $XDG_CACHE_HOME/rune/view/
+Media opened from chats (\fI~/.cache/rune/view/\fR by default; owner-only,
+emptied of old files at start).
+.TP
+.I ~/Downloads/rune/
+Media saved from chats.
+.SH ENVIRONMENT
+.TP
+.B RUNE_LTSM
+Path of \fIltsm.wasm\fR; when set, nowhere else is searched.
+.TP
+.B RUST_LOG
+Log level for \fB\-\-log\fR, for example \fBrune=debug\fR.
+.TP
+.B COLORFGBG ", " COLORTERM
+Pick the light or dark palette and true colour.
+.SH EXIT STATUS
+0 on a normal quit, 1 on an error (printed on standard error).
+.SH NOTES
+Reading a chat sends a read receipt unless \fB\-\-no\-read\-receipts\fR is
+given; sending messages and reading chats are visible to other people.

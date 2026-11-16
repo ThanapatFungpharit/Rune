@@ -24,7 +24,12 @@ cargo test --features tui plugins::            # plugin host: discovery, lifecyc
 (cd plugin-sdk && cargo test)                  # plugin API crate (not built by the commands above)
 (cd plugins/snippets && cargo test)            # the sample plugin's logic, natively
 scripts/plugin.sh build plugins/snippets       # rebuild snippets.wasm (host tests use it; needs wasm32-unknown-unknown)
+make install [PREFIX=~/.local] [DESTDIR=]      # rune-tui + man page + desktop entry + icon (packaging/); make uninstall
 ```
+
+`packaging/rune-tui.1` is the man page: a test (`cli::tests::man_page_lists_every_option`) fails when
+an option in `cli::USAGE` is missing from it. The default session is `cli::session_path`:
+`$XDG_DATA_HOME/rune/session.json` (dir created 0700), falling back to `./session.json` while only that exists.
 
 Opt-in (`#[ignore]`) tests need a real logged-in `session.json` (never committed)
 because `ltsm.wasm` rejects made-up mids — real-format mids are MAC-protected:

@@ -437,11 +437,7 @@ pub fn clean(s: &str, max: usize, newlines: bool) -> String {
 /// The default plugin directory: `$XDG_DATA_HOME/rune/plugins`, else
 /// `~/.local/share/rune/plugins`.
 pub fn default_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
-    Some(base.join("rune/plugins"))
+    Some(crate::cli::data_home()?.join("rune/plugins"))
 }
 
 /// One directory found in the plugin directory.

@@ -11,8 +11,10 @@ pub const USAGE: &str = "\
 Usage: rune-tui [OPTIONS] [SESSION]
 
 A terminal chat client for LINE. SESSION is the saved login (default:
-session.json); when it does not exist, rune-tui logs in by QR code and
-writes it (mode 0600). It holds your tokens and Letter Sealing keys.
+$XDG_DATA_HOME/rune/session.json, else ~/.local/share/rune/session.json;
+./session.json when only that one exists); when it does not exist, rune-tui
+logs in by QR code and writes it (mode 0600). It holds your tokens and
+Letter Sealing keys.
 
 Options:
   --no-read-receipts  never mark chats as read (others see no read receipt)
@@ -37,7 +39,9 @@ Options:
 /// What to run with.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Options {
-    pub session: String,
+    /// The session path given on the command line; `None` means the default
+    /// ([`session_path`]).
+    pub session: Option<String>,
     pub read_receipts: bool,
     pub graphics: bool,
     pub mouse: bool,
@@ -53,7 +57,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Options {
-            session: "session.json".into(),
+            session: None,
             read_receipts: true,
             graphics: true,
             mouse: true,
@@ -151,10 +155,44 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
     if o.no_store && o.db.is_some() {
         return Err("--db and --no-store contradict each other".into());
     }
-    if let Some(s) = session {
-        o.session = s;
-    }
+    o.session = session;
     Ok(Command::Run(o))
+}
+
+/// The old default session path, relative to the working directory.
+pub const LEGACY_SESSION: &str = "session.json";
+
+/// `$XDG_DATA_HOME` (only when absolute, as the spec requires), else
+/// `~/.local/share`.
+pub fn data_home() -> Option<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|h| !h.is_empty())
+                .map(|h| PathBuf::from(h).join(".local/share"))
+        })
+}
+
+/// The session to use: the one given, else `<data home>/rune/session.json`,
+/// unless that does not exist and `./session.json` (the default before rune
+/// could be installed) does: a missing session means a new QR login, which
+/// must not happen just because the default moved.
+pub fn session_path(given: Option<&str>, data_home: Option<PathBuf>) -> PathBuf {
+    if let Some(g) = given {
+        return PathBuf::from(g);
+    }
+    let Some(home) = data_home else {
+        return PathBuf::from(LEGACY_SESSION);
+    };
+    let default = home.join("rune").join("session.json");
+    let legacy = PathBuf::from(LEGACY_SESSION);
+    if !default.exists() && legacy.exists() {
+        legacy
+    } else {
+        default
+    }
 }
 
 #[cfg(test)]
@@ -191,9 +229,9 @@ mod tests {
         assert_eq!(o.cells, CellMode::Sextant);
         assert_eq!(o.db, Some(PathBuf::from("/tmp/x.db")));
         assert_eq!(o.log, Some(PathBuf::from("/tmp/rune.log")));
-        assert_eq!(o.session, "me.json");
+        assert_eq!(o.session.as_deref(), Some("me.json"));
         // A value that looks like the session path is the option's value.
-        assert_eq!(run(&["--db", "a.json"]).unwrap().session, "session.json");
+        assert_eq!(run(&["--db", "a.json"]).unwrap().session, None);
     }
 
     #[test]
@@ -220,8 +258,44 @@ mod tests {
         assert_eq!(p(&["--no-mouse", "--help"]), Command::Help);
         assert_eq!(p(&["--version"]), Command::Version);
         assert_eq!(
-            run(&["--", "--odd-name.json"]).unwrap().session,
-            "--odd-name.json"
+            run(&["--", "--odd-name.json"]).unwrap().session.as_deref(),
+            Some("--odd-name.json")
         );
+    }
+
+    #[test]
+    fn session_defaults_to_the_data_dir() {
+        let home = std::env::temp_dir().join(format!("rune-cli-home-{}", std::process::id()));
+        let default = home.join("rune/session.json");
+        // Given: always that. No home at all: the working directory.
+        assert_eq!(
+            session_path(Some("me.json"), Some(home.clone())),
+            PathBuf::from("me.json")
+        );
+        assert_eq!(session_path(None, None), PathBuf::from(LEGACY_SESSION));
+        // The tests run in the crate root, which has no session.json in CI; when a
+        // developer's is there, it is used until the data dir has one.
+        let expect_missing = if PathBuf::from(LEGACY_SESSION).exists() {
+            PathBuf::from(LEGACY_SESSION)
+        } else {
+            default.clone()
+        };
+        assert_eq!(session_path(None, Some(home.clone())), expect_missing);
+        std::fs::create_dir_all(default.parent().unwrap()).unwrap();
+        std::fs::write(&default, "{}").unwrap();
+        assert_eq!(session_path(None, Some(home.clone())), default);
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn man_page_lists_every_option() {
+        let man = include_str!("../../../packaging/rune-tui.1");
+        for line in USAGE.lines().map(str::trim_start).filter(|l| l.starts_with('-')) {
+            let opt = line.split([' ', ',']).next().unwrap();
+            assert!(
+                man.contains(&opt.replace('-', "\\-")),
+                "{opt} missing from rune-tui.1"
+            );
+        }
     }
 }

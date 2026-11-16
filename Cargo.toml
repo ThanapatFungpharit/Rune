@@ -2,6 +2,7 @@
 name = "rune"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.97"
 license = "MIT"
 description = "Unofficial Rust client for the LINE Chrome-extension gateway protocol"
 publish = false
