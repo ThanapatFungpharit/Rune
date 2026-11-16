@@ -1,6 +1,7 @@
 //! Settings: this app's preferences (kept in the local store), LINE's
-//! account-wide notification settings, your account, plugins and storage;
-//! plus desktop notifications for new messages (worded and shown by `notice`).
+//! account-wide notification settings, keyboard shortcuts (each screen's
+//! page is `shortcuts`), your account, plugins and storage; plus desktop
+//! notifications for new messages (worded and shown by `notice`).
 //!
 //! Screens opened from a settings row (a form, the pin lists, a plugin's
 //! page, a confirmation) come back to Settings when they close: see
@@ -129,6 +130,8 @@ pub enum Tab {
     /// This computer's notifications, then LINE's (which apply to the phone too).
     Notifications,
     Chats,
+    /// The keys of every screen (each opens its own page).
+    Shortcuts,
     /// Your display name, status message and profile page.
     Account,
     Plugins,
@@ -136,9 +139,10 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [
+    pub const ALL: [Tab; 6] = [
         Tab::Notifications,
         Tab::Chats,
+        Tab::Shortcuts,
         Tab::Account,
         Tab::Plugins,
         Tab::Storage,
@@ -148,6 +152,7 @@ impl Tab {
         match self {
             Tab::Notifications => "Notifications",
             Tab::Chats => "Chats",
+            Tab::Shortcuts => "Shortcuts",
             Tab::Account => "Account",
             Tab::Plugins => "Plugins",
             Tab::Storage => "Storage",
@@ -219,6 +224,11 @@ enum RowAct {
     InstallPlugin,
     /// Check every Git-installed plugin for a new version.
     CheckAll,
+    /// One screen's shortcuts, by index in `keymap::SECTIONS`.
+    Shortcuts(usize),
+    ResetShortcuts,
+    /// Read `keys.json` again (after editing it by hand).
+    ReloadKeys,
     None,
 }
 
@@ -381,6 +391,44 @@ impl App {
                     ),
                 ]
             }
+            Tab::Shortcuts => {
+                let mut rows = Vec::new();
+                if self.default_keys {
+                    rows.push(note("This run uses the default keys (--default-keys);"));
+                    rows.push(note("changes made here apply from the next start."));
+                }
+                rows.extend(keymap::SECTIONS.iter().enumerate().map(|(i, s)| {
+                    (
+                        s.title.to_owned(),
+                        self.shortcuts_summary(s),
+                        RowAct::Shortcuts(i),
+                    )
+                }));
+                if !self.keys.is_default() {
+                    rows.push((
+                        "Put back every default shortcut…".into(),
+                        "↵".into(),
+                        RowAct::ResetShortcuts,
+                    ));
+                }
+                if let Some(file) = self.keys_file_shown() {
+                    rows.push(("Read keys.json again".into(), "↵".into(), RowAct::ReloadKeys));
+                    rows.push(note(""));
+                    rows.push(note(&format!(
+                        "Also kept in {file}: edit it, then read it again."
+                    )));
+                } else {
+                    rows.push(note(""));
+                }
+                for problem in &self.key_problems {
+                    rows.push(note(&format!("Not used: {problem}")));
+                }
+                rows.push(note(
+                    "Enter shows a screen's shortcuts: change, add or reset each key.",
+                ));
+                rows.push(note("Alt with a letter or digit is kept for plugins."));
+                rows
+            }
             Tab::Account => {
                 let (name, status) = match &self.my_profile {
                     Some(Load::Ready((n, s))) => (n.clone(), s.clone()),
@@ -491,10 +539,10 @@ impl App {
         self.settings_rows(tab).into_iter().map(|r| r.0).collect()
     }
 
-    pub fn settings_key(&mut self, mut s: SettingsPage, k: KeyEvent) {
+    pub fn settings_key(&mut self, mut s: SettingsPage, cmd: Option<keymap::Cmd>) {
         let rows = self.settings_rows(s.tab);
         let selectable: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].2 != RowAct::None).collect();
-        match keymap::resolve(keymap::Ctx::Settings, &k) {
+        match cmd {
             Some(keymap::Cmd::Back) => return,
             Some(cmd @ (keymap::Cmd::PrevTab | keymap::Cmd::NextTab)) => {
                 s.tab = s.tab.step(cmd == keymap::Cmd::NextTab);
@@ -511,6 +559,17 @@ impl App {
                     Some(p) => selectable.get(p + 1).copied().unwrap_or(s.sel),
                     None => selectable.first().copied().unwrap_or(0),
                 };
+            }
+            Some(cmd @ (keymap::Cmd::PageUp | keymap::Cmd::PageDown)) => {
+                // A page is as many rows as the last frame could choose from.
+                let page = self.hit.modal_rows.len().max(1);
+                let pos = selectable.iter().position(|&i| i == s.sel).unwrap_or(0);
+                let to = if cmd == keymap::Cmd::PageUp {
+                    pos.saturating_sub(page)
+                } else {
+                    (pos + page).min(selectable.len().saturating_sub(1))
+                };
+                s.sel = selectable.get(to).copied().unwrap_or(0);
             }
             Some(keymap::Cmd::Home) => s.sel = selectable.first().copied().unwrap_or(0),
             Some(keymap::Cmd::End) => s.sel = selectable.last().copied().unwrap_or(0),
@@ -662,6 +721,20 @@ impl App {
                 return self.open_from_settings(App::install_plugin_form);
             }
             RowAct::CheckAll => return self.check_all_plugins(),
+            RowAct::Shortcuts(i) => return self.open_from_settings(|app| app.open_shortcuts(i)),
+            RowAct::ReloadKeys => {
+                self.status = self.read_keys_file();
+                return;
+            }
+            RowAct::ResetShortcuts => {
+                let n: usize = keymap::SECTIONS.iter().map(|s| self.keys.changed_in(s)).sum();
+                return self.open_from_settings(|app| {
+                    app.confirm(
+                        format!("Put back the default keys for every screen? Your {n} changed shortcuts are forgotten."),
+                        modal::Action::ResetShortcuts,
+                    )
+                });
+            }
             RowAct::None => return,
         }
         self.prefs.save(&self.store);
@@ -758,6 +831,7 @@ mod tests {
     fn tabs_wrap_around_both_ways() {
         assert_eq!(Tab::Storage.step(true), Tab::Notifications);
         assert_eq!(Tab::Notifications.step(false), Tab::Storage);
-        assert_eq!(Tab::Chats.step(true), Tab::Account);
+        assert_eq!(Tab::Chats.step(true), Tab::Shortcuts);
+        assert_eq!(Tab::Shortcuts.step(true), Tab::Account);
     }
 }

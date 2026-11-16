@@ -1012,11 +1012,11 @@ impl App {
         self.plugin_rows(id).iter().position(|r| r.label.contains(label))
     }
 
-    pub fn plugins_key(&mut self, mut m: Manager, k: KeyEvent) {
+    pub fn plugins_key(&mut self, mut m: Manager, cmd: Option<keymap::Cmd>) {
         let rows = self.plugin_rows(&m.plugin);
         let selectable: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].act != RowAct::None).collect();
         let mut sel = m.sel();
-        match keymap::resolve(keymap::Ctx::Plugins, &k) {
+        match cmd {
             Some(keymap::Cmd::Back) => return self.open_settings_on_plugin(&m.plugin),
             Some(keymap::Cmd::Up) => {
                 let pos = selectable.iter().position(|&i| i == sel).unwrap_or(0);
@@ -1304,9 +1304,10 @@ impl App {
 
     // -- a plugin's view ----------------------------------------------------------------
 
-    pub fn plugin_view_key(&mut self, mut v: PluginView, k: KeyEvent) {
+    /// `cmd` is what `k` means here; keys rune does not bind go to the plugin.
+    pub fn plugin_view_key(&mut self, mut v: PluginView, cmd: Option<keymap::Cmd>, k: KeyEvent) {
         let page = (self.hit.modal.map_or(10, |r| r.height.saturating_sub(2)) as usize).max(1);
-        match keymap::resolve(keymap::Ctx::PluginView, &k) {
+        match cmd {
             Some(keymap::Cmd::Back) => {
                 let (plugin, view) = (v.view.plugin, v.view.id);
                 self.plugin_event(&plugin, plugins::Event::ViewClosed { view });
@@ -1422,6 +1423,15 @@ impl App {
         if ctx == Ctx::Compose {
             lines.extend(self.plugins.commands_help());
         }
+        lines.push((String::new(), String::new()));
+        lines.push((
+            String::new(),
+            if ctx == Ctx::Keys {
+                "These keys cannot be changed.".into()
+            } else {
+                "Change any of these keys in Settings › Shortcuts.".into()
+            },
+        ));
         lines
     }
 }

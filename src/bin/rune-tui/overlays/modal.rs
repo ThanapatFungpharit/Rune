@@ -44,6 +44,10 @@ pub enum Modal {
     Plugins(plugin_ui::Manager),
     /// A plugin's own view.
     PluginView(plugin_ui::PluginView),
+    /// One screen's shortcuts (from Settings › Shortcuts).
+    Shortcuts(shortcuts::KeyPage),
+    /// Search in a chat.
+    Find(find::Find),
 }
 
 /// Something the user can ask for from a menu, key or form.
@@ -64,6 +68,8 @@ pub enum Action {
     ViewMedia,
     Save,
     Open,
+    /// The selected message's text to the clipboard.
+    CopyText,
     /// Open a downloaded file of a type that can run programs (asked first).
     OpenAnyway(String),
     GotoQuoted,
@@ -91,6 +97,10 @@ pub enum Action {
     ConfirmDecline(String),
     Decline(String),
     ClearCache,
+    /// Every shortcut back to its default (asked first).
+    ResetShortcuts,
+    /// Search a chat's stored messages.
+    FindInChat(String),
     /// The albums a group's history mentions.
     Albums(String),
     /// The posts of one album: `(chat, album id)`.
@@ -136,7 +146,12 @@ pub struct Menu {
 
 /// A menu label with its shortcut (see [`Menu`]).
 fn with_key(label: impl Into<String>, key: &str) -> String {
-    format!("{}\t{key}", label.into())
+    let label = label.into();
+    if key.is_empty() {
+        label
+    } else {
+        format!("{label}\t{key}")
+    }
 }
 
 /// A question with two labelled buttons. Every confirmation starts on
@@ -157,6 +172,7 @@ impl Action {
             Action::Decline(_) => "Decline",
             Action::DeletePinList(_) => "Delete",
             Action::ClearCache => "Clear",
+            Action::ResetShortcuts => "Reset",
             Action::OpenAnyway(_) => "Open",
             Action::SetCover(_) => "Replace cover",
             Action::EnablePlugin(_) => "Enable",
@@ -335,11 +351,17 @@ impl App {
         let mut chat = Vec::new();
         if let Some(open) = self.open.clone() {
             chat.push((
-                with_key(format!("💬 Chat menu: {}", self.name(&open)), "Ctrl-g"),
+                with_key(
+                    format!("💬 Chat menu: {}", self.name(&open)),
+                    &keymap::global(keymap::Cmd::ChatMenu),
+                ),
                 Action::ChatMenu(open),
             ));
             chat.push((
-                with_key("📎 Send a photo, file, sticker…", "Ctrl-o"),
+                with_key(
+                    "📎 Send a photo, file, sticker…",
+                    &keymap::global(keymap::Cmd::ComposeMenu),
+                ),
                 Action::ComposeMenu,
             ));
         }
@@ -347,26 +369,44 @@ impl App {
         let groups = vec![
             chat,
             vec![
-                (with_key("🔍 Find a chat or friend", "Ctrl-f"), Action::Search),
-                (with_key("👥 New group…", "n"), Action::NewGroup),
+                (
+                    with_key("🔍 Find a chat or friend", &keymap::global(keymap::Cmd::Search)),
+                    Action::Search,
+                ),
+                (
+                    with_key(
+                        "👥 New group…",
+                        &keymap::shortcut(keymap::Ctx::ChatList, keymap::Cmd::NewGroup),
+                    ),
+                    Action::NewGroup,
+                ),
             ],
             vec![
                 ("👤 My profile".to_owned(), Action::Profile(self.me.clone())),
                 ("📌 Pin lists…".to_owned(), Action::PinLists),
                 (
-                    with_key(format!("👀 Read receipts: {receipts}"), "Ctrl-r"),
+                    with_key(
+                        format!("👀 Read receipts: {receipts}"),
+                        &keymap::global(keymap::Cmd::ReadReceipts),
+                    ),
                     Action::ToggleReadReceipts,
                 ),
             ],
             vec![
                 (
-                    with_key("🔧 Settings", "Ctrl-s"),
+                    with_key("🔧 Settings", &keymap::global(keymap::Cmd::Settings)),
                     Action::Settings(settings::Tab::Notifications),
                 ),
                 ("🧩 Plugins".to_owned(), Action::Settings(settings::Tab::Plugins)),
-                (with_key("❓ Keyboard shortcuts", "F1"), Action::Help),
+                (
+                    with_key("❓ Keyboard shortcuts", &keymap::global(keymap::Cmd::Help)),
+                    Action::Help,
+                ),
             ],
-            vec![(with_key("👋 Quit", "Ctrl-c"), Action::Quit)],
+            vec![(
+                with_key("👋 Quit", &keymap::global(keymap::Cmd::Quit)),
+                Action::Quit,
+            )],
         ];
         self.open_grouped_menu(" ☰ rune ", groups);
     }
@@ -387,24 +427,42 @@ impl App {
         } else {
             "👤 Profile"
         };
-        let mut look = vec![(with_key(profile, "p"), Action::Profile(mid.into()))];
+        let key = |cmd| keymap::shortcut(keymap::Ctx::ChatList, cmd);
+        let mut look = vec![
+            (
+                with_key(profile, &key(keymap::Cmd::Profile)),
+                Action::Profile(mid.into()),
+            ),
+            // No key shown: `/` searches the chat from its messages, but the
+            // chat list from the list.
+            ("🔎 Search in chat…".to_owned(), Action::FindInChat(mid.into())),
+        ];
         if group {
             look.push(("🖼 Albums".to_owned(), Action::Albums(mid.into())));
         }
         let mut send = Vec::new();
         if self.open.as_deref() == Some(mid) {
             send.push((
-                with_key("📎 Send a photo, file, sticker…", "Ctrl-o"),
+                with_key(
+                    "📎 Send a photo, file, sticker…",
+                    &keymap::global(keymap::Cmd::ComposeMenu),
+                ),
                 Action::ComposeMenu,
             ));
         }
         let mut organise = vec![mute_item(mid, muted), pin_item(mid, self.is_pinned(mid))];
         if let Some(position) = self.pinned.iter().position(|pinned| pinned == mid) {
             if position > 0 {
-                organise.push((with_key("⬆ Move pin up", "K"), Action::MovePin(mid.into(), -1)));
+                organise.push((
+                    with_key("⬆ Move pin up", &key(keymap::Cmd::PinUp)),
+                    Action::MovePin(mid.into(), -1),
+                ));
             }
             if position + 1 < self.pinned.len() {
-                organise.push((with_key("⬇ Move pin down", "J"), Action::MovePin(mid.into(), 1)));
+                organise.push((
+                    with_key("⬇ Move pin down", &key(keymap::Cmd::PinDown)),
+                    Action::MovePin(mid.into(), 1),
+                ));
             }
         }
         let (mut manage, mut leave) = (Vec::new(), Vec::new());
@@ -501,15 +559,45 @@ impl App {
         if m.id.is_empty() {
             return;
         }
+        // The keys of where the menu was opened (the viewer has fewer).
+        let ctx = if self.viewer.is_some() {
+            keymap::Ctx::Viewer
+        } else {
+            keymap::Ctx::Messages
+        };
+        let key = |cmd| keymap::shortcut(ctx, cmd);
         // Act on it, then look into it, then the destructive unsend alone at the end.
         let mut act = vec![
-            (with_key("↩ Reply", "r"), Action::Reply(m.id.clone())),
-            (with_key("😀 React…", "e"), Action::ReactMenu(m.id.clone())),
+            (
+                with_key("↩ Reply", &key(keymap::Cmd::Reply)),
+                Action::Reply(m.id.clone()),
+            ),
+            (
+                with_key("😀 React…", &key(keymap::Cmd::React)),
+                Action::ReactMenu(m.id.clone()),
+            ),
         ];
         if m.media_kind().is_some() && !m.unsent {
-            act.push((with_key("🖼 View", "Enter"), Action::ViewMedia));
-            act.push((with_key("💾 Save to ~/Downloads/rune", "s"), Action::Save));
-            act.push((with_key("↗ Open with system app", "o"), Action::Open));
+            let view = if ctx == keymap::Ctx::Messages {
+                key(keymap::Cmd::Confirm)
+            } else {
+                String::new()
+            };
+            act.push((with_key("🖼 View", &view), Action::ViewMedia));
+            act.push((
+                with_key("💾 Save to ~/Downloads/rune", &key(keymap::Cmd::Save)),
+                Action::Save,
+            ));
+            act.push((
+                with_key("↗ Open with system app", &key(keymap::Cmd::OpenExternal)),
+                Action::Open,
+            ));
+        }
+        if m.copyable() {
+            act.push((
+                with_key("📋 Copy text", &key(keymap::Cmd::Copy)),
+                Action::CopyText,
+            ));
         }
         let mut info = Vec::new();
         if m.reply_to.is_some() {
@@ -521,10 +609,13 @@ impl App {
         let mut unsend = Vec::new();
         if m.from == self.me && !m.unsent {
             info.push(("👁 Read by…".to_owned(), Action::ReadBy(m.id.clone())));
-            unsend.push((with_key("🚫 Unsend…", "x"), Action::ConfirmUnsend(m.id.clone())));
+            unsend.push((
+                with_key("🚫 Unsend…", &key(keymap::Cmd::Unsend)),
+                Action::ConfirmUnsend(m.id.clone()),
+            ));
         }
         info.push((
-            with_key("👤 Sender's profile", "p"),
+            with_key("👤 Sender's profile", &key(keymap::Cmd::Profile)),
             Action::Profile(m.from.clone()),
         ));
         self.open_grouped_menu(" Message ", vec![act, info, unsend]);
@@ -676,6 +767,7 @@ impl App {
             Action::ReadBy(id) => self.modal = Some(Modal::ReadBy { msg: id, scroll: 0 }),
             Action::ViewMedia => self.open_viewer(),
             Action::Save => self.act_on_selected(After::Save),
+            Action::CopyText => self.copy_selected(),
             Action::Open => self.act_on_selected(After::Open),
             Action::OpenAnyway(id) => self.finish(&id, After::OpenAnyway),
             Action::GotoQuoted => self.goto_quoted(),
@@ -810,6 +902,8 @@ impl App {
             }
             Action::Decline(chat) => self.answer_invite_for(chat, false),
             Action::ClearCache => self.clear_cache(),
+            Action::ResetShortcuts => self.reset_all_shortcuts(),
+            Action::FindInChat(chat) => self.open_find(chat),
             Action::Search => {
                 self.close_profile();
                 self.start_search();
@@ -1236,11 +1330,23 @@ impl App {
     }
 
     pub fn modal_key(&mut self, k: KeyEvent) {
-        use keymap::{Cmd, Ctx};
+        let cmd = keymap::resolve(self.key_context(), &k);
+        self.modal_input(cmd, k);
+    }
+
+    /// What a click or the wheel does on the overlay: `cmd`, whichever key
+    /// it is bound to.
+    pub fn modal_cmd(&mut self, cmd: keymap::Cmd) {
+        self.modal_input(Some(cmd), KeyEvent::new(KeyCode::Null, KeyModifiers::NONE));
+    }
+
+    /// `cmd` (what `k` means on the open overlay, if anything) for the overlay.
+    fn modal_input(&mut self, cmd: Option<keymap::Cmd>, k: KeyEvent) {
+        use keymap::Cmd;
         let Some(modal) = self.modal.take() else { return };
         let keep = |app: &mut App, m: Modal| app.modal = Some(m);
         match modal {
-            Modal::Menu(mut m) => match keymap::resolve(Ctx::Menu, &k) {
+            Modal::Menu(mut m) => match cmd {
                 Some(Cmd::Back) => {}
                 Some(Cmd::Up) => {
                     m.sel = m.sel.checked_sub(1).unwrap_or(m.items.len().saturating_sub(1));
@@ -1274,7 +1380,7 @@ impl App {
                 }
                 _ => keep(self, Modal::Menu(m)),
             },
-            Modal::Confirm(mut c) => match keymap::resolve(Ctx::Confirm, &k) {
+            Modal::Confirm(mut c) => match cmd {
                 Some(Cmd::Yes) => self.run_action(c.action),
                 Some(Cmd::Confirm) if c.yes => self.run_action(c.action),
                 Some(Cmd::Back | Cmd::No | Cmd::Confirm) => self.status = "cancelled".into(),
@@ -1293,23 +1399,23 @@ impl App {
                 _ => keep(self, Modal::Confirm(c)),
             },
             Modal::Reactions { msg, scroll } => {
-                if let Some(scroll) = text_scroll(&k, scroll) {
+                if let Some(scroll) = text_scroll(cmd, scroll) {
                     keep(self, Modal::Reactions { msg, scroll });
                 }
             }
             Modal::ReadBy { msg, scroll } => {
-                if let Some(scroll) = text_scroll(&k, scroll) {
+                if let Some(scroll) = text_scroll(cmd, scroll) {
                     keep(self, Modal::ReadBy { msg, scroll });
                 }
             }
-            Modal::Help { ctx, under, scroll } => match keymap::resolve(Ctx::Help, &k) {
+            Modal::Help { ctx, under, scroll } => match cmd {
                 Some(Cmd::Back | Cmd::Help) => self.modal = under.map(|modal| *modal),
                 cmd => {
                     let scroll = scrolled(cmd, scroll);
                     keep(self, Modal::Help { ctx, under, scroll });
                 }
             },
-            Modal::Form(mut f) => match keymap::resolve(Ctx::Form, &k) {
+            Modal::Form(mut f) => match cmd {
                 Some(Cmd::Back) => {
                     self.status = "cancelled".into();
                     if let FormKind::Plugin { plugin, form } = f.kind {
@@ -1344,7 +1450,7 @@ impl App {
             },
             Modal::Pick(mut p) => {
                 let vis = p.visible();
-                match keymap::resolve(Ctx::Pick, &k) {
+                match cmd {
                     Some(Cmd::Back) => self.status = "cancelled".into(),
                     Some(Cmd::Up) => {
                         p.sel = p.sel.saturating_sub(1);
@@ -1352,6 +1458,16 @@ impl App {
                     }
                     Some(Cmd::Down) => {
                         p.sel = (p.sel + 1).min(vis.len().saturating_sub(1));
+                        keep(self, Modal::Pick(p));
+                    }
+                    // A page is as many people as the last frame showed.
+                    Some(Cmd::PageUp) => {
+                        p.sel = p.sel.saturating_sub(self.hit.modal_rows.len().max(1));
+                        keep(self, Modal::Pick(p));
+                    }
+                    Some(Cmd::PageDown) => {
+                        let page = self.hit.modal_rows.len().max(1);
+                        p.sel = (p.sel + page).min(vis.len().saturating_sub(1));
                         keep(self, Modal::Pick(p));
                     }
                     Some(Cmd::Toggle) if p.single => {
@@ -1389,11 +1505,13 @@ impl App {
                     }
                 }
             }
-            Modal::Attach(a) => self.attach_key(a, k),
-            Modal::Stickers(s) => self.stickers_key(s, k),
-            Modal::Settings(s) => self.settings_key(s, k),
-            Modal::Plugins(m) => self.plugins_key(m, k),
-            Modal::PluginView(v) => self.plugin_view_key(v, k),
+            Modal::Attach(a) => self.attach_key(a, cmd, k),
+            Modal::Stickers(s) => self.stickers_key(s, cmd),
+            Modal::Settings(s) => self.settings_key(s, cmd),
+            Modal::Plugins(m) => self.plugins_key(m, cmd),
+            Modal::PluginView(v) => self.plugin_view_key(v, cmd, k),
+            Modal::Shortcuts(p) => self.shortcuts_key(p, cmd, k),
+            Modal::Find(f) => self.find_key(f, cmd, k),
         }
     }
 
@@ -1414,13 +1532,31 @@ impl App {
                     self.attach_paste(a, text);
                 }
             }
+            Some(Modal::Find(_)) => {
+                if let Some(Modal::Find(f)) = self.modal.take() {
+                    self.find_paste(f, text);
+                }
+            }
             _ => {}
         }
     }
 
     pub fn modal_mouse(&mut self, m: MouseEvent) {
+        use keymap::Cmd;
         let at = Position::new(m.column, m.row);
         let inside = self.hit.modal.is_some_and(|r| r.contains(at));
+        // Waiting for a new shortcut: the mouse gives up waiting.
+        if let Some(Modal::Shortcuts(p)) = self.modal.as_mut()
+            && p.state != shortcuts::State::Browse
+            && !matches!(
+                m.kind,
+                MouseEventKind::Moved | MouseEventKind::Up(_) | MouseEventKind::Drag(_)
+            )
+        {
+            p.state = shortcuts::State::Browse;
+            p.note = Some("not changed".into());
+            return;
+        }
         match m.kind {
             MouseEventKind::Down(MouseButton::Right) => self.close_modal(),
             MouseEventKind::Down(MouseButton::Left) if !inside => self.close_modal(),
@@ -1433,39 +1569,51 @@ impl App {
                     && let Some(Modal::Confirm(c)) = self.modal.as_mut()
                 {
                     c.yes = yes;
-                    return self.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                    return self.modal_cmd(Cmd::Confirm);
                 }
                 let Some(i) = row else { return };
                 match self.modal.as_mut() {
                     Some(Modal::Menu(menu)) => {
                         menu.sel = i;
-                        self.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                        self.modal_cmd(Cmd::Confirm);
                     }
                     Some(Modal::Pick(p)) => {
                         p.sel = i;
-                        self.modal_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+                        self.modal_cmd(Cmd::Toggle);
                     }
                     Some(Modal::Form(f)) => f.sel = i.min(f.fields.len() - 1),
                     Some(Modal::Attach(a)) => {
                         if a.sel == i {
-                            self.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                            self.modal_cmd(Cmd::Confirm);
                         } else {
                             a.sel = i;
                         }
                     }
                     Some(Modal::Settings(s)) => {
                         if s.sel == i {
-                            self.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                            self.modal_cmd(Cmd::Confirm);
                         } else {
                             s.sel = i;
                         }
                     }
                     Some(Modal::Plugins(m)) => {
                         if m.sel() == i {
-                            self.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                            self.modal_cmd(Cmd::Confirm);
                         } else {
                             m.select(i);
                         }
+                    }
+                    Some(Modal::Shortcuts(p)) => {
+                        if p.sel == i {
+                            self.modal_cmd(Cmd::Confirm);
+                        } else {
+                            p.sel = i;
+                            p.note = None;
+                        }
+                    }
+                    Some(Modal::Find(f)) => {
+                        f.sel = i;
+                        self.modal_cmd(Cmd::Confirm);
                     }
                     _ => {}
                 }
@@ -1473,11 +1621,18 @@ impl App {
             // The wheel stops at the ends of a menu instead of wrapping around.
             MouseEventKind::ScrollUp => match self.modal.as_mut() {
                 Some(Modal::Menu(menu)) => menu.sel = menu.sel.saturating_sub(1),
-                _ => self.modal_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+                // A plugin's view hears the arrow itself.
+                Some(Modal::PluginView(_)) => {
+                    self.modal_input(None, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+                }
+                _ => self.modal_cmd(Cmd::Up),
             },
             MouseEventKind::ScrollDown => match self.modal.as_mut() {
                 Some(Modal::Menu(menu)) => menu.sel = (menu.sel + 1).min(menu.items.len().saturating_sub(1)),
-                _ => self.modal_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+                Some(Modal::PluginView(_)) => {
+                    self.modal_input(None, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+                }
+                _ => self.modal_cmd(Cmd::Down),
             },
             _ => {}
         }
@@ -1615,9 +1770,13 @@ impl App {
                 f.render_widget(Paragraph::new(body), inner);
                 let y = inner.y + shown as u16 + u16::from(inner.height as usize > shown + 1);
                 if y < inner.y + inner.height {
+                    let button = |what: &str, cmd| match keymap::shortcut(keymap::Ctx::Confirm, cmd) {
+                        key if key.is_empty() => format!(" {what} "),
+                        key => format!(" {what} ({key}) "),
+                    };
                     let buttons = [
-                        (format!(" {} (y) ", c.action.verb()), true),
-                        (" Cancel (n) ".to_owned(), false),
+                        (button(c.action.verb(), keymap::Cmd::Yes), true),
+                        (button("Cancel", keymap::Cmd::No), false),
                     ];
                     let mut x = inner.x;
                     for (label, yes) in buttons {
@@ -1653,16 +1812,23 @@ impl App {
                     _ => None,
                 };
                 let lines = self.help_lines(*ctx, view);
-                let want = lines
+                // Every key is padded to the widest (up to 24 columns): room for
+                // that, a space and the longest description, inside the border.
+                let widest_key = lines
                     .iter()
-                    .map(|(key, description)| key.width() + description.width() + 3)
+                    .map(|(key, _)| key.width())
                     .max()
-                    .unwrap_or(40)
-                    .clamp(36, 100);
+                    .unwrap_or(1)
+                    .min(24);
+                let widest_description = lines.iter().map(|(_, d)| d.width()).max().unwrap_or(0);
+                let want = (widest_key + 1 + widest_description + 2).clamp(36, 100);
                 let r = popup(area, want as u16, lines.len() as u16 + 2);
                 let h = r.height.saturating_sub(2) as usize;
                 *scroll = (*scroll).min(lines.len().saturating_sub(h));
-                let title = format!(" {} shortcuts ", ctx.title());
+                let title = match ctx {
+                    keymap::Ctx::Keys => " Shortcut editor keys ".to_owned(),
+                    ctx => format!(" {} shortcuts ", ctx.title()),
+                };
                 let inner = self.modal_frame(f, r, &title, &hint);
                 let key_width = lines
                     .iter()
@@ -1812,7 +1978,9 @@ impl App {
             | Modal::Stickers(_)
             | Modal::Settings(_)
             | Modal::Plugins(_)
-            | Modal::PluginView(_) => {}
+            | Modal::PluginView(_)
+            | Modal::Shortcuts(_)
+            | Modal::Find(_) => {}
         }
         self.modal = Some(modal);
         match self.modal.take() {
@@ -1836,6 +2004,14 @@ impl App {
                 self.draw_plugin_view(f, area, &mut v, hint);
                 self.modal = Some(Modal::PluginView(v));
             }
+            Some(Modal::Shortcuts(mut p)) => {
+                self.draw_shortcuts(f, area, &mut p, hint);
+                self.modal = Some(Modal::Shortcuts(p));
+            }
+            Some(Modal::Find(mut find)) => {
+                self.draw_find(f, area, &mut find, hint);
+                self.modal = Some(Modal::Find(find));
+            }
             other => self.modal = other,
         }
     }
@@ -1856,8 +2032,8 @@ fn scrolled(cmd: Option<keymap::Cmd>, scroll: usize) -> usize {
 }
 
 /// A key in a read-only text box: the new scroll position, `None` to close.
-fn text_scroll(k: &KeyEvent, scroll: usize) -> Option<usize> {
-    match keymap::resolve(keymap::Ctx::Info, k) {
+fn text_scroll(cmd: Option<keymap::Cmd>, scroll: usize) -> Option<usize> {
+    match cmd {
         Some(keymap::Cmd::Back) => None,
         cmd => Some(scrolled(cmd, scroll)),
     }

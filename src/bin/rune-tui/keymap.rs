@@ -1,8 +1,15 @@
 //! Every key binding, per context, in one place: what `on_key` and the
-//! overlays resolve keys with, and what the status-line hints and the help
-//! screen show.
+//! overlays resolve keys with, and what the status-line hints, the help
+//! screen, menus and messages show.
 //!
-//! The rules the tables follow:
+//! The tables below are the defaults. Any binding can be changed in
+//! Settings › Shortcuts ([`Keymap`] holds the changes, stored as
+//! `setting.keys`); text never names a key itself but asks [`label`], so
+//! what the screen says is always what the keys do. `--default-keys` runs
+//! with the defaults. The shortcut editor's own keys (`Ctx::Keys`) and the
+//! menus' numbers cannot be changed, so a mistake can always be undone.
+//!
+//! The rules the defaults follow (and changes are held to, where marked *):
 //! - Global chords work in every view where they make sense, also while
 //!   typing: `Ctrl-c` quits, `F1` shows help, `Ctrl-x` opens the main menu
 //!   (everything that is not about one chat or message: search, new group,
@@ -13,7 +20,7 @@
 //! - Navigation is never typed into the message line: the `/` commands act
 //!   on the open chat; screens are opened by keys and menus.
 //! - `?` shows help wherever printable keys are not text.
-//! - Plain letters are only bound where nothing is typed, and only for
+//! - Plain letters are only bound where nothing is typed (*), and only for
 //!   things done often to the selected item. Everything else lives in the
 //!   item's menu (`m`), which lists it by name.
 //! - `Enter` confirms or opens, `Esc` goes back; consequential actions ask
@@ -21,15 +28,21 @@
 //! - Text fields edit at a cursor (`←` `→` `Home` `End` `Delete`), and by
 //!   word the way shells do (`Ctrl-←` `Ctrl-→` `Ctrl-w` `Ctrl-u` `Ctrl-k`).
 //! - Lists jump to their first and last item with `Home` and `End`.
-//! - `Alt-<letter or digit>` is never bound here: those keys belong to
+//! - `Alt-<letter or digit>` is never bound here (*): those keys belong to
 //!   plugins (`is_plugin_key`), so a plugin can never shadow a rune key.
+//! - One key means one thing wherever it answers (*: a change that would
+//!   break this offers to move the key).
 //! - On the message line `Enter` sends and `Shift-Enter` (or `Alt-Enter`,
 //!   or `Ctrl-j` where the terminal cannot tell `Shift-Enter` apart) starts
 //!   a new line; `↑` `↓` move between its lines.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Ctx {
     ChatList,
     ChatSearch,
@@ -54,11 +67,15 @@ pub enum Ctx {
     Plugins,
     /// A plugin's view: keys not bound here go to the plugin.
     PluginView,
+    /// One screen's shortcuts (Settings › Shortcuts › a screen). Its keys
+    /// cannot be changed.
+    Keys,
+    /// Search in a chat: typing is the query.
+    Find,
 }
 
 impl Ctx {
-    #[cfg(test)]
-    pub const ALL: [Ctx; 20] = [
+    pub const ALL: [Ctx; 22] = [
         Ctx::ChatList,
         Ctx::ChatSearch,
         Ctx::Compose,
@@ -79,6 +96,8 @@ impl Ctx {
         Ctx::Settings,
         Ctx::Plugins,
         Ctx::PluginView,
+        Ctx::Keys,
+        Ctx::Find,
     ];
 
     /// Shown as the help screen's title.
@@ -104,11 +123,41 @@ impl Ctx {
             Ctx::Settings => "Settings",
             Ctx::Plugins => "Plugin page",
             Ctx::PluginView => "Plugin view",
+            Ctx::Keys => "Shortcut editor",
+            Ctx::Find => "Search in chat",
+        }
+    }
+
+    /// Its name in stored shortcuts (never changes).
+    fn id(self) -> &'static str {
+        match self {
+            Ctx::ChatList => "chat-list",
+            Ctx::ChatSearch => "chat-search",
+            Ctx::Compose => "message-line",
+            Ctx::Messages => "messages",
+            Ctx::Viewer => "viewer",
+            Ctx::Profile => "profile",
+            Ctx::Menu => "menu",
+            Ctx::Confirm => "confirm",
+            Ctx::Info => "info",
+            Ctx::Help => "help",
+            Ctx::Form => "form",
+            Ctx::Pick => "people-picker",
+            Ctx::AttachBrowse => "files",
+            Ctx::AttachFilter => "file-filter",
+            Ctx::AttachSend => "send-dialog",
+            Ctx::Stickers => "stickers",
+            Ctx::Emoji => "emoji",
+            Ctx::Settings => "settings",
+            Ctx::Plugins => "plugin-page",
+            Ctx::PluginView => "plugin-view",
+            Ctx::Keys => "shortcuts",
+            Ctx::Find => "chat-search-messages",
         }
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Cmd {
     Up,
     Down,
@@ -158,6 +207,8 @@ pub enum Cmd {
     OpenLink,
     Save,
     OpenExternal,
+    Copy,
+    FindInChat,
     PlayPause,
     // Overlays.
     Yes,
@@ -170,12 +221,106 @@ pub enum Cmd {
     ShowHidden,
     HomeDir,
     ParentDir,
+    // The shortcut editor.
+    AddKey,
+    ResetKey,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+impl Cmd {
+    /// Its name in stored shortcuts (never changes).
+    fn id(self) -> &'static str {
+        match self {
+            Cmd::Up => "up",
+            Cmd::Down => "down",
+            Cmd::Left => "left",
+            Cmd::Right => "right",
+            Cmd::PageUp => "page-up",
+            Cmd::PageDown => "page-down",
+            Cmd::Home => "home",
+            Cmd::End => "end",
+            Cmd::Confirm => "confirm",
+            Cmd::Back => "back",
+            Cmd::Search => "search",
+            Cmd::Toggle => "toggle",
+            Cmd::SwitchFocus => "switch-focus",
+            Cmd::CursorLeft => "cursor-left",
+            Cmd::CursorRight => "cursor-right",
+            Cmd::LineStart => "line-start",
+            Cmd::LineEnd => "line-end",
+            Cmd::DeleteBackward => "delete-backward",
+            Cmd::DeleteForward => "delete-forward",
+            Cmd::WordLeft => "word-left",
+            Cmd::WordRight => "word-right",
+            Cmd::DeleteWordBackward => "delete-word-backward",
+            Cmd::DeleteToLineStart => "delete-to-line-start",
+            Cmd::DeleteToLineEnd => "delete-to-line-end",
+            Cmd::NewLine => "new-line",
+            Cmd::Help => "help",
+            Cmd::MainMenu => "main-menu",
+            Cmd::Settings => "settings",
+            Cmd::Quit => "quit",
+            Cmd::ComposeMenu => "compose-menu",
+            Cmd::ChatMenu => "chat-menu",
+            Cmd::ChatProfile => "chat-profile",
+            Cmd::ReadReceipts => "read-receipts",
+            Cmd::Menu => "menu",
+            Cmd::Profile => "profile",
+            Cmd::NewGroup => "new-group",
+            Cmd::PinUp => "pin-up",
+            Cmd::PinDown => "pin-down",
+            Cmd::NextUnread => "next-unread",
+            Cmd::Reply => "reply",
+            Cmd::React => "react",
+            Cmd::Unsend => "unsend",
+            Cmd::OpenLink => "open-link",
+            Cmd::Save => "save",
+            Cmd::OpenExternal => "open-external",
+            Cmd::Copy => "copy",
+            Cmd::FindInChat => "find-in-chat",
+            Cmd::PlayPause => "play-pause",
+            Cmd::Yes => "yes",
+            Cmd::No => "no",
+            Cmd::Digit(_) => "digit",
+            Cmd::NextTab => "next-tab",
+            Cmd::PrevTab => "prev-tab",
+            Cmd::AsFile => "as-file",
+            Cmd::OriginalQuality => "original-quality",
+            Cmd::ShowHidden => "show-hidden",
+            Cmd::HomeDir => "home-dir",
+            Cmd::ParentDir => "parent-dir",
+            Cmd::AddKey => "add-key",
+            Cmd::ResetKey => "reset-key",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Key {
     pub code: KeyCode,
     pub mods: KeyModifiers,
+}
+
+impl Key {
+    /// The key as bindings compare it: a character says Shift itself (`K`,
+    /// `?`), and Shift-Tab is its own key whether or not the terminal adds
+    /// Shift to it (crossterm does).
+    pub fn normalized(self) -> Key {
+        match self.code {
+            KeyCode::Char(_) | KeyCode::BackTab => Key {
+                code: self.code,
+                mods: self.mods.difference(KeyModifiers::SHIFT),
+            },
+            _ => self,
+        }
+    }
+
+    pub fn of(event: &KeyEvent) -> Key {
+        Key {
+            code: event.code,
+            mods: event.modifiers,
+        }
+        .normalized()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -236,7 +381,7 @@ use KeyCode::{
     BackTab, Backspace, Delete, Down, End, Enter, Esc, Home, Left, PageDown, PageUp, Right, Tab, Up,
 };
 
-pub const GLOBAL: &[Binding] = &[
+static GLOBAL: &[Binding] = &[
     binding!(Cmd::Quit, "quit", false; ctrl('c')),
     binding!(Cmd::Help, "show the shortcuts", false; key(KeyCode::F(1))),
     binding!(Cmd::MainMenu, "menu", true; ctrl('x')),
@@ -249,7 +394,8 @@ pub const GLOBAL: &[Binding] = &[
 ];
 
 /// `?` where printable keys are not text.
-static QUESTION_HELP: &[Binding] = &[binding!(Cmd::Help, "show the shortcuts", false; ch('?'))];
+static QUESTION_HELP: &[Binding] =
+    &[binding!(Cmd::Help, "show the shortcuts (not while typing)", false; ch('?'))];
 
 /// Editing keys of every text field with a cursor.
 static TEXT_EDIT: &[Binding] = &[
@@ -324,6 +470,8 @@ static MESSAGES: &[Binding] = &[
     binding!(Cmd::Menu, "all actions", true; ch('m')),
     binding!(Cmd::Save, "save to ~/Downloads/rune", true; ch('s')),
     binding!(Cmd::OpenExternal, "open with the system app", false; ch('o')),
+    binding!(Cmd::Copy, "copy the text", false; ch('c')),
+    binding!(Cmd::FindInChat, "search this chat's messages", false; ch('/')),
     binding!(Cmd::Profile, "the sender's profile", false; ch('p')),
     binding!(Cmd::Unsend, "unsend (asks first)", false; ch('x')),
     binding!(Cmd::Back, "back to typing", false; key(Esc)),
@@ -347,6 +495,10 @@ static PROFILE: &[Binding] = &[
     binding!(Cmd::Right, "next button", false; key(Right), ch('l')),
     binding!(Cmd::Up, "previous member (above the first: the buttons)", false; key(Up), ch('k')),
     binding!(Cmd::Down, "next member", false; key(Down), ch('j')),
+    binding!(Cmd::PageUp, "a page of members up", false; key(PageUp)),
+    binding!(Cmd::PageDown, "a page of members down", false; key(PageDown)),
+    binding!(Cmd::Home, "the buttons", false; key(Home)),
+    binding!(Cmd::End, "last member", false; key(End)),
     binding!(Cmd::Confirm, "press the button / open the member", true; key(Enter)),
 ];
 
@@ -410,6 +562,8 @@ static PICK: &[Binding] = &[
     binding!(Cmd::Back, "cancel", true; key(Esc)),
     binding!(Cmd::Up, "previous person", false; key(Up)),
     binding!(Cmd::Down, "next person", false; key(Down)),
+    binding!(Cmd::PageUp, "page up", false; key(PageUp)),
+    binding!(Cmd::PageDown, "page down", false; key(PageDown)),
     binding!(Cmd::Toggle, "tick / untick", true; ch(' ')),
     binding!(Cmd::Confirm, "done (nobody ticked: the highlighted one)", true; key(Enter)),
 ];
@@ -474,6 +628,8 @@ static SETTINGS: &[Binding] = &[
     binding!(Cmd::PrevTab, "previous tab", false; key(Left), key(BackTab)),
     binding!(Cmd::Up, "previous setting", false; key(Up), ch('k')),
     binding!(Cmd::Down, "next setting", false; key(Down), ch('j')),
+    binding!(Cmd::PageUp, "page up", false; key(PageUp)),
+    binding!(Cmd::PageDown, "page down", false; key(PageDown)),
     binding!(Cmd::Home, "first setting", false; key(Home)),
     binding!(Cmd::End, "last setting", false; key(End)),
     binding!(Cmd::Confirm, "change", true; key(Enter), ch(' ')),
@@ -495,58 +651,248 @@ static PLUGIN_VIEW: &[Binding] = &[
     binding!(Cmd::PageDown, "scroll down", false; key(PageDown)),
 ];
 
-/// The context's own bindings, then the shared ones it takes.
-fn tables(ctx: Ctx) -> [&'static [Binding]; 3] {
-    let own = match ctx {
-        Ctx::ChatList => CHAT_LIST,
-        Ctx::ChatSearch => CHAT_SEARCH,
-        Ctx::Compose => COMPOSE,
-        Ctx::Messages => MESSAGES,
-        Ctx::Viewer => VIEWER,
-        Ctx::Profile => PROFILE,
-        Ctx::Menu => MENU,
-        Ctx::Confirm => CONFIRM,
-        Ctx::Info => INFO,
-        Ctx::Help => HELP,
-        Ctx::Form => FORM,
-        Ctx::Pick => PICK,
-        Ctx::AttachBrowse => ATTACH_BROWSE,
-        Ctx::AttachFilter => ATTACH_FILTER,
-        Ctx::AttachSend => ATTACH_SEND,
-        Ctx::Stickers => STICKERS,
-        Ctx::Emoji => EMOJI,
-        Ctx::Settings => SETTINGS,
-        Ctx::Plugins => PLUGINS,
-        Ctx::PluginView => PLUGIN_VIEW,
-    };
-    let edit = if matches!(
+/// Search in a chat: printable keys are the query.
+static FIND: &[Binding] = &[
+    binding!(Cmd::Back, "close", true; key(Esc)),
+    binding!(Cmd::Confirm, "show the message in the chat", true; key(Enter)),
+    binding!(Cmd::Up, "newer match", false; key(Up)),
+    binding!(Cmd::Down, "older match", false; key(Down)),
+    binding!(Cmd::PageUp, "page up", false; key(PageUp)),
+    binding!(Cmd::PageDown, "page down", false; key(PageDown)),
+];
+
+/// The shortcut editor: fixed, so a shortcut changed by mistake can always
+/// be changed back.
+static KEYS: &[Binding] = &[
+    binding!(Cmd::Back, "back", true; key(Esc)),
+    binding!(Cmd::Up, "previous shortcut", false; key(Up), ch('k')),
+    binding!(Cmd::Down, "next shortcut", false; key(Down), ch('j')),
+    binding!(Cmd::Home, "first shortcut", false; key(Home)),
+    binding!(Cmd::End, "last shortcut", false; key(End)),
+    binding!(Cmd::NextTab, "next screen", false; key(Right), key(Tab)),
+    binding!(Cmd::PrevTab, "previous screen", false; key(Left), key(BackTab)),
+    binding!(Cmd::Confirm, "change (then press the new key)", true; key(Enter)),
+    binding!(Cmd::AddKey, "add a key", true; ch('a')),
+    binding!(Cmd::ResetKey, "reset to the default", true; key(Delete), key(Backspace)),
+];
+
+/// A table of bindings: one context's own, or one several contexts share.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Table {
+    Global,
+    /// `?` for help where printable keys are not text.
+    QuestionHelp,
+    TextEdit,
+    Own(Ctx),
+}
+
+impl Table {
+    fn bindings(self) -> &'static [Binding] {
+        match self {
+            Table::Global => GLOBAL,
+            Table::QuestionHelp => QUESTION_HELP,
+            Table::TextEdit => TEXT_EDIT,
+            Table::Own(ctx) => match ctx {
+                Ctx::ChatList => CHAT_LIST,
+                Ctx::ChatSearch => CHAT_SEARCH,
+                Ctx::Compose => COMPOSE,
+                Ctx::Messages => MESSAGES,
+                Ctx::Viewer => VIEWER,
+                Ctx::Profile => PROFILE,
+                Ctx::Menu => MENU,
+                Ctx::Confirm => CONFIRM,
+                Ctx::Info => INFO,
+                Ctx::Help => HELP,
+                Ctx::Form => FORM,
+                Ctx::Pick => PICK,
+                Ctx::AttachBrowse => ATTACH_BROWSE,
+                Ctx::AttachFilter => ATTACH_FILTER,
+                Ctx::AttachSend => ATTACH_SEND,
+                Ctx::Stickers => STICKERS,
+                Ctx::Emoji => EMOJI,
+                Ctx::Settings => SETTINGS,
+                Ctx::Plugins => PLUGINS,
+                Ctx::PluginView => PLUGIN_VIEW,
+                Ctx::Keys => KEYS,
+                Ctx::Find => FIND,
+            },
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Table::Global => "global",
+            Table::QuestionHelp => "help-key",
+            Table::TextEdit => "text",
+            Table::Own(ctx) => ctx.id(),
+        }
+    }
+
+    /// Every table.
+    fn all() -> impl Iterator<Item = Table> {
+        [Table::Global, Table::QuestionHelp, Table::TextEdit]
+            .into_iter()
+            .chain(Ctx::ALL.into_iter().map(Table::Own))
+    }
+
+    /// Where the table's bindings are listed in Settings › Shortcuts.
+    pub fn section_title(self) -> &'static str {
+        SECTIONS
+            .iter()
+            .find(|s| s.tables.contains(&self))
+            .map_or("Shortcut editor", |s| s.title)
+    }
+}
+
+/// A screen of Settings › Shortcuts: the tables it lists.
+pub struct Section {
+    pub title: &'static str,
+    pub tables: &'static [Table],
+}
+
+/// Every table whose keys can be changed, in the order Settings › Shortcuts
+/// lists them (the shortcut editor's own is left out).
+pub const SECTIONS: &[Section] = &[
+    Section {
+        title: "Everywhere",
+        tables: &[Table::Global, Table::QuestionHelp],
+    },
+    Section {
+        title: "Chat list",
+        tables: &[Table::Own(Ctx::ChatList)],
+    },
+    Section {
+        title: "Chat search",
+        tables: &[Table::Own(Ctx::ChatSearch)],
+    },
+    Section {
+        title: "Message line",
+        tables: &[Table::Own(Ctx::Compose)],
+    },
+    Section {
+        title: "Text fields",
+        tables: &[Table::TextEdit],
+    },
+    Section {
+        title: "Messages",
+        tables: &[Table::Own(Ctx::Messages)],
+    },
+    Section {
+        title: "Media viewer",
+        tables: &[Table::Own(Ctx::Viewer)],
+    },
+    Section {
+        title: "Profile",
+        tables: &[Table::Own(Ctx::Profile)],
+    },
+    Section {
+        title: "Menus",
+        tables: &[Table::Own(Ctx::Menu)],
+    },
+    Section {
+        title: "Confirmations",
+        tables: &[Table::Own(Ctx::Confirm)],
+    },
+    Section {
+        title: "Information boxes",
+        tables: &[Table::Own(Ctx::Info)],
+    },
+    Section {
+        title: "Help screen",
+        tables: &[Table::Own(Ctx::Help)],
+    },
+    Section {
+        title: "Forms",
+        tables: &[Table::Own(Ctx::Form)],
+    },
+    Section {
+        title: "People picker",
+        tables: &[Table::Own(Ctx::Pick)],
+    },
+    Section {
+        title: "File browser",
+        tables: &[Table::Own(Ctx::AttachBrowse)],
+    },
+    Section {
+        title: "File filter",
+        tables: &[Table::Own(Ctx::AttachFilter)],
+    },
+    Section {
+        title: "Send dialog",
+        tables: &[Table::Own(Ctx::AttachSend)],
+    },
+    Section {
+        title: "Stickers",
+        tables: &[Table::Own(Ctx::Stickers)],
+    },
+    Section {
+        title: "LINE emoji reactions",
+        tables: &[Table::Own(Ctx::Emoji)],
+    },
+    Section {
+        title: "Settings",
+        tables: &[Table::Own(Ctx::Settings)],
+    },
+    Section {
+        title: "Search in chat",
+        tables: &[Table::Own(Ctx::Find)],
+    },
+    Section {
+        title: "Plugin page",
+        tables: &[Table::Own(Ctx::Plugins)],
+    },
+    Section {
+        title: "Plugin view",
+        tables: &[Table::Own(Ctx::PluginView)],
+    },
+];
+
+impl Section {
+    /// The bindings it lists (those that can be changed).
+    pub fn entries(&self) -> Vec<(Table, &'static Binding)> {
+        self.tables
+            .iter()
+            .flat_map(|&t| t.bindings().iter().map(move |b| (t, b)))
+            .filter(|(t, b)| customizable(*t, b.cmd))
+            .collect()
+    }
+}
+
+/// The menus' numbers and the shortcut editor's keys stay as they are.
+fn customizable(table: Table, cmd: Cmd) -> bool {
+    table != Table::Own(Ctx::Keys) && !matches!(cmd, Cmd::Digit(_))
+}
+
+/// The tables answering in `ctx`, in the order they are asked: its own,
+/// the shared ones it takes, the global chords last.
+fn tables(ctx: Ctx) -> impl Iterator<Item = Table> {
+    let edit = matches!(
         ctx,
-        Ctx::Compose | Ctx::Form | Ctx::ChatSearch | Ctx::Pick | Ctx::AttachFilter
-    ) {
-        TEXT_EDIT
-    } else {
-        &[]
-    };
-    let question = if is_typing(ctx) || ctx == Ctx::Help {
-        &[]
-    } else {
-        QUESTION_HELP
-    };
-    [own, edit, question]
+        Ctx::Compose | Ctx::Form | Ctx::ChatSearch | Ctx::Pick | Ctx::AttachFilter | Ctx::Find
+    );
+    let question = !(is_typing(ctx) || ctx == Ctx::Help);
+    [
+        Some(Table::Own(ctx)),
+        edit.then_some(Table::TextEdit),
+        question.then_some(Table::QuestionHelp),
+        Some(Table::Global),
+    ]
+    .into_iter()
+    .flatten()
 }
 
 /// Every binding active in `ctx`, the context's first, globals last.
-fn all(ctx: Ctx) -> impl Iterator<Item = &'static Binding> {
+fn all(ctx: Ctx) -> impl Iterator<Item = (Table, &'static Binding)> {
     tables(ctx)
-        .into_iter()
-        .flatten()
-        .chain(GLOBAL.iter().filter(move |b| global_allowed(ctx, b.cmd)))
+        .flat_map(|t| t.bindings().iter().map(move |b| (t, b)))
+        .filter(move |(t, b)| *t != Table::Global || global_allowed(ctx, b.cmd))
 }
 
-pub fn resolve(ctx: Ctx, event: &KeyEvent) -> Option<Cmd> {
-    all(ctx)
-        .find(|binding| binding.keys.iter().any(|key| matches_key(*key, event)))
-        .map(|binding| binding.cmd)
+/// The contexts where `cmd` of `table` answers.
+fn contexts_of(table: Table, cmd: Cmd) -> impl Iterator<Item = Ctx> {
+    Ctx::ALL.into_iter().filter(move |&ctx| {
+        tables(ctx).any(|t| t == table) && (table != Table::Global || global_allowed(ctx, cmd))
+    })
 }
 
 fn global_allowed(ctx: Ctx, cmd: Cmd) -> bool {
@@ -562,48 +908,442 @@ fn global_allowed(ctx: Ctx, cmd: Cmd) -> bool {
     }
 }
 
-fn matches_key(key: Key, event: &KeyEvent) -> bool {
-    let mut modifiers = event.modifiers;
-    let mut expected = key.mods;
-    // Terminals differ in whether `?` or `K` come with Shift; the character says it.
-    if matches!(event.code, KeyCode::Char(_)) && matches!(key.code, KeyCode::Char(_)) {
-        modifiers = modifiers.difference(KeyModifiers::SHIFT);
-        expected = expected.difference(KeyModifiers::SHIFT);
-    }
-    key.code == event.code && expected == modifiers
+fn binding(table: Table, cmd: Cmd) -> Option<&'static Binding> {
+    table.bindings().iter().find(|b| b.cmd == cmd)
+}
+
+/// The binding's name in stored shortcuts and `keys.json`: `messages.reply`.
+pub fn name(table: Table, cmd: Cmd) -> String {
+    format!("{}.{}", table.id(), cmd.id())
+}
+
+/// What `cmd` of `table` does, as the help screen says it.
+pub fn help(table: Table, cmd: Cmd) -> &'static str {
+    binding(table, cmd).map_or("", |b| b.help)
 }
 
 /// Printable keys are text here.
 pub fn is_typing(ctx: Ctx) -> bool {
     matches!(
         ctx,
-        Ctx::ChatSearch | Ctx::Compose | Ctx::Form | Ctx::Pick | Ctx::AttachBrowse | Ctx::AttachFilter
+        Ctx::ChatSearch
+            | Ctx::Compose
+            | Ctx::Form
+            | Ctx::Pick
+            | Ctx::AttachBrowse
+            | Ctx::AttachFilter
+            | Ctx::Find
     )
 }
 
-/// How to get help in `ctx`: the status line starts with it, so it is never cut off.
-pub fn help_key(ctx: Ctx) -> &'static str {
-    if is_typing(ctx) { "F1 help" } else { "? help" }
+/// Whether typing `c` in `ctx` is text: everywhere keys are text, except
+/// the file browser, where a letter or digit starts a filter and the rest
+/// (`.`, `~`) are commands.
+fn typed_there(ctx: Ctx, c: char) -> bool {
+    is_typing(ctx) && (ctx != Ctx::AttachBrowse || c.is_alphanumeric())
 }
 
-/// The hinted bindings of `ctx` whose command `available` allows right now
-/// (the main menu first: everything else can be found from it).
-pub fn hint(ctx: Ctx, available: impl Fn(Cmd) -> bool) -> String {
-    let mut shown: Vec<&Binding> = all(ctx).filter(|b| b.hint && available(b.cmd)).collect();
-    shown.sort_by_key(|b| b.cmd != Cmd::MainMenu);
-    shown
-        .into_iter()
-        .map(|b| {
+/// The bindings as the user has them: the defaults with Settings ›
+/// Shortcuts' changes on top.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Keymap {
+    /// Changed bindings and their keys (empty: no key at all).
+    custom: HashMap<(Table, Cmd), Vec<Key>>,
+}
+
+impl Keymap {
+    /// The keys `b` of `table` answers to.
+    fn keys_for(&self, table: Table, b: &'static Binding) -> &[Key] {
+        self.custom.get(&(table, b.cmd)).map_or(b.keys, Vec::as_slice)
+    }
+
+    /// The keys of `cmd` in `table` (none if the table has no such command).
+    pub fn keys(&self, table: Table, cmd: Cmd) -> &[Key] {
+        binding(table, cmd).map_or(&[], |b| self.keys_for(table, b))
+    }
+
+    pub fn is_custom(&self, table: Table, cmd: Cmd) -> bool {
+        self.custom.contains_key(&(table, cmd))
+    }
+
+    pub fn is_default(&self) -> bool {
+        self.custom.is_empty()
+    }
+
+    /// How many bindings are changed.
+    pub fn changed(&self) -> usize {
+        self.custom.len()
+    }
+
+    /// How many of `section`'s bindings are changed.
+    pub fn changed_in(&self, section: &Section) -> usize {
+        section
+            .entries()
+            .iter()
+            .filter(|(t, b)| self.is_custom(*t, b.cmd))
+            .count()
+    }
+
+    pub fn resolve(&self, ctx: Ctx, event: &KeyEvent) -> Option<Cmd> {
+        let pressed = Key::of(event);
+        all(ctx)
+            .find(|&(t, b)| self.keys_for(t, b).iter().any(|k| k.normalized() == pressed))
+            .map(|(_, b)| b.cmd)
+    }
+
+    /// The keys of what `cmd` does in `ctx`, as the screen names them
+    /// (empty when nothing there does it).
+    pub fn label(&self, ctx: Ctx, cmd: Cmd) -> String {
+        all(ctx)
+            .find(|(_, b)| b.cmd == cmd)
+            .map(|(t, b)| display_keys(self.keys_for(t, b)))
+            .unwrap_or_default()
+    }
+
+    /// The hinted bindings of `ctx` whose command `available` allows right
+    /// now (the main menu first: everything else can be found from it).
+    pub fn hint(&self, ctx: Ctx, available: impl Fn(Cmd) -> bool) -> String {
+        let mut shown: Vec<(Table, &Binding)> = all(ctx)
+            .filter(|&(t, b)| b.hint && available(b.cmd) && !self.keys_for(t, b).is_empty())
+            .collect();
+        shown.sort_by_key(|(_, b)| b.cmd != Cmd::MainMenu);
+        shown
+            .into_iter()
+            .map(|(t, b)| {
+                let keys = self.keys_for(t, b);
+                let keys = match b.cmd {
+                    Cmd::Digit(_) => "1…9".to_owned(),
+                    // The full list (with Ctrl-j) is on the help screen.
+                    Cmd::NewLine if keys == b.keys => "Shift/Alt-Enter".to_owned(),
+                    _ => display_keys(keys),
+                };
+                format!("{keys} {}", b.help)
+            })
+            .collect::<Vec<_>>()
+            .join(HINT_SEP)
+    }
+
+    /// How to get help in `ctx`, for the start of the status line.
+    pub fn help_key(&self, ctx: Ctx) -> String {
+        match self.label(ctx, Cmd::Help) {
+            keys if keys.is_empty() => String::new(),
+            keys => format!("{keys} help"),
+        }
+    }
+
+    /// Every binding of `ctx`, for the help screen (unbound ones say so).
+    pub fn help_lines(&self, ctx: Ctx) -> Vec<(String, &'static str)> {
+        let mut lines: Vec<(String, &'static str)> = Vec::new();
+        for (t, b) in all(ctx) {
+            // The numbered menu items share one line.
+            if matches!(b.cmd, Cmd::Digit(2..)) {
+                continue;
+            }
             let keys = match b.cmd {
                 Cmd::Digit(_) => "1…9".to_owned(),
-                // The full list (with Ctrl-j) is on the help screen.
-                Cmd::NewLine => "Shift/Alt-Enter".to_owned(),
-                _ => display_keys(b.keys),
+                _ => match self.keys_for(t, b) {
+                    [] => "—".to_owned(),
+                    keys => display_keys(keys),
+                },
             };
-            format!("{keys} {}", b.help)
+            lines.push((keys, b.help));
+        }
+        if ctx == Ctx::Compose {
+            lines.extend(COMMANDS.iter().map(|&(cmd, what)| (cmd.to_owned(), what)));
+        }
+        lines
+    }
+
+    /// The other bindings that already answer to `key` somewhere `cmd` of
+    /// `table` does: binding it there takes the key from them.
+    pub fn conflicts(&self, table: Table, cmd: Cmd, key: Key) -> Vec<(Table, Cmd)> {
+        let key = key.normalized();
+        let mut out = Vec::new();
+        for ctx in contexts_of(table, cmd) {
+            for (t, b) in all(ctx) {
+                if (t, b.cmd) != (table, cmd)
+                    && self.keys_for(t, b).iter().any(|k| k.normalized() == key)
+                    && !out.contains(&(t, b.cmd))
+                {
+                    out.push((t, b.cmd));
+                }
+            }
+        }
+        out
+    }
+
+    /// The keys of `cmd` in `table` that something else also answers to
+    /// where it does (only possible through stored changes made before a
+    /// default changed, or edited by hand): the first `(key, table, cmd)`.
+    pub fn clash(&self, table: Table, cmd: Cmd) -> Option<(Key, Table, Cmd)> {
+        self.keys(table, cmd).iter().find_map(|&k| {
+            self.conflicts(table, cmd, k)
+                .first()
+                .map(|&(t, c)| (k.normalized(), t, c))
         })
-        .collect::<Vec<_>>()
-        .join(HINT_SEP)
+    }
+
+    /// Why `key` cannot be bound to `cmd` of `table` as things are, if it cannot:
+    /// a rule ([`refusal`]) or a binding that cannot give the key up.
+    pub fn refusal(&self, table: Table, cmd: Cmd, key: Key) -> Option<String> {
+        if let Some(why) = refusal(table, cmd, key) {
+            return Some(why);
+        }
+        self.conflicts(table, cmd, key)
+            .into_iter()
+            .find(|&(t, c)| !customizable(t, c))
+            .map(|(t, c)| {
+                let what = binding(t, c).map_or("", |b| b.help);
+                format!(
+                    "{} cannot be used: it is “{what}” in the {}",
+                    display_key(key.normalized()),
+                    t.section_title().to_lowercase()
+                )
+            })
+    }
+
+    /// Give `cmd` of `table` exactly `keys` (normalized, without repeats).
+    pub fn set(&mut self, table: Table, cmd: Cmd, keys: Vec<Key>) {
+        let Some(b) = binding(table, cmd) else { return };
+        let mut wanted: Vec<Key> = Vec::new();
+        for k in keys.into_iter().map(Key::normalized) {
+            if !wanted.contains(&k) {
+                wanted.push(k);
+            }
+        }
+        let defaults: Vec<Key> = b.keys.iter().map(|k| k.normalized()).collect();
+        let same = wanted.len() == defaults.len() && wanted.iter().all(|k| defaults.contains(k));
+        if same {
+            self.custom.remove(&(table, cmd));
+        } else {
+            self.custom.insert((table, cmd), wanted);
+        }
+    }
+
+    /// Bind `key` to `cmd` of `table` too.
+    pub fn add(&mut self, table: Table, cmd: Cmd, key: Key) {
+        let mut keys = self.keys(table, cmd).to_vec();
+        keys.push(key);
+        self.set(table, cmd, keys);
+    }
+
+    /// Unbind `key` from `cmd` of `table`.
+    pub fn take(&mut self, table: Table, cmd: Cmd, key: Key) {
+        let key = key.normalized();
+        let keys = self
+            .keys(table, cmd)
+            .iter()
+            .copied()
+            .filter(|k| k.normalized() != key)
+            .collect();
+        self.set(table, cmd, keys);
+    }
+
+    /// Back to the default keys.
+    pub fn reset(&mut self, table: Table, cmd: Cmd) {
+        self.custom.remove(&(table, cmd));
+    }
+
+    /// Stored as `setting.keys`: `{"messages.reply": ["ctrl-t"], …}`.
+    pub fn to_json(&self) -> String {
+        let mut entries: Vec<(String, Vec<String>)> = self
+            .custom
+            .iter()
+            .map(|((t, c), keys)| {
+                let names = keys.iter().filter_map(|k| key_name(*k)).collect();
+                (format!("{}.{}", t.id(), c.id()), names)
+            })
+            .collect();
+        entries.sort();
+        let map: serde_json::Map<String, serde_json::Value> = entries
+            .into_iter()
+            .map(|(id, keys)| (id, serde_json::json!(keys)))
+            .collect();
+        serde_json::Value::Object(map).to_string()
+    }
+
+    /// Read what [`to_json`](Self::to_json) wrote, leaving out (and naming)
+    /// what is unknown, unreadable or against the rules.
+    pub fn from_json(json: &str) -> (Keymap, Vec<String>) {
+        Keymap::parse(json).unwrap_or_else(|e| {
+            (
+                Keymap::default(),
+                vec![format!("custom shortcuts unreadable: {e}")],
+            )
+        })
+    }
+
+    /// [`from_json`](Self::from_json), but `Err` when the whole text is not
+    /// a JSON object (a file that is mid-edit is not taken as "no changes").
+    /// Entries named `_…` are comments.
+    pub fn parse(json: &str) -> Result<(Keymap, Vec<String>), String> {
+        let mut map = Keymap::default();
+        let mut problems = Vec::new();
+        let value: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        let entries = value.as_object().ok_or("not a JSON object")?;
+        for (id, keys) in entries.iter().filter(|(id, _)| !id.starts_with('_')) {
+            let found = Table::all().find_map(|t| {
+                t.bindings()
+                    .iter()
+                    .find(|b| format!("{}.{}", t.id(), b.cmd.id()) == *id)
+                    .map(|b| (t, b.cmd))
+            });
+            let Some((table, cmd)) = found.filter(|&(t, c)| customizable(t, c)) else {
+                problems.push(format!("unknown shortcut {id} (ignored)"));
+                continue;
+            };
+            let Some(names) = keys.as_array() else {
+                problems.push(format!("{id}: not a list of keys (ignored)"));
+                continue;
+            };
+            let mut parsed = Vec::new();
+            for name in names {
+                match name.as_str().and_then(parse_key) {
+                    Some(k) => match refusal(table, cmd, k) {
+                        None => parsed.push(k),
+                        Some(why) => problems.push(format!("{id}: {why} (ignored)")),
+                    },
+                    None => problems.push(format!("{id}: cannot read key {name} (ignored)")),
+                }
+            }
+            map.set(table, cmd, parsed);
+        }
+        Ok((map, problems))
+    }
+
+    /// The changes as a file to read and edit by hand (`keys.json`): what
+    /// [`to_json`](Self::to_json) holds, one entry per line, under a note.
+    pub fn to_file_json(&self) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(&self.to_json()).unwrap_or_default();
+        if let Some(entries) = value.as_object_mut() {
+            entries.insert("_about".into(), serde_json::json!(FILE_NOTE));
+        }
+        let mut text = serde_json::to_string_pretty(&value).unwrap_or_default();
+        text.push('\n');
+        text
+    }
+}
+
+/// The note at the top of `keys.json`.
+const FILE_NOTE: &str = "rune's keyboard shortcuts that differ from the defaults: \"screen.command\": [keys]. \
+     Settings › Shortcuts shows each one's name. Keys: ctrl-x, alt-enter, shift-tab, f1, pgup, \
+     space, up, K, ? … ([] for none). Read when rune starts (or with Settings › Shortcuts › \
+     Read keys.json again); rune rewrites this file when you change a shortcut there.";
+
+/// Why `key` can never be bound to `cmd` of `table`, if it cannot: keys
+/// that are not keys, plugin keys, and characters where they are text.
+pub fn refusal(table: Table, cmd: Cmd, key: Key) -> Option<String> {
+    let key = key.normalized();
+    let name = display_key(key);
+    if !bindable(key.code) {
+        return Some(format!("{name} cannot be used as a shortcut"));
+    }
+    if is_plugin_key(&KeyEvent::new(key.code, key.mods)).is_some() {
+        return Some(format!("{name} is kept for plugins (Alt with a letter or digit)"));
+    }
+    if let KeyCode::Char(c) = key.code
+        && !key.mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && let Some(ctx) = contexts_of(table, cmd).find(|&ctx| typed_there(ctx, c))
+    {
+        return Some(format!(
+            "{name} is typed as text in the {}",
+            ctx.title().to_lowercase()
+        ));
+    }
+    None
+}
+
+fn bindable(code: KeyCode) -> bool {
+    match code {
+        KeyCode::Char(c) => !c.is_control(),
+        KeyCode::F(n) => (1..=24).contains(&n),
+        Enter
+        | Esc
+        | Tab
+        | BackTab
+        | Backspace
+        | Delete
+        | Home
+        | End
+        | PageUp
+        | PageDown
+        | Up
+        | Down
+        | Left
+        | Right
+        | KeyCode::Insert => true,
+        _ => false,
+    }
+}
+
+thread_local! {
+    /// The keymap the UI (which runs on one thread) answers keys with.
+    static ACTIVE: RefCell<Rc<Keymap>> = RefCell::new(Rc::new(Keymap::default()));
+}
+
+/// Answer keys with `map` from now on.
+pub fn install(map: Keymap) {
+    ACTIVE.with(|a| *a.borrow_mut() = Rc::new(map));
+}
+
+/// The keymap keys are answered with.
+pub fn active() -> Rc<Keymap> {
+    ACTIVE.with(|a| a.borrow().clone())
+}
+
+pub fn resolve(ctx: Ctx, event: &KeyEvent) -> Option<Cmd> {
+    active().resolve(ctx, event)
+}
+
+/// The first key of what `cmd` does in `ctx`, for a menu or a sentence
+/// (empty when it has none).
+pub fn shortcut(ctx: Ctx, cmd: Cmd) -> String {
+    let map = active();
+    all(ctx)
+        .find(|(_, b)| b.cmd == cmd)
+        .and_then(|(t, b)| map.keys_for(t, b).first().copied())
+        .map(display_key)
+        .unwrap_or_default()
+}
+
+/// A global chord's first key (empty when it has none).
+pub fn global(cmd: Cmd) -> String {
+    active()
+        .keys(Table::Global, cmd)
+        .first()
+        .map(|&k| display_key(k))
+        .unwrap_or_default()
+}
+
+/// `"{key} {what}"`, or just `what` when `cmd` has no key in `ctx`.
+pub fn with_keys(ctx: Ctx, cmd: Cmd, what: &str) -> String {
+    match shortcut(ctx, cmd) {
+        key if key.is_empty() => what.to_owned(),
+        key => format!("{key} {what}"),
+    }
+}
+
+/// Where the main menu's item `item` is, for a sentence: `Ctrl-x › Plugins`.
+pub fn via_menu(item: &str) -> String {
+    match global(Cmd::MainMenu) {
+        key if key.is_empty() => format!("main menu › {item}"),
+        key => format!("{key} › {item}"),
+    }
+}
+
+/// How to get help in `ctx`: the status line starts with it, so it is never cut off.
+pub fn help_key(ctx: Ctx) -> String {
+    active().help_key(ctx)
+}
+
+/// See [`Keymap::hint`].
+pub fn hint(ctx: Ctx, available: impl Fn(Cmd) -> bool) -> String {
+    active().hint(ctx, available)
+}
+
+/// See [`Keymap::help_lines`].
+pub fn help_lines(ctx: Ctx) -> Vec<(String, &'static str)> {
+    active().help_lines(ctx)
 }
 
 /// Separates the entries of a hint.
@@ -702,27 +1442,7 @@ pub fn is_plugin_key(event: &KeyEvent) -> Option<char> {
     }
 }
 
-/// Every binding of `ctx`, for the help screen.
-pub fn help_lines(ctx: Ctx) -> Vec<(String, &'static str)> {
-    let mut lines: Vec<(String, &'static str)> = Vec::new();
-    for b in all(ctx) {
-        // The numbered menu items share one line.
-        if matches!(b.cmd, Cmd::Digit(2..)) {
-            continue;
-        }
-        let keys = match b.cmd {
-            Cmd::Digit(_) => "1…9".to_owned(),
-            _ => display_keys(b.keys),
-        };
-        lines.push((keys, b.help));
-    }
-    if ctx == Ctx::Compose {
-        lines.extend(COMMANDS.iter().map(|&(cmd, what)| (cmd.to_owned(), what)));
-    }
-    lines
-}
-
-fn display_keys(keys: &[Key]) -> String {
+pub fn display_keys(keys: &[Key]) -> String {
     let mut shown: Vec<String> = Vec::new();
     for k in keys {
         let label = display_key(*k);
@@ -734,20 +1454,26 @@ fn display_keys(keys: &[Key]) -> String {
     shown.join("/")
 }
 
-fn display_key(key: Key) -> String {
+pub fn display_key(key: Key) -> String {
     let mut label = String::new();
     if key.mods.contains(KeyModifiers::CONTROL) {
         label.push_str("Ctrl-");
+        if key.mods.contains(KeyModifiers::ALT) {
+            label.push_str("Alt-");
+        }
         if let KeyCode::Char(c) = key.code {
+            // Ctrl takes letters without case; a capital one came with Shift.
+            if c.is_ascii_uppercase() {
+                label.push_str("Shift-");
+            }
             label.push(c.to_ascii_lowercase());
             return label;
         }
-    }
-    if key.mods.contains(KeyModifiers::ALT) {
+    } else if key.mods.contains(KeyModifiers::ALT) {
         label.push_str("Alt-");
     }
     // A character says Shift itself (`K`, `?`).
-    if key.mods.contains(KeyModifiers::SHIFT) && !matches!(key.code, KeyCode::Char(_)) {
+    if key.mods.contains(KeyModifiers::SHIFT) && !matches!(key.code, KeyCode::Char(_) | BackTab) {
         label.push_str("Shift-");
     }
     label.push_str(&match key.code {
@@ -760,6 +1486,7 @@ fn display_key(key: Key) -> String {
         Esc => "Esc".into(),
         KeyCode::F(n) => format!("F{n}"),
         Home => "Home".into(),
+        KeyCode::Insert => "Insert".into(),
         Left => "←".into(),
         PageDown => "PgDn".into(),
         PageUp => "PgUp".into(),
@@ -771,6 +1498,97 @@ fn display_key(key: Key) -> String {
         other => format!("{other:?}"),
     });
     label
+}
+
+/// A key's name in stored shortcuts: `ctrl-x`, `shift-enter`, `alt-left`,
+/// `f1`, `space`, `K`, `?` (`None` for keys that cannot be bound).
+pub fn key_name(key: Key) -> Option<String> {
+    let key = key.normalized();
+    let code = match key.code {
+        KeyCode::Char(' ') => "space".to_owned(),
+        KeyCode::Char(c) if !c.is_control() => c.to_string(),
+        KeyCode::F(n) if (1..=24).contains(&n) => format!("f{n}"),
+        Enter => "enter".into(),
+        Esc => "esc".into(),
+        Tab => "tab".into(),
+        BackTab => "backtab".into(),
+        Backspace => "backspace".into(),
+        Delete => "delete".into(),
+        KeyCode::Insert => "insert".into(),
+        Home => "home".into(),
+        End => "end".into(),
+        PageUp => "pgup".into(),
+        PageDown => "pgdn".into(),
+        Up => "up".into(),
+        Down => "down".into(),
+        Left => "left".into(),
+        Right => "right".into(),
+        _ => return None,
+    };
+    let mut name = String::new();
+    for (m, prefix) in [
+        (KeyModifiers::CONTROL, "ctrl-"),
+        (KeyModifiers::ALT, "alt-"),
+        (KeyModifiers::SHIFT, "shift-"),
+    ] {
+        if key.mods.contains(m) {
+            name.push_str(prefix);
+        }
+    }
+    name.push_str(&code);
+    Some(name)
+}
+
+/// Read a [`key_name`] (modifier names in any case).
+pub fn parse_key(name: &str) -> Option<Key> {
+    let mut mods = KeyModifiers::NONE;
+    let mut rest = name;
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        let found = [
+            ("ctrl-", KeyModifiers::CONTROL),
+            ("alt-", KeyModifiers::ALT),
+            ("shift-", KeyModifiers::SHIFT),
+        ]
+        .into_iter()
+        .find(|(p, _)| lower.starts_with(p) && rest.len() > p.len());
+        match found {
+            Some((p, m)) => {
+                mods |= m;
+                rest = &rest[p.len()..];
+            }
+            None => break,
+        }
+    }
+    let mut chars = rest.chars();
+    let code = match (chars.next(), chars.next()) {
+        (Some(c), None) => KeyCode::Char(c),
+        _ => match rest.to_ascii_lowercase().as_str() {
+            "space" => KeyCode::Char(' '),
+            "enter" => Enter,
+            "esc" => Esc,
+            "tab" => Tab,
+            "backtab" => BackTab,
+            "backspace" => Backspace,
+            "delete" => Delete,
+            "insert" => KeyCode::Insert,
+            "home" => Home,
+            "end" => End,
+            "pgup" => PageUp,
+            "pgdn" => PageDown,
+            "up" => Up,
+            "down" => Down,
+            "left" => Left,
+            "right" => Right,
+            f => KeyCode::F(
+                f.strip_prefix('f')?
+                    .parse()
+                    .ok()
+                    .filter(|n| (1..=24).contains(n))?,
+            ),
+        },
+    };
+    bindable(code).then_some(Key { code, mods }.normalized())
 }
 
 #[cfg(test)]
@@ -785,22 +1603,14 @@ mod tests {
         event(code, KeyModifiers::NONE)
     }
 
-    fn normalized(key: Key) -> (KeyCode, KeyModifiers) {
-        if matches!(key.code, KeyCode::Char(_)) {
-            (key.code, key.mods.difference(KeyModifiers::SHIFT))
-        } else {
-            (key.code, key.mods)
-        }
-    }
-
     #[test]
     fn every_key_means_one_thing_per_context_and_is_documented() {
         for ctx in Ctx::ALL {
             let mut keys = Vec::new();
-            for binding in all(ctx) {
+            for (_, binding) in all(ctx) {
                 assert!(!binding.help.is_empty(), "empty help text in {ctx:?}");
                 for &key in binding.keys {
-                    let key = normalized(key);
+                    let key = key.normalized();
                     assert!(!keys.contains(&key), "{key:?} is bound twice in {ctx:?}");
                     keys.push(key);
                 }
@@ -815,7 +1625,7 @@ mod tests {
         // Alternatives are allowed only as arrow + vi letter, Tab + Shift-Tab,
         // or a key plus its capital; never two chords or two letters for one action.
         for ctx in Ctx::ALL {
-            for b in all(ctx) {
+            for (_, b) in all(ctx) {
                 let chords = b
                     .keys
                     .iter()
@@ -843,7 +1653,7 @@ mod tests {
 
     #[test]
     fn printable_keys_are_text_while_typing() {
-        for ctx in [Ctx::ChatSearch, Ctx::Compose, Ctx::Form] {
+        for ctx in [Ctx::ChatSearch, Ctx::Compose, Ctx::Form, Ctx::Find] {
             for c in ' '..='~' {
                 assert_eq!(resolve(ctx, &plain(KeyCode::Char(c))), None, "{ctx:?} {c:?}");
             }
@@ -865,6 +1675,7 @@ mod tests {
             Ctx::ChatSearch,
             Ctx::Pick,
             Ctx::AttachFilter,
+            Ctx::Find,
         ] {
             assert_eq!(resolve(ctx, &plain(KeyCode::Left)), Some(Cmd::CursorLeft));
             assert_eq!(resolve(ctx, &plain(KeyCode::Right)), Some(Cmd::CursorRight));
@@ -990,7 +1801,7 @@ mod tests {
                 let fitted = fit_hint(&full, w);
                 assert!(fitted.width() <= w, "{ctx:?} at {w}: {fitted:?}");
                 if w >= help_key(ctx).width() + 4 {
-                    assert!(fitted.starts_with(help_key(ctx)), "{ctx:?} at {w}: {fitted:?}");
+                    assert!(fitted.starts_with(&help_key(ctx)), "{ctx:?} at {w}: {fitted:?}");
                 }
                 // Never an entry cut in the middle.
                 for part in fitted.trim_end_matches('…').split(HINT_SEP) {
@@ -1089,5 +1900,268 @@ mod tests {
         assert!(!menu.iter().any(|(k, _)| k == "2"));
         let confirm = help_lines(Ctx::Confirm);
         assert!(confirm.iter().any(|(k, _)| k == "y"));
+    }
+
+    #[test]
+    fn shift_tab_matches_whether_or_not_the_terminal_adds_shift() {
+        // crossterm reports Shift-Tab as BackTab with Shift.
+        for mods in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+            let back_tab = event(KeyCode::BackTab, mods);
+            assert_eq!(resolve(Ctx::ChatList, &back_tab), Some(Cmd::SwitchFocus));
+            assert_eq!(resolve(Ctx::Settings, &back_tab), Some(Cmd::PrevTab));
+            assert_eq!(resolve(Ctx::Form, &back_tab), Some(Cmd::Up));
+            assert_eq!(resolve(Ctx::Stickers, &back_tab), Some(Cmd::PrevTab));
+        }
+        assert_eq!(
+            display_key(Key::of(&event(KeyCode::BackTab, KeyModifiers::SHIFT))),
+            "Shift-Tab"
+        );
+    }
+
+    #[test]
+    fn key_names_round_trip() {
+        for t in Table::all() {
+            for b in t.bindings() {
+                for &k in b.keys {
+                    let name = key_name(k).unwrap_or_else(|| panic!("{k:?} has no name"));
+                    assert_eq!(parse_key(&name), Some(k.normalized()), "{name}");
+                }
+            }
+        }
+        assert_eq!(parse_key("ctrl--"), Some(ctrl('-')));
+        assert_eq!(parse_key("CTRL-x"), Some(ctrl('x')));
+        assert_eq!(parse_key("Shift-Enter"), Some(shift(Enter)));
+        assert_eq!(parse_key("f12"), Some(key(KeyCode::F(12))));
+        assert_eq!(parse_key("shift-K"), Some(ch('K')));
+        assert_eq!(parse_key("space"), Some(ch(' ')));
+        assert_eq!(parse_key("f"), Some(ch('f')));
+        for bad in ["", "ctrl-", "f25", "f0", "foo", "ctrl-foo", "\u{7}"] {
+            assert_eq!(parse_key(bad), None, "{bad:?}");
+        }
+        assert_eq!(key_name(key(KeyCode::Null)), None);
+    }
+
+    #[test]
+    fn changed_keys_answer_and_the_old_ones_do_not() {
+        let mut map = Keymap::default();
+        let reply = (Table::Own(Ctx::Messages), Cmd::Reply);
+        map.set(reply.0, reply.1, vec![ctrl('t')]);
+        assert!(map.is_custom(reply.0, reply.1));
+        let ctrl_t = event(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(map.resolve(Ctx::Messages, &ctrl_t), Some(Cmd::Reply));
+        assert_eq!(map.resolve(Ctx::Messages, &plain(KeyCode::Char('r'))), None);
+        // Only there: the chat list never had it.
+        assert_eq!(map.resolve(Ctx::ChatList, &ctrl_t), None);
+        assert_eq!(map.label(Ctx::Messages, Cmd::Reply), "Ctrl-t");
+        assert!(map.hint(Ctx::Messages, |_| true).contains("Ctrl-t reply"));
+        assert!(
+            map.help_lines(Ctx::Messages)
+                .contains(&("Ctrl-t".into(), "reply"))
+        );
+        // Giving it its default keys back is no change at all.
+        map.set(reply.0, reply.1, vec![ch('r')]);
+        assert!(map.is_default());
+        // Several keys, repeats dropped, Shift on characters ignored.
+        map.add(reply.0, reply.1, ctrl('t'));
+        map.add(reply.0, reply.1, ctrl('t'));
+        assert_eq!(map.keys(reply.0, reply.1), [ch('r'), ctrl('t')]);
+        map.take(reply.0, reply.1, ch('r'));
+        assert_eq!(map.keys(reply.0, reply.1), [ctrl('t')]);
+        // No key at all: unhinted, and the help screen says so.
+        map.take(reply.0, reply.1, ctrl('t'));
+        assert!(map.keys(reply.0, reply.1).is_empty());
+        assert!(!map.hint(Ctx::Messages, |_| true).contains("reply"));
+        assert!(map.help_lines(Ctx::Messages).contains(&("—".into(), "reply")));
+        map.reset(reply.0, reply.1);
+        assert!(map.is_default());
+        // A changed new-line key is hinted as it is.
+        map.set(Table::Own(Ctx::Compose), Cmd::NewLine, vec![ctrl('n')]);
+        assert!(map.hint(Ctx::Compose, |_| true).contains("Ctrl-n new line"));
+    }
+
+    #[test]
+    fn conflicts_are_found_wherever_both_answer() {
+        let map = Keymap::default();
+        let messages = Table::Own(Ctx::Messages);
+        assert_eq!(
+            map.conflicts(messages, Cmd::Reply, ch('e')),
+            [(messages, Cmd::React)]
+        );
+        assert!(map.conflicts(messages, Cmd::Reply, ctrl('t')).is_empty());
+        // A key of the chat list only is free in the messages.
+        assert!(
+            map.conflicts(Table::Own(Ctx::ChatList), Cmd::Menu, ch('r'))
+                .is_empty()
+        );
+        // Global chords answer while typing: the text keys are in the way.
+        assert!(
+            map.conflicts(Table::Global, Cmd::Search, ctrl('u'))
+                .contains(&(Table::TextEdit, Cmd::DeleteToLineStart))
+        );
+        assert!(
+            map.conflicts(Table::Global, Cmd::MainMenu, ctrl('w'))
+                .contains(&(Table::TextEdit, Cmd::DeleteWordBackward))
+        );
+        // ...and other chords.
+        assert_eq!(
+            map.conflicts(Table::Global, Cmd::Settings, ctrl('r')),
+            [(Table::Global, Cmd::ReadReceipts)]
+        );
+        // `?` answers wherever keys are not text.
+        assert!(
+            map.conflicts(Table::Own(Ctx::Settings), Cmd::Up, ch('?'))
+                .contains(&(Table::QuestionHelp, Cmd::Help))
+        );
+        // Shift does not make a character another key.
+        assert_eq!(
+            map.conflicts(
+                Table::Own(Ctx::ChatList),
+                Cmd::NewGroup,
+                shift(KeyCode::Char('K'))
+            ),
+            [(Table::Own(Ctx::ChatList), Cmd::PinUp)]
+        );
+        assert_eq!(map.clash(messages, Cmd::Reply), None);
+        // Stored changes can clash (a default changed since): it is found.
+        let mut map = map;
+        map.set(messages, Cmd::Reply, vec![ch('e')]);
+        assert_eq!(
+            map.clash(messages, Cmd::Reply),
+            Some((ch('e'), messages, Cmd::React))
+        );
+        assert_eq!(
+            map.clash(messages, Cmd::React),
+            Some((ch('e'), messages, Cmd::Reply))
+        );
+    }
+
+    #[test]
+    fn rules_refuse_plugin_keys_text_and_what_cannot_move() {
+        let map = Keymap::default();
+        let messages = Table::Own(Ctx::Messages);
+        assert!(
+            refusal(messages, Cmd::Reply, alt(KeyCode::Char('r')))
+                .unwrap()
+                .contains("plugins")
+        );
+        assert!(refusal(messages, Cmd::Reply, alt(KeyCode::Char('7'))).is_some());
+        assert_eq!(refusal(messages, Cmd::Reply, alt(Enter)), None);
+        assert_eq!(refusal(messages, Cmd::Reply, ch('t')), None);
+        assert!(
+            refusal(Table::Own(Ctx::Compose), Cmd::Back, ch('q'))
+                .unwrap()
+                .contains("typed as text in the message line")
+        );
+        // Global chords and text keys answer while typing.
+        assert!(refusal(Table::Global, Cmd::Search, ch('/')).is_some());
+        assert!(refusal(Table::TextEdit, Cmd::WordLeft, ch('b')).is_some());
+        assert_eq!(refusal(Table::Global, Cmd::Search, ctrl('/')), None);
+        // The file browser types letters and digits only.
+        let files = Table::Own(Ctx::AttachBrowse);
+        assert!(refusal(files, Cmd::ShowHidden, ch('h')).is_some());
+        assert_eq!(refusal(files, Cmd::ShowHidden, ch('!')), None);
+        assert!(refusal(Table::TextEdit, Cmd::WordLeft, key(KeyCode::Null)).is_some());
+        assert!(refusal(messages, Cmd::Reply, key(KeyCode::CapsLock)).is_some());
+        // Menu numbers and the shortcut editor's keys stay.
+        assert!(
+            map.refusal(Table::Own(Ctx::Menu), Cmd::Up, ch('1'))
+                .unwrap()
+                .contains("menus")
+        );
+        assert!(map.refusal(Table::Global, Cmd::Quit, key(Delete)).is_some());
+        assert_eq!(
+            map.refusal(messages, Cmd::Reply, ch('e')),
+            None,
+            "React can give it up"
+        );
+    }
+
+    #[test]
+    fn stored_shortcuts_round_trip_and_bad_entries_are_dropped() {
+        let mut map = Keymap::default();
+        map.set(
+            Table::Own(Ctx::Messages),
+            Cmd::Reply,
+            vec![ctrl('t'), key(KeyCode::F(5))],
+        );
+        map.set(Table::Global, Cmd::MainMenu, vec![ctrl('b')]);
+        map.set(Table::Own(Ctx::ChatList), Cmd::PinUp, vec![]);
+        map.set(Table::QuestionHelp, Cmd::Help, vec![ch('h')]);
+        let json = map.to_json();
+        assert!(json.contains(r#""messages.reply":["ctrl-t","f5"]"#), "{json}");
+        assert!(json.contains(r#""chat-list.pin-up":[]"#), "{json}");
+        assert_eq!(Keymap::from_json(&json), (map, vec![]));
+        let (read, problems) = Keymap::from_json(
+            r#"{"messages.reply": ["ctrl-t", "bogus", "alt-a"], "messages.fly": ["f"],
+                "menu.digit": ["x"], "shortcuts.add-key": ["b"], "global.quit": "ctrl-q",
+                "message-line.back": ["q"]}"#,
+        );
+        assert_eq!(read.keys(Table::Own(Ctx::Messages), Cmd::Reply), [ctrl('t')]);
+        assert_eq!(read.keys(Table::Own(Ctx::Compose), Cmd::Back), &[] as &[Key]);
+        assert!(
+            read.keys(Table::Global, Cmd::Quit) == [ctrl('c')],
+            "a bad entry keeps the default"
+        );
+        assert_eq!(problems.len(), 7, "{problems:?}");
+        assert!(!Keymap::from_json("[1]").1.is_empty());
+        assert!(
+            Keymap::parse("{\"messages.reply\": [").is_err(),
+            "mid-edit is not empty"
+        );
+        // The file form reads back the same, its note ignored.
+        let mut map = Keymap::default();
+        map.set(Table::Own(Ctx::Messages), Cmd::Reply, vec![ctrl('t')]);
+        let file = map.to_file_json();
+        assert!(file.starts_with("{\n  \"_about\""), "{file}");
+        assert!(
+            file.contains("\n  \"messages.reply\": [\n    \"ctrl-t\"\n  ]"),
+            "{file}"
+        );
+        assert_eq!(Keymap::parse(&file), Ok((map, vec![])));
+        assert!(!Keymap::from_json("{").1.is_empty());
+        assert_eq!(Keymap::from_json("{}"), (Keymap::default(), vec![]));
+    }
+
+    #[test]
+    fn every_changeable_binding_is_listed_once_under_a_unique_name() {
+        let mut ids = Vec::new();
+        for t in Table::all() {
+            for b in t.bindings().iter().filter(|b| customizable(t, b.cmd)) {
+                let id = format!("{}.{}", t.id(), b.cmd.id());
+                assert!(!ids.contains(&id), "{id} twice");
+                ids.push(id);
+                let listed = SECTIONS
+                    .iter()
+                    .filter(|s| s.entries().iter().any(|(st, sb)| *st == t && sb.cmd == b.cmd))
+                    .count();
+                assert_eq!(listed, 1, "{t:?} {:?} listed {listed} times", b.cmd);
+            }
+        }
+        assert!(
+            !SECTIONS.iter().any(|s| s.tables.contains(&Table::Own(Ctx::Keys))),
+            "the editor's own keys are fixed"
+        );
+        assert!(SECTIONS.iter().all(|s| !s.entries().is_empty()));
+    }
+
+    #[test]
+    fn text_names_the_keys_the_installed_keymap_has() {
+        assert_eq!(global(Cmd::MainMenu), "Ctrl-x");
+        assert_eq!(with_keys(Ctx::Compose, Cmd::Back, "cancel"), "Esc cancel");
+        let mut map = Keymap::default();
+        map.set(Table::Global, Cmd::MainMenu, vec![ctrl('b')]);
+        map.set(Table::Own(Ctx::Compose), Cmd::Back, vec![]);
+        map.set(Table::QuestionHelp, Cmd::Help, vec![ch('h')]);
+        install(map);
+        assert_eq!(global(Cmd::MainMenu), "Ctrl-b");
+        assert_eq!(with_keys(Ctx::Compose, Cmd::Back, "cancel"), "cancel");
+        assert_eq!(help_key(Ctx::Messages), "h help");
+        assert!(hint(Ctx::ChatList, |_| true).starts_with("Ctrl-b menu"));
+        assert_eq!(
+            resolve(Ctx::Compose, &event(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+            Some(Cmd::MainMenu)
+        );
+        install(Keymap::default());
+        assert_eq!(global(Cmd::MainMenu), "Ctrl-x");
     }
 }

@@ -28,6 +28,8 @@ Options:
   --plugins DIR       where plugins are installed (default:
                       $XDG_DATA_HOME/rune/plugins, else ~/.local/share/rune/plugins)
   --no-plugins        start no plugin this run (they stay enabled)
+  --default-keys      use the default keyboard shortcuts this run (yours
+                      stay saved; change them in Settings › Shortcuts)
   -h, --help          show this help
   -V, --version       show the version
 ";
@@ -45,6 +47,7 @@ pub struct Options {
     pub log: Option<PathBuf>,
     pub plugins: Option<PathBuf>,
     pub no_plugins: bool,
+    pub default_keys: bool,
 }
 
 impl Default for Options {
@@ -60,6 +63,7 @@ impl Default for Options {
             log: None,
             plugins: None,
             no_plugins: false,
+            default_keys: false,
         }
     }
 }
@@ -134,6 +138,10 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
                 flag(&inline)?;
                 o.no_plugins = true;
             }
+            "--default-keys" => {
+                flag(&inline)?;
+                o.default_keys = true;
+            }
             _ => return Err(format!("unknown option {name} (see --help)")),
         }
     }
@@ -178,6 +186,7 @@ mod tests {
         .unwrap();
         assert_eq!(o.plugins, Some(PathBuf::from("/tmp/plugins")));
         assert!(run(&["--no-plugins"]).unwrap().no_plugins);
+        assert!(run(&["--default-keys"]).unwrap().default_keys);
         assert!(!o.read_receipts && !o.graphics && !o.mouse);
         assert_eq!(o.cells, CellMode::Sextant);
         assert_eq!(o.db, Some(PathBuf::from("/tmp/x.db")));
@@ -201,6 +210,7 @@ mod tests {
         assert!(run(&["--no-store", "--db", "x.db"]).is_err());
         assert!(run(&["--no-plugins", "--plugins", "d"]).is_err());
         assert!(run(&["--no-plugins=1"]).is_err());
+        assert!(run(&["--default-keys=no"]).is_err());
     }
 
     #[test]

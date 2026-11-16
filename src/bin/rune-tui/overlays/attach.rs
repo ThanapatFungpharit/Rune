@@ -372,9 +372,11 @@ impl App {
         self.modal = Some(Modal::Attach(a));
     }
 
-    pub fn attach_key(&mut self, mut a: Attach, k: KeyEvent) {
+    /// `cmd` is what `k` means in the dialog's context now (send dialog,
+    /// browser or filter: see `App::key_context`).
+    pub fn attach_key(&mut self, mut a: Attach, cmd: Option<keymap::Cmd>, k: KeyEvent) {
         if let Some(c) = a.chosen.as_mut() {
-            match keymap::resolve(keymap::Ctx::AttachSend, &k) {
+            match cmd {
                 Some(keymap::Cmd::Back) => a.chosen = None,
                 Some(keymap::Cmd::Confirm) if a.cover => {
                     let _ = self.store.set("setting.attach_dir", &a.dir.to_string_lossy());
@@ -399,12 +401,6 @@ impl App {
         }
         let vis = a.visible();
         // With a filter typed, the arrows and Home/End edit it (`AttachFilter`).
-        let ctx = if a.filter.is_empty() {
-            keymap::Ctx::AttachBrowse
-        } else {
-            keymap::Ctx::AttachFilter
-        };
-        let cmd = keymap::resolve(ctx, &k);
         match a.filter.edit(cmd, &k) {
             Edit::Changed => {
                 a.sel = 0;

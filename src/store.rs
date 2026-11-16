@@ -1391,6 +1391,36 @@ impl Store {
         Self::decode(rows)
     }
 
+    /// The text messages of `chat` whose text contains `query` (trimmed;
+    /// letters compared without case, as `str::to_lowercase` folds them),
+    /// newest first, at most `limit`. Unsent and undecryptable ones are left
+    /// out. Only the text of each candidate is read until one matches.
+    pub fn search_messages(&self, chat: &str, query: &str, limit: usize) -> Result<Vec<StoredMessage>> {
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT json_extract(json, '$.text'), json, e2ee_error, unsent FROM messages
+                 WHERE chat = ?1 AND content_type = ?2 AND unsent = 0 AND e2ee_error IS NULL
+                 ORDER BY time DESC, id_num DESC",
+            )?;
+            let mut rows = st.query(params![chat, content_type::TEXT])?;
+            let mut found = Vec::new();
+            while found.len() < limit
+                && let Some(r) = rows.next()?
+            {
+                let text: Option<String> = r.get(0)?;
+                if text.is_some_and(|t| t.to_lowercase().contains(&needle)) {
+                    found.push((r.get(1)?, r.get(2)?, r.get(3)?));
+                }
+            }
+            Ok(found)
+        })?;
+        Self::decode(rows)
+    }
+
     /// The album posts of `chat` (content type 16, `serviceType` `AB`),
     /// newest first. Only post notifications are read (by index), never the
     /// whole history.
@@ -1940,6 +1970,42 @@ mod tests {
             .unwrap();
         assert_eq!(ids(&s), ["104", "100"]);
         assert!(s.album_posts("Cnone").unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_finds_text_in_one_chat_newest_first_without_case() {
+        let s = Store::open_in_memory().unwrap();
+        let mut msgs: Vec<Message> = (1..=40)
+            .map(|i| msg(&i.to_string(), "Ua", "Cg", i * 10, &format!("note {i}")))
+            .collect();
+        msgs.push(msg("50", "Ua", "Cg", 500, "Meet at the CAFÉ?"));
+        msgs.push(msg("51", "Ub", "Cg", 510, "ไปกินข้าวที่ร้านกาแฟ"));
+        msgs.push(msg("52", "Ub", "Cg", 520, "the café, at noon"));
+        // A file named like the query is not a text match.
+        let mut file = msg("53", "Ub", "Cg", 530, "café.pdf");
+        file.content_type = content_type::FILE;
+        msgs.push(file);
+        s.put_messages("Cg", &msgs, None).unwrap();
+        s.put_message("Cother", &msg("60", "Ua", "Cother", 600, "café elsewhere"), None)
+            .unwrap();
+        // Undecryptable text is not searched.
+        s.put_message("Cg", &msg("61", "Ua", "Cg", 610, "café secret"), Some("no key"))
+            .unwrap();
+        let ids = |q: &str, limit: usize| -> Vec<String> {
+            s.search_messages("Cg", q, limit)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.message.id)
+                .collect()
+        };
+        assert_eq!(ids("café", 10), ["52", "50"]);
+        assert_eq!(ids("  CAFÉ ", 10), ["52", "50"], "trimmed, without case");
+        assert_eq!(ids("กาแฟ", 10), ["51"]);
+        assert_eq!(ids("note 1", 3), ["19", "18", "17"], "newest first, limited");
+        assert!(ids("", 10).is_empty() && ids("   ", 10).is_empty());
+        assert!(ids("nothing like it", 10).is_empty());
+        s.mark_unsent("52").unwrap();
+        assert_eq!(ids("café", 10), ["50"], "unsent ones drop out");
     }
 
     #[test]

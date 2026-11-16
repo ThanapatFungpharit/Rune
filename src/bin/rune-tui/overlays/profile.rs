@@ -566,19 +566,19 @@ impl App {
     /// Keys while the page is open: `←`/`→` pick a button, `↑`/`↓` a member
     /// (above the first member are the buttons), `Enter` presses or opens.
     pub fn profile_key(&mut self, k: KeyEvent) {
+        self.profile_cmd(keymap::resolve(keymap::Ctx::Profile, &k));
+    }
+
+    fn profile_cmd(&mut self, cmd: Option<keymap::Cmd>) {
         use keymap::Cmd;
         let n = self.profile_members();
         let buttons = self.profile_buttons();
-        match keymap::resolve(keymap::Ctx::Profile, &k) {
+        // A page is as many members as the last frame showed.
+        let page = self.hit.profile_rows.len().max(1);
+        match cmd {
             Some(Cmd::Back) => self.profile_back(),
-            Some(Cmd::Up) => {
-                self.profile_sel = match self.profile_sel {
-                    Some(0) | None => None,
-                    Some(i) => Some(i - 1),
-                }
-            }
-            Some(Cmd::Down) if n > 0 => {
-                self.profile_sel = Some(self.profile_sel.map_or(0, |i| (i + 1).min(n - 1)));
+            Some(cmd @ (Cmd::Up | Cmd::Down | Cmd::PageUp | Cmd::PageDown | Cmd::Home | Cmd::End)) => {
+                self.profile_sel = member_step(self.profile_sel, n, cmd, page);
             }
             Some(Cmd::Left) => {
                 self.profile_sel = None;
@@ -626,8 +626,8 @@ impl App {
                     self.open_member(i);
                 }
             }
-            MouseEventKind::ScrollDown => self.profile_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-            MouseEventKind::ScrollUp => self.profile_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            MouseEventKind::ScrollDown => self.profile_cmd(Some(keymap::Cmd::Down)),
+            MouseEventKind::ScrollUp => self.profile_cmd(Some(keymap::Cmd::Up)),
             _ => {}
         }
     }
@@ -849,9 +849,44 @@ impl App {
     }
 }
 
+/// The member selected after `cmd` (`None`: the buttons above the list of `n`).
+fn member_step(sel: Option<usize>, n: usize, cmd: keymap::Cmd, page: usize) -> Option<usize> {
+    use keymap::Cmd;
+    let last = n.checked_sub(1)?;
+    match (cmd, sel) {
+        (Cmd::Home, _) | (Cmd::Up | Cmd::PageUp, None | Some(0)) => None,
+        (Cmd::Up, Some(i)) => Some(i - 1),
+        (Cmd::PageUp, Some(i)) => Some(i.saturating_sub(page)),
+        (Cmd::Down, sel) => Some(sel.map_or(0, |i| (i + 1).min(last))),
+        (Cmd::PageDown, sel) => Some(sel.map_or(page - 1, |i| i + page).min(last)),
+        (Cmd::End, _) => Some(last),
+        (_, sel) => sel,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn members_are_stepped_through_by_one_by_page_and_to_the_ends() {
+        use keymap::Cmd;
+        let step = |sel, cmd| member_step(sel, 30, cmd, 10);
+        assert_eq!(step(None, Cmd::Down), Some(0));
+        assert_eq!(step(Some(0), Cmd::Up), None, "above the first: the buttons");
+        assert_eq!(step(None, Cmd::PageDown), Some(9));
+        assert_eq!(step(Some(9), Cmd::PageDown), Some(19));
+        assert_eq!(step(Some(25), Cmd::PageDown), Some(29));
+        assert_eq!(step(Some(15), Cmd::PageUp), Some(5));
+        assert_eq!(step(Some(5), Cmd::PageUp), Some(0));
+        assert_eq!(step(Some(0), Cmd::PageUp), None);
+        assert_eq!(step(Some(12), Cmd::End), Some(29));
+        assert_eq!(step(Some(12), Cmd::Home), None);
+        assert_eq!(step(Some(29), Cmd::Down), Some(29));
+        // No members: always the buttons.
+        assert_eq!(member_step(None, 0, Cmd::Down, 10), None);
+        assert_eq!(member_step(None, 0, Cmd::End, 10), None);
+    }
 
     #[test]
     fn avatar_is_round() {

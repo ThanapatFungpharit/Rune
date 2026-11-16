@@ -235,7 +235,8 @@ Navigation is "Enter forward, Esc back": `Enter` opens a chat, after which
 you type straight away; `↑` steps up into the messages and `↓` past the
 newest one (or just typing) returns to the input line. The mouse works too —
 click a chat or a picture, scroll with the wheel. Pass `--no-mouse` to leave
-the mouse to the terminal (Shift-drag selects text in most terminals anyway).
+the mouse to the terminal (Shift-drag selects text in most terminals anyway);
+`c` on a selected message copies its text.
 
 `Enter` sends and `Shift-Enter` starts a new line (`Alt-Enter` or `Ctrl-j`
 where the terminal does not report `Shift-Enter`). Nothing half-written
@@ -256,7 +257,7 @@ view (also while typing):
   your profile, pin lists, read receipts, settings, plugins, the shortcuts,
   quit. Every entry shows its own shortcut, so the menu also teaches them.
 - **The chat's menu** (`m` in the chat list, `Ctrl-g` in a chat): profile,
-  albums, send, mute, pin, then invite, rename and leave for groups.
+  search in chat, albums, send, mute, pin, then invite, rename and leave for groups.
 - **The message's menu** (`m` on a selected message or in the viewer).
 
 **Settings** (`Ctrl-s`) is where preferences and management live, plugins
@@ -267,25 +268,42 @@ opened with keys and menus, so typing never navigates by accident.
 
 `?` (or `F1`, which also works while typing) lists every key of the screen
 you are on; the status line starts with `Ctrl-x menu` and shows the common
-keys that apply right now. Letters are only bound where nothing is typed and
+keys that apply right now. A message on the status line stays while you are
+away; once it has been up for 8 seconds (30 for a failure), your next key
+clears it. Letters are only bound where nothing is typed and
 only for frequent actions; everything else is in a menu, by name.
 Consequential actions (unsend, leave, decline, delete) ask first, with the
 *Cancel* button highlighted.
+
+Every key below is a default: **Settings › Shortcuts** lists each screen, and
+on a screen's page `Enter` takes the next key you press as the new one (`a`
+adds a key beside the others, `Delete` puts the default back). A key that
+already does something else there is moved only when you say so; `Alt` with a
+letter or digit stays with plugins, and letters are refused where they would be
+typed as text. Menus, hints, help screens and messages always name the keys
+as you have them. Changes are kept in the local store and in
+`~/.config/rune/keys.json` (`$XDG_CONFIG_HOME` if set) — only what differs from
+the defaults, as `"messages.reply": ["ctrl-t"]` (each shortcut's name is shown in
+the editor). Edit that file by hand or copy it to another machine: it is read at
+start, where it wins over the store, or with *Read keys.json again*; a file
+rune cannot read is left alone, never overwritten. `--default-keys` starts
+with the defaults for one run (yours stay saved), and the editor's own keys
+cannot be changed, so a mistake can always be undone.
 
 | Key / mouse / command                                                            | Action                                                                                                                                                          |
 |----------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `Ctrl-c`                                                                         | quit                                                                                                                                                            |
 | `?`, `F1`                                                                        | the keys of the current screen                                                                                                                                  |
 | `Ctrl-x`                                                                         | main menu: chat menu, send, find, new group, my profile, pin lists, read receipts, settings, plugins, shortcuts, quit                                           |
-| `Ctrl-s`                                                                         | settings: notifications (this computer and LINE's), chats, account, plugins, storage                                                                           |
+| `Ctrl-s`                                                                         | settings: notifications (this computer and LINE's), chats, shortcuts, account, plugins, storage                                                                |
 | `↑` `↓` / `j` `k`, wheel                                                         | move in the chat list / message list                                                                                                                            |
-| chat list: `PgUp` `PgDn`                                                         | a page of chats up / down                                                                                                                                       |
-| `Home` `End` (chat list, messages, menus, settings)                              | first / last item; in messages `End` selects the newest message                                                                                                 |
+| `PgUp` `PgDn` (chat list, people picker, settings, a group's members)            | a page up / down                                                                                                                                                |
+| `Home` `End` (chat list, messages, menus, settings, a group's members)           | first / last item; in messages `End` selects the newest message; on a profile `Home` goes back to the buttons                                                   |
 | chat list: `↓` / wheel to the last chat                                          | load more chats: older and hidden ones the start-up list leaves out (100 per page, until all are listed)                                                        |
 | `Enter`, click                                                                   | open the chat · send the message · view the selected media (GIFs and animated stickers play in the viewer); videos, audio and audio/video files **play in mpv** |
 | chat list: `Enter` on an invitation                                              | join or decline (invitations are listed first, in yellow)                                                                                                       |
 | chat list: `/`, `Ctrl-f` anywhere                                                | search chats (by name or member) and friends, best match first; `↓` at the end searches older chats; `Esc` stops                                                |
-| chat list: `m`, `Ctrl-g` in a chat                                               | the chat's menu: profile/members, albums, send, mute, pin/unpin, move pin, invite, rename, leave                                                               |
+| chat list: `m`, `Ctrl-g` in a chat                                               | the chat's menu: profile/members, search in chat, albums, send, mute, pin/unpin, move pin, invite, rename, leave                                               |
 | chat list: `p`, `Ctrl-p` in a chat                                               | the chat's profile                                                                                                                                              |
 | `Ctrl-r`                                                                         | read receipts on / off (saved; read chats without others seeing it)                                                                                             |
 | chat list: `n`                                                                   | new group (name, then pick friends)                                                                                                                             |
@@ -305,7 +323,9 @@ Consequential actions (unsend, leave, decline, delete) ask first, with the
 | messages / viewer: `o`                                                           | open (from `~/.cache/rune/view/`, not Downloads; emptied of files older than 7 days or beyond 1 GiB at start-up): motion media in mpv, everything else with the system app; file types that can run programs (`.desktop`, scripts, `.jar`, executables, installers) are asked about first |
 | messages: `p`                                                                    | the sender's profile                                                                                                                                            |
 | messages: `x`                                                                    | unsend one of your messages (asks first)                                                                                                                        |
-| messages / viewer: `m`                                                           | every action for the message: reply, react, reactions, read by, unsend, view, save, open, go to the quoted message, sender's profile                            |
+| messages: `/`, chat menu › *Search in chat…*                                     | search the chat's messages stored on this computer (text, without case; newest first, as you type); `Enter` shows the message in the chat (`/` again: the same query) |
+| messages: `c`                                                                    | copy the message's text (through `wl-copy`, `xclip`, `xsel` or `pbcopy`, else the terminal's OSC 52 — which also works over SSH where the terminal allows it)  |
+| messages / viewer: `m`                                                           | every action for the message: reply, react, reactions, read by, unsend, view, save, open, copy, go to the quoted message, sender's profile                      |
 | viewer: `←` `→` / `h` `l`, wheel                                                 | previous / next media in the chat                                                                                                                               |
 | viewer: `Space`                                                                  | play a video or audio clip in mpv; pause / resume a GIF or animated sticker                                                                                     |
 | viewer: `u`                                                                      | open the link in the picture's QR code                                                                                                                          |
@@ -391,7 +411,8 @@ or off; message text; groups; muted chats never notify; a test button; a 1:1 cha
 is titled with the sender, a group with the group and `Sender: text` / `Sender sent a photo`,
 with the sender's profile picture as the icon under `notify-send`), then LINE's own notification
 switches (they apply to your phone too); *Chats* (read receipts, automatic pictures, inline picture size,
-colour theme: automatic, dark or light, pin lists); *Account* (display name, status message,
+colour theme: automatic, dark or light, pin lists); *Shortcuts* (every screen's keys, each
+changeable; see above); *Account* (display name, status message,
 your profile page); *Plugins* (every installed plugin and its state, and installing from Git;
 `Enter` opens a plugin's page, `Esc` comes back); *Storage* (database path,
 counts, stream position, clear local data). Clearing deletes the stored chats

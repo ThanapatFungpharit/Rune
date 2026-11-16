@@ -149,7 +149,8 @@ restarts its wait whenever `subscribe_tokens` fires.
 `graphics/` holds picture code (`picture`, `piccache`, `cells`, `anim`, `avatar`, `fetchq`),
 `overlays/` the screens drawn over the chat (`modal`, `attach`, `stickers`,
 `settings`, `profile`, `albums`, `plugin_ui`); `input`, `keymap`, `links` sit
-beside `main.rs`, as do `cli`, `notice`, `receipts`, `retry` and `theme` (every colour by role — `theme::t().accent`, `theme::muted()` — dark and light palettes, Auto from `COLORFGBG`, xterm-256 fallback without `COLORTERM=truecolor`; never hard-code a `Color` in drawing code). Child modules `use crate::*` and `main.rs` re-imports each by
+beside `main.rs`, as do `cli`, `clipboard` (`c` copies a text message: `wl-copy`/`xclip`/`xsel`/`pbcopy`,
+else OSC 52; under `cfg(test)` into `clipboard::COPIED`), `notice`, `receipts`, `retry` and `theme` (every colour by role — `theme::t().accent`, `theme::muted()` — dark and light palettes, Auto from `COLORFGBG`, xterm-256 fallback without `COLORTERM=truecolor`; never hard-code a `Color` in drawing code). Child modules `use crate::*` and `main.rs` re-imports each by
 its short name, so `picture::…`, `modal::…` paths work everywhere. Single `App` state
 driven by a `tokio::select!` over crossterm events and an `mpsc` of `AppEvent`s;
 all network work runs in spawned tasks that post results back. A failed load posts
@@ -157,7 +158,9 @@ all network work runs in spawned tasks that post results back. A failed load pos
 `retry.rs` backs each `Job` off exponentially on its own schedule (capped at 5 min,
 10 min for per-item jobs, never given up) and `App::run_retries` restarts due ones; one
 job's success or failure never reschedules another. Writes of user data to the store go through `App::saved`, which
-puts a failure on the status line (cache writes stay best effort). `cli.rs` parses the
+puts a failure on the status line (cache writes stay best effort). A status message clears on
+the next key, click or paste once it has been drawn for 8 s (30 s if `status_is_error`):
+`App::expire_status`, never on a timer, so nothing goes while the user is away. `cli.rs` parses the
 options (strict; `--log` sets up `tracing-subscriber`); `main::read_session` only logs
 in when the session file is missing. SIGTERM/SIGHUP quit like the quit key (`spawn_signal_watch` →
 `AppEvent::Terminate`; a second one exits at once), and a terminal error ends `run`'s loop rather
@@ -196,13 +199,30 @@ without graphics, then draws pictures under a higher `Layer`'s box as text
 cells (or not at all when fully covered); `modal.rs` (menus — the main menu `Ctrl-x`, chat and message menus; a label's
 `\t` suffix is its right-aligned shortcut — forms, pickers, confirms and
 the `Action` dispatcher), `attach.rs` (file browser + send dialog),
-`stickers.rs` (also the LINE emoji reaction picker, `Pick::Emoji`), `settings.rs` (prefs in the store, notifications; tabs are `settings::Tab`) are the
-overlays — an open `App::modal` takes every key. A screen opened from a settings row goes through
+`stickers.rs` (also the LINE emoji reaction picker, `Pick::Emoji`), `settings.rs` (prefs in the store, notifications; tabs are `settings::Tab`),
+`find.rs` (search in a chat, `Modal::Find`/`Ctx::Find`: `Store::search_messages` — stored, decrypted text
+messages only, `str::to_lowercase` matching — runs in `spawn_blocking` per change of the query and posts
+`AppEvent::Found`; a result whose `seq` is not the latest is dropped; `Enter` goes through
+`App::show_message`, which album photos share: it loads the stored stretch from the message to the
+loaded history) are the overlays — an open `App::modal` takes every key. A screen opened from a settings row goes through
 `open_from_settings`, which keeps Settings in `App::modal_parent`; `settle_modal` (after every key,
 mouse, paste and app event) puts it back once that screen closes. Navigation is keys and menus,
 never message-line commands: `/` commands act on the open chat, and an unknown `/word` is never sent. `keymap.rs` holds every binding
 per `Ctx` (one per screen/overlay, plus shared text-editing and `?` tables);
-`App::available` filters the status-line hints by what the selection allows; every hint is
+Those tables are the defaults: `keymap::Keymap` layers the user's changes on them (stored as JSON in
+`setting.keys`, per `Table` — a context's own, or the shared `Global`/`TextEdit`/`QuestionHelp` — and
+`Cmd`, with stable ids; also mirrored to `keys.json` in the config dir, `shortcuts::default_file` —
+read at start where it wins, rewritten on every change through symlinks, and left alone while
+`Keymap::parse` refuses it), installed per UI thread (`keymap::install`; `--default-keys` installs the
+defaults while `App::keys` keeps the saved set). Nothing names a key in text: menus, confirm buttons,
+status messages, the welcome tips and plugin notices ask `keymap::shortcut`/`global`/`with_keys`/
+`via_menu`. Settings › Shortcuts lists `keymap::SECTIONS`; `overlays/shortcuts.rs` is one section's
+page (`Modal::Shortcuts`, `Ctx::Keys`, whose keys and the menus' digits cannot change): `Enter`
+captures the next key (routed there before global keys), refused by `Keymap::refusal` (plugin `Alt`
+keys, printable keys where `typed_there`), and a key in use elsewhere (`Keymap::conflicts`, across
+every context the binding answers in) moves only after a yes; `Keymap::clash` flags stored clashes.
+Mouse clicks and the wheel act through `App::modal_cmd(Cmd)`, never a synthesized key, so they work
+whatever the keys are. `App::available` filters the status-line hints by what the selection allows; every hint is
 fitted to its width by `keymap::fit_hint` (whole entries dropped from the end, then `…`; the help
 key always kept — `main::status_line`, `frame_hint` for overlay frames), and
 the keymap tests pin one meaning per key and no redundant alternatives. `keymap::COMMANDS`
@@ -271,8 +291,8 @@ cargo workspace; its prebuilt `snippets.wasm` is checked in for the host tests.
 
 ## Repo notes
 
-- The enclosing git repository is the user's home directory; this project has no
-  repo of its own, so don't commit unless asked (and suggest `git init` here).
+- Own git repo (`origin` = private GitHub `ThanapatFungpharit/Rune`); commit or push only when asked.
+  `ltsm.wasm` must never enter history (it was purged with `git filter-repo`).
 - `session.json` holds tokens and private keys (written 0600, gitignored);
   the TUI's `session.db` holds decrypted messages (0600, gitignored).
 - The live service is the source of truth: the reference was wrong in places (e.g. `getE2EEPublicKey(mid, 1, 0)` is

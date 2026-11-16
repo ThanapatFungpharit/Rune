@@ -440,8 +440,8 @@ impl App {
         self.send_outgoing(chat, out, "[sticker]".into());
     }
 
-    pub fn stickers_key(&mut self, mut s: Stickers, k: KeyEvent) {
-        match keymap::resolve(s.ctx(), &k) {
+    pub fn stickers_key(&mut self, mut s: Stickers, cmd: Option<keymap::Cmd>) {
+        match cmd {
             Some(keymap::Cmd::Back) => return,
             Some(cmd @ (keymap::Cmd::Left | keymap::Cmd::Right | keymap::Cmd::Up | keymap::Cmd::Down)) => {
                 s.step(cmd)

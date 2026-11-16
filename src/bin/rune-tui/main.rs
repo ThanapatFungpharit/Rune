@@ -114,6 +114,7 @@ use ratatui_image::picker::Picker;
 use ratatui_image::picker::ProtocolType;
 
 mod cli;
+mod clipboard;
 mod graphics;
 mod input;
 mod keymap;
@@ -131,7 +132,7 @@ use fetchq::{FetchQueue, MediaKey};
 use graphics::{anim, avatar, cells, fetchq, piccache, picture};
 use input::{Edit, TextInput};
 use modal::{Action, Modal};
-use overlays::{albums, attach, modal, plugin_ui, profile, settings, stickers};
+use overlays::{albums, attach, find, modal, plugin_ui, profile, settings, shortcuts, stickers};
 use piccache::PicCache;
 use picture::{Layer, Picture};
 use profile::{ProfileAction, ProfileData, ProfileLoaded};
@@ -209,13 +210,18 @@ impl ChatEntry {
 }
 
 /// Chat-list preview of a pending invitation.
-const INVITE_PREVIEW: &str = "Invitation · Enter to join or decline";
+fn invite_preview() -> String {
+    format!(
+        "Invitation · {}",
+        keymap::with_keys(keymap::Ctx::ChatList, keymap::Cmd::Confirm, "to join or decline")
+    )
+}
 
 impl ChatEntry {
     fn invitation(chat: &Chat) -> Self {
         ChatEntry {
             mid: chat.chat_mid.clone(),
-            preview: INVITE_PREVIEW.into(),
+            preview: invite_preview(),
             last_time: chat.created_time().unwrap_or(0),
             unread: 0,
             invited: true,
@@ -243,6 +249,8 @@ struct UiMsg {
     /// Composed by its sender (not a call record, album notice or bot card):
     /// sending it means they had the chat open, so they had seen what came before.
     written: bool,
+    /// A text message: `text` is what its sender typed (and can be copied).
+    plain: bool,
 }
 
 /// How we know a member has seen a message.
@@ -309,6 +317,11 @@ impl UiMsg {
                 .is_some_and(|n| is_motion_file(n)),
             _ => false,
         }
+    }
+
+    /// Its text is worth copying: what its sender typed, still there.
+    fn copyable(&self) -> bool {
+        self.plain && !self.unsent && !self.text.is_empty()
     }
 
     /// Has a picture we can draw (thumbnail / viewer).
@@ -477,6 +490,8 @@ enum AppEvent {
     /// Sent: chat, how to show it, the message to store.
     Sent(String, Box<UiMsg>, Option<Box<Message>>),
     Status(String),
+    /// A search in a chat finished (see `find`).
+    Found(Box<find::Found>),
     /// Group members and invitees, per chat.
     Members(HashMap<String, (Vec<String>, Vec<String>)>),
     /// LINE's per-chat notification setting, per mid.
@@ -539,6 +554,17 @@ struct App {
     prefs: Prefs,
     /// `--no-read-receipts` given: never send them this run.
     no_read_receipts_flag: bool,
+    /// The user's shortcuts (Settings › Shortcuts), as stored.
+    keys: keymap::Keymap,
+    /// `--default-keys` given: keys answer with the defaults this run.
+    default_keys: bool,
+    /// What in the stored shortcuts could not be used (shown in Settings ›
+    /// Shortcuts until they are next changed).
+    key_problems: Vec<String>,
+    /// The file the shortcuts are also kept in (`keys.json`), if any.
+    keys_file: Option<shortcuts::KeysFile>,
+    /// The last search in a chat: (chat, query), offered again there.
+    last_find: Option<(String, String)>,
     /// The open overlay, if any.
     modal: Option<Modal>,
     /// The screen `modal` was opened from (Settings), shown again once it
@@ -617,6 +643,8 @@ struct App {
     /// Lines scrolled up from the bottom of the conversation.
     scroll: usize,
     status: String,
+    /// The status message as last drawn, and since when (see `expire_status`).
+    status_since: Option<(String, Instant)>,
     quit: bool,
     /// Selected message (index into the open chat's messages).
     sel: Option<usize>,
@@ -1051,6 +1079,7 @@ fn to_ui(m: &Message, e2ee_error: Option<&str>) -> Option<UiMsg> {
         reactions: m.reactions(),
         unsent: false,
         delivered: m.delivered_time().or(m.created_time).unwrap_or(0),
+        plain: m.content_type == ct::TEXT && !m.is_e2ee() && e2ee_error.is_none(),
         written: matches!(
             m.content_type,
             ct::TEXT
@@ -2330,6 +2359,11 @@ impl App {
     fn new(client: Client, me: String, tx: mpsc::UnboundedSender<AppEvent>, store: Store) -> App {
         let prefs = Prefs::load(&store);
         theme::apply(prefs.theme);
+        let (keys, key_problems) = shortcuts::load(&store);
+        for problem in &key_problems {
+            tracing::warn!("shortcuts: {problem}");
+        }
+        keymap::install(keys.clone());
         let store_for_plugins = store.clone();
         let mut app = App {
             client,
@@ -2339,6 +2373,11 @@ impl App {
             store,
             prefs,
             no_read_receipts_flag: false,
+            keys,
+            default_keys: false,
+            key_problems,
+            keys_file: None,
+            last_find: None,
             modal: None,
             modal_parent: None,
             contacts: HashMap::new(),
@@ -2381,6 +2420,7 @@ impl App {
             input: TextInput::default(),
             scroll: 0,
             status: String::new(),
+            status_since: None,
             quit: false,
             sel: None,
             thumbs: PicCache::new(THUMB_CACHE_BYTES),
@@ -2757,7 +2797,13 @@ impl App {
         self.status = if self.prefs.read_receipts {
             "read receipts on: chats you read are marked read".into()
         } else {
-            "read receipts off: read without others seeing it (Ctrl-r turns them back on)".into()
+            match keymap::global(keymap::Cmd::ReadReceipts) {
+                key if key.is_empty() => {
+                    "read receipts off: read without others seeing it (Settings › Chats turns them back on)"
+                        .into()
+                }
+                key => format!("read receipts off: read without others seeing it ({key} turns them back on)"),
+            }
         };
     }
 
@@ -2954,7 +3000,11 @@ impl App {
 
     fn open_chat(&mut self, mid: String) {
         if self.chats.iter().any(|c| c.mid == mid && c.invited) {
-            self.status = format!("invitation to {} — Enter to join or decline", self.name(&mid));
+            self.status = format!(
+                "invitation to {} — {}",
+                self.name(&mid),
+                keymap::with_keys(keymap::Ctx::ChatList, keymap::Cmd::Confirm, "to join or decline")
+            );
             return;
         }
         let mut mark = None;
@@ -3366,6 +3416,7 @@ impl App {
                         unsent: false,
                         delivered: 0,
                         written: true,
+                        plain: false,
                     });
                     ui.from = me;
                     let _ = tx.send(AppEvent::Sent(chat, Box::new(ui), Some(Box::new(m))));
@@ -4453,6 +4504,7 @@ impl App {
                 self.status = "sent".into();
             }
             AppEvent::Status(s) => self.status = s,
+            AppEvent::Found(found) => self.on_found(*found),
             AppEvent::Terminate => self.quit = true,
             AppEvent::Invitations(chats, full) => {
                 if full {
@@ -5028,14 +5080,48 @@ impl App {
     }
 
     fn on_key(&mut self, k: KeyEvent) {
+        if k.kind == KeyEventKind::Press {
+            self.expire_status();
+        }
         self.handle_key(k);
         self.settle_modal();
+    }
+
+    /// Remember when the status message changed (called before each frame).
+    fn note_status(&mut self) {
+        if self.status_since.as_ref().is_none_or(|(s, _)| *s != self.status) {
+            self.status_since = Some((self.status.clone(), Instant::now()));
+        }
+    }
+
+    /// Before a key, click or paste is handled: a status message that has
+    /// been on screen long enough goes, so old news does not crowd out the
+    /// keys. It only goes when someone is there to have read it — never
+    /// while the keyboard is idle — and errors stay longer.
+    fn expire_status(&mut self) {
+        self.note_status();
+        if let Some((shown, since)) = &self.status_since
+            && !shown.is_empty()
+        {
+            let keep = if status_is_error(shown) {
+                STATUS_ERROR_KEEP
+            } else {
+                STATUS_KEEP
+            };
+            if since.elapsed() >= keep {
+                self.status.clear();
+            }
+        }
     }
 
     fn handle_key(&mut self, k: KeyEvent) {
         use keymap::Cmd;
         if k.kind != KeyEventKind::Press {
             return;
+        }
+        // Waiting for a new shortcut: whatever is pressed is it.
+        if matches!(&self.modal, Some(Modal::Shortcuts(p)) if p.capturing()) {
+            return self.modal_key(k);
         }
         let ctx = self.key_context();
         let cmd = keymap::resolve(ctx, &k);
@@ -5249,7 +5335,10 @@ impl App {
             // A pasted line break is not a request to send half of the paste.
             Some(Cmd::Confirm) if self.pasting => {
                 self.input.insert('\n');
-                self.status = "pasted text keeps its line breaks — Enter sends it".into();
+                self.status = format!(
+                    "pasted text keeps its line breaks — {} it",
+                    keymap::with_keys(keymap::Ctx::Compose, Cmd::Confirm, "sends")
+                );
             }
             Some(Cmd::Confirm) => self.submit(),
             Some(Cmd::NewLine) => self.input.insert('\n'),
@@ -5333,6 +5422,12 @@ impl App {
             }
             Some(Cmd::Save) => self.act_on_selected(After::Save),
             Some(Cmd::OpenExternal) => self.act_on_selected(After::Open),
+            Some(Cmd::Copy) => self.copy_selected(),
+            Some(Cmd::FindInChat) => {
+                if let Some(chat) = self.open.clone() {
+                    self.open_find(chat);
+                }
+            }
             None => {
                 if let Some(c) = typed_char(k) {
                     self.focus = Focus::Input;
@@ -5350,6 +5445,7 @@ impl App {
     /// Bracketed paste: into the search field or an overlay's text field; a
     /// file path in a chat offers to send the file; other text is typed.
     fn on_paste(&mut self, text: &str) {
+        self.expire_status();
         self.handle_paste(text);
         self.settle_modal();
     }
@@ -5383,12 +5479,21 @@ impl App {
             self.input.insert_str(text);
             let lines = text.lines().count();
             if lines > 1 {
-                self.status = format!("pasted {lines} lines — Enter sends them as one message");
+                self.status = format!(
+                    "pasted {lines} lines — {} them as one message",
+                    keymap::with_keys(keymap::Ctx::Compose, keymap::Cmd::Confirm, "sends")
+                );
             }
         }
     }
 
     fn on_mouse(&mut self, m: MouseEvent) {
+        if matches!(
+            m.kind,
+            MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) {
+            self.expire_status();
+        }
         self.handle_mouse(m);
         self.settle_modal();
     }
@@ -5499,6 +5604,24 @@ impl App {
         self.left_search();
     }
 
+    /// `c` on a selected message: its text to the clipboard.
+    fn copy_selected(&mut self) {
+        let Some(m) = self.selected_msg() else { return };
+        if !m.copyable() {
+            self.status = "only a text message can be copied".into();
+            return;
+        }
+        let text = m.text.clone();
+        let n = text.chars().count();
+        let what = if n == 1 { "character" } else { "characters" };
+        self.status = match clipboard::copy(&text, &self.tx) {
+            clipboard::Via::Program(_) => format!("copied {n} {what}"),
+            clipboard::Via::Terminal => {
+                format!("copied {n} {what} through the terminal (if it allows that: OSC 52)")
+            }
+        };
+    }
+
     /// `r` on a selected message: the next text message quotes it.
     fn start_reply(&mut self) {
         // From the viewer's menu: typing happens in the message line.
@@ -5511,7 +5634,12 @@ impl App {
         };
         self.replying = Some(m.id.clone());
         self.focus = Focus::Input;
-        self.status = "replying — Enter send · Esc cancel".into();
+        self.status = format!(
+            "replying — {}{}{}",
+            keymap::with_keys(keymap::Ctx::Compose, keymap::Cmd::Confirm, "send"),
+            keymap::HINT_SEP,
+            keymap::with_keys(keymap::Ctx::Compose, keymap::Cmd::Back, "cancel")
+        );
     }
 
     /// `g` on a reply: select the message it quotes.
@@ -5636,6 +5764,8 @@ impl App {
                 Modal::Settings(_) => Ctx::Settings,
                 Modal::Plugins(_) => Ctx::Plugins,
                 Modal::PluginView(_) => Ctx::PluginView,
+                Modal::Shortcuts(_) => Ctx::Keys,
+                Modal::Find(_) => Ctx::Find,
             };
         }
         if !self.profile.is_empty() {
@@ -5674,8 +5804,14 @@ impl App {
             Cmd::Profile => msg.is_some(),
             Cmd::Unsend => msg.is_some_and(|m| self.can_unsend(m)),
             Cmd::Save | Cmd::OpenExternal => msg.is_some_and(|m| m.media_kind().is_some()),
+            Cmd::Copy => msg.is_some_and(UiMsg::copyable),
+            Cmd::FindInChat => self.open.is_some(),
             Cmd::OpenLink => msg.is_some_and(|m| !self.links_of(m).is_empty()),
             Cmd::PlayPause => self.viewer_plays() || self.viewer_animates(),
+            Cmd::ResetKey => matches!(
+                &self.modal,
+                Some(Modal::Shortcuts(p)) if p.selected().is_some_and(|(t, c)| self.keys.is_custom(t, c))
+            ),
             Cmd::AsFile | Cmd::OriginalQuality => match &self.modal {
                 Some(Modal::Attach(a)) => {
                     !a.cover
@@ -6281,19 +6417,46 @@ impl App {
             }
         };
         let Some(chat) = self.open.clone() else {
+            use keymap::{Cmd, Ctx};
             let key = Style::new().fg(theme::t().accent);
-            let tip = |k: &'static str, what: &'static str| {
-                Line::from(vec![Span::styled(format!("{k:>7}  "), key), Span::raw(what)])
+            let (help, typing_help) = (
+                keymap::shortcut(Ctx::ChatList, Cmd::Help),
+                keymap::global(Cmd::Help),
+            );
+            let help_what = if typing_help.is_empty() || typing_help == help {
+                "all shortcuts".to_owned()
+            } else {
+                format!("all shortcuts ({typing_help} while typing)")
             };
-            let lines = vec![
+            // The keys as they are now; one without a key is left out.
+            let tips: Vec<(String, String)> = [
+                (
+                    keymap::shortcut(Ctx::ChatList, Cmd::Search),
+                    "search chats and friends".to_owned(),
+                ),
+                (
+                    keymap::shortcut(Ctx::ChatList, Cmd::NewGroup),
+                    "new group".to_owned(),
+                ),
+                (
+                    keymap::global(Cmd::MainMenu),
+                    "menu: profile, pin lists, settings, plugins…".to_owned(),
+                ),
+                (if help.is_empty() { typing_help } else { help }, help_what),
+            ]
+            .into_iter()
+            .filter(|(k, _)| !k.is_empty())
+            .collect();
+            let key_w = tips.iter().map(|(k, _)| k.width()).max().unwrap_or(0).max(7);
+            let mut lines = vec![
                 Line::raw(""),
                 Line::raw("Pick a chat on the left to open it."),
                 Line::raw(""),
-                tip("/", "search chats and friends"),
-                tip("n", "new group"),
-                tip("Ctrl-x", "menu: profile, pin lists, settings, plugins…"),
-                tip("?", "all shortcuts (F1 while typing)"),
             ];
+            lines.extend(tips.into_iter().map(|(k, what)| {
+                let pad = " ".repeat(key_w - k.width());
+                Line::from(vec![Span::styled(format!("{pad}{k}  "), key), Span::raw(what)])
+            }));
             let width = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
             let x = inner.x + inner.width.saturating_sub(width) / 2;
             let area = Rect::new(x, inner.y, width.min(inner.width), inner.height);
@@ -6689,7 +6852,11 @@ impl App {
         let title = match (&self.replying, &self.open) {
             (Some(id), Some(chat)) => {
                 let max = (area.width as usize).saturating_sub(30).max(10);
-                format!(" ↩ Reply to {} · Esc cancel ", self.quote(chat, id, max))
+                format!(
+                    " ↩ Reply to {} · {} ",
+                    self.quote(chat, id, max),
+                    keymap::with_keys(keymap::Ctx::Compose, keymap::Cmd::Back, "cancel")
+                )
             }
             _ => match self.input.line_count() {
                 1 => " Message ".into(),
@@ -6854,6 +7021,7 @@ async fn run(
         app.flush_receipts();
         app.sync_anim();
         app.maybe_more_chats();
+        app.note_status();
         if let Err(e) = terminal.draw(|f| app.draw(f)) {
             failure = Some(e);
             break;
@@ -6960,6 +7128,11 @@ const CHAT_LIST_MIN_W: u16 = 26;
 
 /// Events read in one go, at most (a long paste takes several reads).
 const MAX_BATCH: usize = 4096;
+
+/// How long a status message stays at least (see `App::expire_status`).
+const STATUS_KEEP: Duration = Duration::from_secs(8);
+/// ... and one that reports a failure.
+const STATUS_ERROR_KEEP: Duration = Duration::from_secs(30);
 /// This many key presses read in one go are a paste, not typing: a person
 /// gets that far ahead of the screen only when it stalls.
 const BURST_KEYS: usize = 8;
@@ -7110,6 +7283,10 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
     app.plugins = plugins::Plugins::new(store, plugin_dir, opts.no_plugins, keymap::CORE_COMMANDS);
     app.start_plugins();
     app.no_read_receipts_flag = !opts.read_receipts;
+    app.use_default_keys(opts.default_keys);
+    if let Some(file) = shortcuts::default_file() {
+        app.use_keys_file(file);
+    }
     app.cell_mode = opts.cells;
     app.picker = picker;
     app.status = if app.chats.is_empty() {
@@ -7491,6 +7668,7 @@ mod tests {
                     unsent: false,
                     delivered: 0,
                     written: true,
+                    plain: true,
                 })
                 .collect();
             a.messages.insert((*mid).into(), msgs);
@@ -7524,6 +7702,7 @@ mod tests {
                 unsent: false,
                 delivered: 0,
                 written: true,
+                plain: true,
             })
             .collect(),
         );
@@ -11170,11 +11349,14 @@ mod tests {
     fn the_message_line_help_lists_its_commands() {
         let lines = keymap::help_lines(keymap::Ctx::Compose);
         assert!(lines.iter().any(|(k, _)| k == "/attach [PATH]"));
+        // The messages have the `/` key (search), not the `/commands`.
+        let messages = keymap::help_lines(keymap::Ctx::Messages);
         assert!(
-            !keymap::help_lines(keymap::Ctx::Messages)
+            !messages
                 .iter()
-                .any(|(k, _)| k.starts_with('/'))
+                .any(|(k, _)| is_command_word(k.split(' ').next().unwrap_or("")))
         );
+        assert!(messages.contains(&("/".into(), "search this chat's messages")));
     }
 
     #[test]
@@ -11613,5 +11795,668 @@ mod tests {
         assert!(a.open.is_none() && a.viewer.is_none() && a.replying.is_none());
         assert!(!a.typing.contains_key("Ua") && !a.no_older.contains("Ua"));
         assert_eq!(a.focus, Focus::Chats);
+    }
+
+    // -- shortcuts ---------------------------------------------------------------------
+
+    /// Settings › Shortcuts › `section`, with the binding of `cmd` selected.
+    fn shortcut_page(a: &mut App, section: &str, cmd: keymap::Cmd) {
+        a.open_settings_at(settings::Tab::Shortcuts);
+        let rows = a.settings_rows_for_test(settings::Tab::Shortcuts);
+        let Some(Modal::Settings(s)) = &mut a.modal else {
+            panic!("settings")
+        };
+        s.sel = rows.iter().position(|r| r == section).expect(section);
+        key(a, KeyCode::Enter);
+        let Some(Modal::Shortcuts(p)) = &mut a.modal else {
+            panic!("the {section} shortcuts, not {:?}", a.key_context())
+        };
+        assert_eq!(keymap::SECTIONS[p.section].title, section);
+        p.sel = keymap::SECTIONS[p.section]
+            .entries()
+            .iter()
+            .position(|(_, b)| b.cmd == cmd)
+            .expect("listed");
+    }
+
+    fn shortcut_state(a: &App) -> shortcuts::State {
+        match &a.modal {
+            Some(Modal::Shortcuts(p)) => p.state.clone(),
+            _ => panic!("the shortcut page, not {:?}", a.key_context()),
+        }
+    }
+
+    fn ctrl(a: &mut App, c: char) {
+        key_with_modifiers(a, KeyCode::Char(c), KeyModifiers::CONTROL);
+    }
+
+    #[tokio::test]
+    async fn a_changed_shortcut_answers_at_once_everywhere_it_is_named_and_is_kept() {
+        use keymap::Cmd;
+        let mut a = app();
+        a.open_chat("Ua".into());
+        shortcut_page(&mut a, "Messages", Cmd::Reply);
+        key(&mut a, KeyCode::Enter);
+        assert!(matches!(
+            shortcut_state(&a),
+            shortcuts::State::Capture { add: false }
+        ));
+        assert!(screen(&mut a).contains("press the new key"), "{}", screen(&mut a));
+        // Esc gives up waiting; the page then names the shortcut for keys.json.
+        key(&mut a, KeyCode::Esc);
+        assert_eq!(shortcut_state(&a), shortcuts::State::Browse);
+        let Some(Modal::Shortcuts(p)) = &mut a.modal else {
+            panic!()
+        };
+        p.note = None;
+        assert!(
+            screen(&mut a).contains("“messages.reply” in keys.json"),
+            "{}",
+            screen(&mut a)
+        );
+        key(&mut a, KeyCode::Enter);
+        ctrl(&mut a, 't');
+        assert_eq!(shortcut_state(&a), shortcuts::State::Browse);
+        assert!(screen(&mut a).contains("(default r)"), "{}", screen(&mut a));
+        // Back to Settings, which counts the change, then out.
+        key(&mut a, KeyCode::Esc);
+        assert!(matches!(&a.modal, Some(Modal::Settings(s)) if s.tab == settings::Tab::Shortcuts));
+        assert!(screen(&mut a).contains("1 changed"), "{}", screen(&mut a));
+        key(&mut a, KeyCode::Esc);
+        assert!(a.modal.is_none());
+
+        // In the messages: Ctrl-t replies, r does nothing.
+        a.select_msg(Some(1));
+        key(&mut a, KeyCode::Char('r'));
+        assert_eq!(a.replying, None);
+        a.select_msg(Some(1));
+        ctrl(&mut a, 't');
+        assert_eq!(a.replying.as_deref(), Some("01"));
+        assert!(a.status.contains("Esc cancel"), "{}", a.status);
+        // The message menu and the hint name the new key.
+        a.select_msg(Some(1));
+        assert!(a.hint().contains("Ctrl-t reply"), "{}", a.hint());
+        key(&mut a, KeyCode::Char('m'));
+        let Some(Modal::Menu(m)) = &a.modal else {
+            panic!("message menu")
+        };
+        assert!(
+            m.items.iter().any(|(l, _)| l == "↩ Reply\tCtrl-t"),
+            "{:?}",
+            m.items
+        );
+        a.modal = None;
+
+        // Stored, and the next start answers with it.
+        let stored = a.store.get("setting.keys").unwrap().unwrap();
+        assert!(stored.contains(r#""messages.reply":["ctrl-t"]"#), "{stored}");
+        keymap::install(keymap::Keymap::default());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let b = App::new(
+            Client::new(Config::default()).unwrap(),
+            "Ume".into(),
+            tx,
+            a.store.clone(),
+        );
+        assert!(b.key_problems.is_empty());
+        let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(keymap::resolve(keymap::Ctx::Messages, &ctrl_t), Some(Cmd::Reply));
+
+        // Delete puts the default back; nothing is stored then.
+        shortcut_page(&mut a, "Messages", Cmd::Reply);
+        key(&mut a, KeyCode::Delete);
+        assert!(a.keys.is_default());
+        assert_eq!(a.store.get("setting.keys").unwrap(), None);
+        assert_eq!(keymap::resolve(keymap::Ctx::Messages, &ctrl_t), None);
+    }
+
+    #[tokio::test]
+    async fn a_key_in_use_moves_only_when_asked() {
+        use keymap::{Cmd, Ctx, Table};
+        let mut a = app();
+        shortcut_page(&mut a, "Messages", Cmd::Reply);
+        key(&mut a, KeyCode::Enter);
+        key(&mut a, KeyCode::Char('e'));
+        assert!(matches!(shortcut_state(&a), shortcuts::State::Conflict { .. }));
+        assert!(
+            screen(&mut a).contains("already does “react”"),
+            "{}",
+            screen(&mut a)
+        );
+        key(&mut a, KeyCode::Char('n'));
+        assert!(a.keys.is_default(), "kept");
+        // Asked again and moved: React has no key left, and says so.
+        key(&mut a, KeyCode::Enter);
+        key(&mut a, KeyCode::Char('e'));
+        key(&mut a, KeyCode::Enter);
+        let messages = Table::Own(Ctx::Messages);
+        assert_eq!(keymap::display_keys(a.keys.keys(messages, Cmd::Reply)), "e");
+        assert!(a.keys.keys(messages, Cmd::React).is_empty());
+        assert!(
+            screen(&mut a).contains("“react” now has no key"),
+            "{}",
+            screen(&mut a)
+        );
+        assert!(keymap::help_lines(Ctx::Messages).contains(&("—".into(), "react")));
+        // React back to its default clashes with Reply: both rows say so.
+        let Some(Modal::Shortcuts(p)) = &mut a.modal else {
+            panic!()
+        };
+        p.sel += 1;
+        key(&mut a, KeyCode::Backspace);
+        assert!(a.keys.clash(messages, Cmd::React).is_some());
+        let text = screen(&mut a);
+        assert!(
+            text.contains("change one of them") && text.contains("⚠ e"),
+            "{text}"
+        );
+        key(&mut a, KeyCode::Esc);
+        assert!(screen(&mut a).contains("⚠ 1 changed"), "{}", screen(&mut a));
+        // Putting back every default asks first.
+        let rows = a.settings_rows_for_test(settings::Tab::Shortcuts);
+        let Some(Modal::Settings(s)) = &mut a.modal else {
+            panic!()
+        };
+        s.sel = rows
+            .iter()
+            .position(|r| r.starts_with("Put back every default"))
+            .unwrap();
+        key(&mut a, KeyCode::Enter);
+        assert!(matches!(a.modal, Some(Modal::Confirm(_))));
+        key(&mut a, KeyCode::Char('y'));
+        assert!(a.keys.is_default());
+        assert!(matches!(&a.modal, Some(Modal::Settings(s)) if s.tab == settings::Tab::Shortcuts));
+    }
+
+    #[tokio::test]
+    async fn the_new_key_is_checked_and_waiting_takes_every_key() {
+        use keymap::Cmd;
+        let mut a = app();
+        shortcut_page(&mut a, "Message line", Cmd::Back);
+        key(&mut a, KeyCode::Enter);
+        key_with_modifiers(&mut a, KeyCode::Char('q'), KeyModifiers::ALT);
+        assert!(screen(&mut a).contains("kept for plugins"), "{}", screen(&mut a));
+        key(&mut a, KeyCode::Char('q'));
+        assert!(screen(&mut a).contains("typed as text"), "{}", screen(&mut a));
+        assert!(
+            matches!(shortcut_state(&a), shortcuts::State::Capture { .. }),
+            "still waiting"
+        );
+        // Even Ctrl-c is a candidate, not quitting (Quit has it: asked first).
+        ctrl(&mut a, 'c');
+        assert!(!a.quit);
+        assert!(matches!(shortcut_state(&a), shortcuts::State::Conflict { .. }));
+        key(&mut a, KeyCode::Esc);
+        // And F1 is not help while waiting.
+        key(&mut a, KeyCode::Enter);
+        key(&mut a, KeyCode::F(1));
+        assert!(matches!(shortcut_state(&a), shortcuts::State::Conflict { .. }));
+        key(&mut a, KeyCode::Esc);
+        key(&mut a, KeyCode::Enter);
+        key(&mut a, KeyCode::Esc);
+        assert_eq!(shortcut_state(&a), shortcuts::State::Browse);
+        assert!(a.keys.is_default());
+        // `a` adds a key beside the others; Tab moves to the next screen.
+        key(&mut a, KeyCode::Char('a'));
+        ctrl(&mut a, 'q');
+        let line = keymap::Table::Own(keymap::Ctx::Compose);
+        assert_eq!(keymap::display_keys(a.keys.keys(line, Cmd::Back)), "Esc/Ctrl-q");
+        key(&mut a, KeyCode::Tab);
+        assert!(
+            screen(&mut a).contains("Shortcuts › Text fields"),
+            "{}",
+            screen(&mut a)
+        );
+        // The editor's own help says its keys stay.
+        key(&mut a, KeyCode::Char('?'));
+        assert!(
+            screen(&mut a).contains("These keys cannot be changed"),
+            "{}",
+            screen(&mut a)
+        );
+    }
+
+    #[tokio::test]
+    async fn default_keys_run_ignores_the_saved_shortcuts_but_keeps_them() {
+        use keymap::{Cmd, Ctx, Table};
+        let store = Store::open_in_memory().unwrap();
+        store
+            .set(
+                "setting.keys",
+                r#"{"messages.reply":["ctrl-t"],"messages.bogus":["x"]}"#,
+            )
+            .unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut a = App::new(Client::new(Config::default()).unwrap(), "Ume".into(), tx, store);
+        assert_eq!(a.key_problems.len(), 1, "{:?}", a.key_problems);
+        let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(keymap::resolve(Ctx::Messages, &ctrl_t), Some(Cmd::Reply));
+        a.use_default_keys(true);
+        assert_eq!(keymap::resolve(Ctx::Messages, &ctrl_t), None);
+        let r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
+        assert_eq!(keymap::resolve(Ctx::Messages, &r), Some(Cmd::Reply));
+        // The page shows (and edits) the saved ones, saying when they apply.
+        let rows = a.settings_rows_for_test(settings::Tab::Shortcuts);
+        assert!(rows.iter().any(|r| r.contains("--default-keys")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("messages.bogus")), "{rows:?}");
+        shortcut_page(&mut a, "Messages", Cmd::React);
+        key(&mut a, KeyCode::Enter);
+        ctrl(&mut a, 'e');
+        assert_eq!(
+            keymap::display_keys(a.keys.keys(Table::Own(Ctx::Messages), Cmd::React)),
+            "Ctrl-e"
+        );
+        let ctrl_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(
+            keymap::resolve(Ctx::Messages, &ctrl_e),
+            None,
+            "from the next start"
+        );
+        assert!(a.store.get("setting.keys").unwrap().unwrap().contains("ctrl-e"));
+        assert!(a.key_problems.is_empty(), "the bad entry is not stored any more");
+    }
+
+    #[tokio::test]
+    async fn clicks_and_the_wheel_do_what_they_did_whatever_the_keys() {
+        use keymap::{Cmd, Ctx, Table};
+        let mut a = app();
+        let mut map = keymap::Keymap::default();
+        map.set(Table::Own(Ctx::Menu), Cmd::Confirm, vec![]);
+        map.set(Table::Own(Ctx::Menu), Cmd::Down, vec![]);
+        map.set(
+            Table::Global,
+            Cmd::Settings,
+            vec![keymap::Key::of(&KeyEvent::new(
+                KeyCode::Char('e'),
+                KeyModifiers::CONTROL,
+            ))],
+        );
+        keymap::install(map);
+        ctrl_x(&mut a);
+        let text = screen(&mut a);
+        assert!(text.contains("Ctrl-e") && !text.contains("Ctrl-s"), "{text}");
+        let Some(Modal::Menu(m)) = &a.modal else {
+            panic!("main menu")
+        };
+        let i = m.items.iter().position(|(l, _)| l.contains("Settings")).unwrap();
+        // Enter chooses nothing now, the wheel still moves, a click chooses.
+        key(&mut a, KeyCode::Enter);
+        assert!(matches!(a.modal, Some(Modal::Menu(_))));
+        a.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(&a.modal, Some(Modal::Menu(m)) if m.sel == 1));
+        let y = a.hit.modal_rows.iter().find(|r| r.1 == i).unwrap().0;
+        let x = a.hit.modal.unwrap().x + 2;
+        click(&mut a, x, y);
+        assert!(
+            matches!(a.modal, Some(Modal::Settings(_))),
+            "{:?}",
+            a.key_context()
+        );
+        // The welcome screen and plugin notices name the keys as they are.
+        a.modal = None;
+        assert!(screen(&mut a).contains("Ctrl-x"));
+        assert_eq!(keymap::via_menu("Plugins"), "Ctrl-x › Plugins");
+    }
+
+    #[test]
+    fn shift_tab_switches_focus_as_terminals_send_it() {
+        let mut a = app();
+        a.open_chat("Ua".into());
+        a.focus = Focus::Chats;
+        key_with_modifiers(&mut a, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(a.focus, Focus::Input);
+        key_with_modifiers(&mut a, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(a.focus, Focus::Chats);
+    }
+
+    #[tokio::test]
+    async fn copy_puts_a_text_message_on_the_clipboard_and_nothing_else() {
+        let copied = || clipboard::COPIED.with(|c| c.borrow().clone());
+        let mut a = app();
+        a.open_chat("Ua".into());
+        a.select_msg(Some(1));
+        key(&mut a, KeyCode::Char('c'));
+        assert_eq!(copied(), ["m1"]);
+        assert_eq!(a.status, "copied 2 characters");
+        assert_eq!(a.focus, Focus::Messages, "c is not typed");
+        // The message menu offers it too, with its key.
+        key(&mut a, KeyCode::Char('m'));
+        let Some(Modal::Menu(m)) = &a.modal else {
+            panic!("message menu")
+        };
+        assert!(
+            m.items.iter().any(|(l, _)| l == "📋 Copy text\tc"),
+            "{:?}",
+            m.items
+        );
+        choose(&mut a, "Copy text");
+        assert_eq!(copied(), ["m1", "m1"]);
+        // Nothing to copy from an unsent message (or media, sealed text, …).
+        a.messages.get_mut("Ua").unwrap()[1].unsent = true;
+        a.select_msg(Some(1));
+        key(&mut a, KeyCode::Char('c'));
+        assert!(a.status.contains("only a text message"), "{}", a.status);
+        key(&mut a, KeyCode::Char('m'));
+        let Some(Modal::Menu(m)) = &a.modal else {
+            panic!("message menu")
+        };
+        assert!(!m.items.iter().any(|(l, _)| l.contains("Copy")));
+        assert_eq!(copied().len(), 2);
+        let sealed: Message = serde_json::from_value(serde_json::json!({
+            "id": "9", "contentType": 0, "chunks": ["a", "b", "c", "d", "e"],
+            "contentMetadata": {"e2eeVersion": "2"}
+        }))
+        .unwrap();
+        assert!(sealed.is_e2ee() && !to_ui(&sealed, None).unwrap().copyable());
+        let image: Message =
+            serde_json::from_value(serde_json::json!({"id": "8", "contentType": 1})).unwrap();
+        assert!(!to_ui(&image, None).unwrap().copyable());
+        let text: Message =
+            serde_json::from_value(serde_json::json!({"id": "7", "contentType": 0, "text": "hi"})).unwrap();
+        assert!(to_ui(&text, None).unwrap().copyable());
+        assert!(!to_ui(&text, Some("no key")).unwrap().copyable());
+    }
+
+    #[test]
+    fn old_status_messages_go_with_the_next_key_but_not_by_themselves() {
+        let mut a = app();
+        let aged = |a: &mut App, text: &str, secs: u64| {
+            a.status = text.into();
+            a.status_since = Some((text.into(), Instant::now() - Duration::from_secs(secs)));
+        };
+        // Fresh: kept through keys.
+        a.status = "copied 2 characters".into();
+        a.note_status();
+        key(&mut a, KeyCode::Down);
+        assert_eq!(a.status, "copied 2 characters");
+        // Old: the next key clears it first.
+        aged(&mut a, "copied 2 characters", 9);
+        key(&mut a, KeyCode::Down);
+        assert_eq!(a.status, "");
+        // Failures stay longer.
+        aged(&mut a, "send failed: timeout", 9);
+        key(&mut a, KeyCode::Down);
+        assert_eq!(a.status, "send failed: timeout");
+        aged(&mut a, "send failed: timeout", 31);
+        key(&mut a, KeyCode::Down);
+        assert_eq!(a.status, "");
+        // A key that says the same thing again says it afresh.
+        a.list.select(Some(0));
+        aged(&mut a, "no other unread chat", 9);
+        key(&mut a, KeyCode::Char('u'));
+        assert_eq!(a.status, "no other unread chat");
+        // Clicks and the wheel count; the pointer merely moving does not.
+        aged(&mut a, "saved", 9);
+        let moved = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        a.on_mouse(moved);
+        assert_eq!(a.status, "saved");
+        a.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            ..moved
+        });
+        assert_eq!(a.status, "");
+    }
+
+    #[tokio::test]
+    async fn long_lists_page_by_what_the_screen_shows() {
+        let mut a = app();
+        a.modal = Some(Modal::Pick(modal::Pick {
+            title: String::new(),
+            kind: modal::PickKind::ShareContact,
+            options: (0..100)
+                .map(|i| (format!("U{i}"), format!("Friend {i:02}")))
+                .collect(),
+            chosen: vec![],
+            filter: TextInput::default(),
+            sel: 0,
+            single: false,
+        }));
+        screen(&mut a);
+        let shown = a.hit.modal_rows.len();
+        assert!(shown > 3, "{shown}");
+        let sel = |a: &App| match &a.modal {
+            Some(Modal::Pick(p)) => p.sel,
+            _ => panic!("picker"),
+        };
+        key(&mut a, KeyCode::PageDown);
+        assert_eq!(sel(&a), shown);
+        key(&mut a, KeyCode::PageUp);
+        assert_eq!(sel(&a), 0);
+        // Settings › Shortcuts lists more screens than fit.
+        a.open_settings_at(settings::Tab::Shortcuts);
+        screen(&mut a);
+        let Some(Modal::Settings(s)) = &a.modal else {
+            panic!()
+        };
+        let first = s.sel;
+        key(&mut a, KeyCode::PageDown);
+        let Some(Modal::Settings(s)) = &a.modal else {
+            panic!()
+        };
+        assert!(s.sel > first + 3, "{} after {first}", s.sel);
+        key(&mut a, KeyCode::PageUp);
+        let Some(Modal::Settings(s)) = &a.modal else {
+            panic!()
+        };
+        assert_eq!(s.sel, first);
+    }
+
+    #[tokio::test]
+    async fn shortcuts_are_also_kept_in_a_file_that_wins_at_start() {
+        use keymap::{Cmd, Ctx, Table};
+        let dir = std::env::temp_dir().join(format!("rune-keys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("rune").join("keys.json");
+        let reply = |a: &App| keymap::display_keys(a.keys.keys(Table::Own(Ctx::Messages), Cmd::Reply));
+        // A change made before there was a file goes into it.
+        let mut a = app();
+        shortcut_page(&mut a, "Messages", Cmd::Reply);
+        key(&mut a, KeyCode::Enter);
+        ctrl(&mut a, 't');
+        a.use_keys_file(file.clone());
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            text.contains("\"_about\"") && text.contains("\"ctrl-t\""),
+            "{text}"
+        );
+        // Every change is written to it.
+        shortcut_page(&mut a, "Messages", Cmd::React);
+        key(&mut a, KeyCode::Enter);
+        ctrl(&mut a, 'e');
+        assert!(std::fs::read_to_string(&file).unwrap().contains("messages.react"));
+        // Edited by hand, then read again from Settings › Shortcuts.
+        std::fs::write(&file, r#"{"messages.reply": ["ctrl-y"], "messages.nope": ["z"]}"#).unwrap();
+        a.modal = None;
+        a.open_settings_at(settings::Tab::Shortcuts);
+        let rows = a.settings_rows_for_test(settings::Tab::Shortcuts);
+        assert!(
+            rows.iter().any(|r| r.contains("rune/keys.json: edit it")),
+            "{rows:?}"
+        );
+        let Some(Modal::Settings(s)) = &mut a.modal else {
+            panic!()
+        };
+        s.sel = rows.iter().position(|r| r == "Read keys.json again").unwrap();
+        key(&mut a, KeyCode::Enter);
+        assert!(a.status.contains("1 changed shortcut"), "{}", a.status);
+        assert_eq!(reply(&a), "Ctrl-y");
+        assert!(a.keys.keys(Table::Own(Ctx::Messages), Cmd::React) == [keymap::parse_key("e").unwrap()]);
+        assert!(
+            a.settings_rows_for_test(settings::Tab::Shortcuts)
+                .iter()
+                .any(|r| r.contains("messages.nope"))
+        );
+        let ctrl_y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL);
+        assert_eq!(keymap::resolve(Ctx::Messages, &ctrl_y), Some(Cmd::Reply));
+
+        // At the next start the file wins over the store.
+        let store = a.store.clone();
+        store
+            .set("setting.keys", r#"{"messages.reply":["ctrl-q"]}"#)
+            .unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut b = App::new(
+            Client::new(Config::default()).unwrap(),
+            "Ume".into(),
+            tx,
+            store.clone(),
+        );
+        assert_eq!(reply(&b), "Ctrl-q");
+        b.use_keys_file(file.clone());
+        assert_eq!(reply(&b), "Ctrl-y");
+        assert!(
+            store.get("setting.keys").unwrap().unwrap().contains("ctrl-y"),
+            "the store follows"
+        );
+
+        // A file half-way through an edit is neither used nor overwritten.
+        std::fs::write(&file, "{ \"messages.reply\": [").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut c = App::new(
+            Client::new(Config::default()).unwrap(),
+            "Ume".into(),
+            tx,
+            store.clone(),
+        );
+        c.use_keys_file(file.clone());
+        assert_eq!(reply(&c), "Ctrl-y", "the stored ones are used");
+        assert!(
+            c.key_problems.iter().any(|p| p.contains("unreadable")),
+            "{:?}",
+            c.key_problems
+        );
+        shortcut_page(&mut c, "Messages", Cmd::Reply);
+        key(&mut c, KeyCode::Delete);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "{ \"messages.reply\": [");
+        assert!(
+            c.key_problems.iter().any(|p| p.contains("unreadable")),
+            "still said"
+        );
+
+        // A symlinked file (dotfile managers) is written where it points.
+        #[cfg(unix)]
+        {
+            let real = dir.join("dotfiles-keys.json");
+            std::fs::write(&real, "{}").unwrap();
+            let link = dir.join("linked").join("keys.json");
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let mut d = app();
+            d.use_keys_file(link.clone());
+            shortcut_page(&mut d, "Messages", Cmd::Reply);
+            key(&mut d, KeyCode::Enter);
+            ctrl(&mut d, 't');
+            assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+            assert!(std::fs::read_to_string(&real).unwrap().contains("ctrl-t"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The next search result the app posts (other events are dropped).
+    async fn found(rx: &mut mpsc::UnboundedReceiver<AppEvent>) -> Box<find::Found> {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
+                Ok(Some(AppEvent::Found(f))) => return f,
+                Ok(Some(_)) => continue,
+                other => panic!("no search result: {}", other.is_ok()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn search_in_a_chat_lists_stored_matches_and_shows_the_chosen_one() {
+        let store = Store::open_in_memory().unwrap();
+        let text = |i: i64| match i {
+            150 => "the Secret word",
+            390 => "secret again",
+            _ => "chatter",
+        };
+        let msgs: Vec<Message> = (1..=400)
+            .map(|i| {
+                serde_json::from_value(serde_json::json!({
+                    "id": i.to_string(), "from": if i % 2 == 0 { "Ume" } else { "Ua" }, "to": "Ua",
+                    "toType": 0, "contentType": 0, "text": text(i),
+                    "createdTime": (1_000_000 + i * 1000).to_string()
+                }))
+                .unwrap()
+            })
+            .collect();
+        store.put_messages("Ua", &msgs, None).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut a = App::new(Client::new(Config::default()).unwrap(), "Ume".into(), tx, store);
+        a.names.insert("Ua".into(), "Alice".into());
+        a.open_chat("Ua".into());
+        assert!(
+            !a.open_messages().iter().any(|m| m.id == "150"),
+            "older than what is loaded"
+        );
+        a.select_msg(Some(a.open_messages().len() - 1));
+        key(&mut a, KeyCode::Char('/'));
+        assert_eq!(a.key_context(), keymap::Ctx::Find);
+        assert!(screen(&mut a).contains("type to search"), "{}", screen(&mut a));
+        type_text(&mut a, "SECRET");
+        // Every change searched; only the answer to the last one is shown.
+        while matches!(&a.modal, Some(Modal::Find(f)) if f.busy) {
+            let f = found(&mut rx).await;
+            a.on_event(AppEvent::Found(f));
+        }
+        let Some(Modal::Find(f)) = &a.modal else {
+            panic!("search")
+        };
+        assert_eq!(f.searched.as_deref(), Some("SECRET"));
+        assert_eq!(
+            f.hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            ["390", "150"]
+        );
+        let text = screen(&mut a);
+        assert!(
+            text.contains("2 matches") && text.contains("Secret word"),
+            "{text}"
+        );
+        // A stale result does not replace it.
+        a.on_found(find::Found {
+            chat: "Ua".into(),
+            seq: 1,
+            query: "S".into(),
+            hits: Ok(vec![]),
+        });
+        assert!(matches!(&a.modal, Some(Modal::Find(f)) if f.hits.len() == 2));
+        key(&mut a, KeyCode::Down);
+        key(&mut a, KeyCode::Enter);
+        assert!(a.modal.is_none());
+        assert_eq!(a.selected_msg().map(|m| m.id.as_str()), Some("150"));
+        assert_eq!(a.focus, Focus::Messages);
+        // History stays contiguous: everything from 150 to the newest is loaded.
+        let ids: Vec<i64> = a.open_messages().iter().map(|m| m.id.parse().unwrap()).collect();
+        assert!(ids.windows(2).all(|w| w[1] == w[0] + 1), "{ids:?}");
+        // The query comes back for this chat, from the chat menu too.
+        a.run_action(Action::FindInChat("Ua".into()));
+        let Some(Modal::Find(f)) = &a.modal else {
+            panic!("search")
+        };
+        assert_eq!(f.query.as_str(), "SECRET");
+        while matches!(&a.modal, Some(Modal::Find(f)) if f.busy) {
+            let f = found(&mut rx).await;
+            a.on_event(AppEvent::Found(f));
+        }
+        assert!(matches!(&a.modal, Some(Modal::Find(f)) if f.hits.len() == 2));
+        // Esc closes; the chat menu lists it.
+        key(&mut a, KeyCode::Esc);
+        assert!(a.modal.is_none());
+        a.chat_menu("Ua");
+        let Some(Modal::Menu(m)) = &a.modal else {
+            panic!("chat menu")
+        };
+        assert!(m.items.iter().any(|(l, _)| l.contains("Search in chat")));
     }
 }

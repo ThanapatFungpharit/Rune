@@ -145,12 +145,22 @@ impl App {
     /// Select a message of `chat` (loading older stored history if needed)
     /// and show its media in the viewer.
     pub fn view_message(&mut self, chat: &str, id: &str) {
+        if self.show_message(chat, id) {
+            self.open_viewer();
+        } else {
+            self.status = "that photo's message is not in the loaded history".into();
+        }
+    }
+
+    /// Open `chat` with message `id` selected, loading the stored stretch
+    /// from it to the loaded history first if need be (which keeps the
+    /// history contiguous without reading all of it). False if `id` is not
+    /// stored in `chat`.
+    pub fn show_message(&mut self, chat: &str, id: &str) -> bool {
         if self.open.as_deref() != Some(chat) {
             self.open_chat(chat.to_owned());
         }
         if !self.open_messages().iter().any(|m| m.id == id) {
-            // Only the stretch from that message to the loaded history, which
-            // keeps the history contiguous without reading all of it.
             let oldest = self
                 .open_messages()
                 .iter()
@@ -170,9 +180,9 @@ impl App {
         match self.open_messages().iter().position(|m| m.id == id) {
             Some(i) => {
                 self.select_msg(Some(i));
-                self.open_viewer();
+                true
             }
-            None => self.status = "that photo's message is not in the loaded history".into(),
+            None => false,
         }
     }
 }

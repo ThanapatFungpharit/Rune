@@ -746,7 +746,8 @@ impl Plugins {
             Err(LoadFailure::Changed) => {
                 e.state = State::NeedsApproval("its module changed on disk since you approved it".into());
                 return vec![Effect::Status(format!(
-                    "plugin {name} changed: approve it again in Settings › Plugins (Ctrl-x › Plugins)"
+                    "plugin {name} changed: approve it again in Settings › Plugins ({})",
+                    crate::keymap::via_menu("Plugins")
                 ))];
             }
             Err(LoadFailure::Error(why)) => {
@@ -1092,9 +1093,10 @@ impl Plugins {
             let e = &self.entries[i];
             let msg = match &e.state {
                 State::Disabled => format!(
-                    "found plugin {} {}: enable it in Settings › Plugins (Ctrl-x › Plugins)",
+                    "found plugin {} {}: enable it in Settings › Plugins ({})",
                     e.name(),
-                    e.manifest.as_ref().map_or("", |m| m.version.as_str())
+                    e.manifest.as_ref().map_or("", |m| m.version.as_str()),
+                    crate::keymap::via_menu("Plugins")
                 ),
                 State::Loading => format!("starting {}…", e.name()),
                 s => format!("plugin folder {id}: {}", s.detail().unwrap_or(s.label())),
@@ -1140,8 +1142,9 @@ impl Plugins {
                 e.name()
             ),
             State::Disabled if was == State::Missing => format!(
-                "found plugin {} again: enable it in Settings › Plugins (Ctrl-x › Plugins)",
-                e.name()
+                "found plugin {} again: enable it in Settings › Plugins ({})",
+                e.name(),
+                crate::keymap::via_menu("Plugins")
             ),
             State::Disabled => format!("plugin {} changed on disk (it is off)", e.name()),
             State::Paused => return (Vec::new(), job),
@@ -1407,9 +1410,10 @@ impl Plugins {
                 .is_some_and(|m| m.commands.iter().any(|c| c.name == name))
         })?;
         Some(vec![Effect::Status(format!(
-            "/{name} comes from the plugin {}, which is {} (see Ctrl-x › Plugins)",
+            "/{name} comes from the plugin {}, which is {} (see {})",
             idle.name(),
-            idle.state.label()
+            idle.state.label(),
+            crate::keymap::via_menu("Plugins")
         ))])
     }
 
