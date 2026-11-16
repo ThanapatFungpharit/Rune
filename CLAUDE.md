@@ -23,6 +23,7 @@ cargo test --lib media::                       # unit tests of one module
 cargo test --features tui plugins::            # plugin host: discovery, lifecycle, sandbox failures
 (cd plugin-sdk && cargo test)                  # plugin API crate (not built by the commands above)
 (cd plugins/snippets && cargo test)            # the sample plugin's logic, natively
+(cd vendor/crossterm && cargo test --lib --features event-stream --target-dir ../../target/vendor modify_other_keys)  # rune's crossterm patch
 scripts/plugin.sh build plugins/snippets       # rebuild snippets.wasm (host tests use it; needs wasm32-unknown-unknown)
 make install [PREFIX=~/.local] [DESTDIR=]      # rune-tui + man page + desktop entry + icon (packaging/); make uninstall
 ```

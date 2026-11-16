@@ -61,3 +61,10 @@ tui = ["store", "dep:rqrr", "dep:ratatui", "dep:crossterm", "dep:chrono", "dep:u
 name = "rune-tui"
 path = "src/bin/rune-tui/main.rs"
 required-features = ["tui"]
+
+# crossterm 0.29.0 with one parser patch: xterm modifyOtherKeys key codes
+# (`ESC [ 27 ; mods ; key ~`), which rune-tui turns on where the kitty
+# keyboard protocol is missing so Shift-Enter can start a new line.
+# See vendor/crossterm/RUNE-PATCH.md.
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm" }
