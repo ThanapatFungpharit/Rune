@@ -423,7 +423,9 @@ Downloads stays.
 Opening a chat marks it as read (others see the read receipt) unless you
 pass `--no-read-receipts` or turn read receipts off (`Ctrl-r` anywhere, or in
 the settings or the main menu; a yellow *receipts off* badge sits on the chat list and the message line while they
-are).
+are). With them off a chat also stays unread here — its count, bold name and
+*Unread Messages* divider remain, as they do on your phone — until it is read
+with receipts on or on another device.
 Messages that arrive in the open chat while the terminal is in the
 background are marked read when you return to it (in terminals that report
 focus changes; others count as always focused).

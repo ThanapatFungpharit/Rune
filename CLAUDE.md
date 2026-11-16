@@ -178,7 +178,7 @@ through `App::note_read` into `receipts::Receipts` (pure state, mirrored in the 
 per chat in flight, retried via `Job::Receipt` until acknowledged) and a `held` one (read with them
 off; approved only once receipts are on *and* the user is in that chat). Positions clear only on an
 acknowledgement (our request, or op 40 from any device); tickets make results of requests cancelled
-by turning receipts off harmless; `--no-read-receipts` counts as off (reads are held, never sent that run). Names and pictures from any source go through
+by turning receipts off harmless; `--no-read-receipts` counts as off (reads are held, never sent that run); with receipts off nothing clears a chat's unread count or `last_seen` — `App::mark_seen`, gated opens/sends/server merges — only op 40 or reading with them on does). Names and pictures from any source go through
 `App::learn_names`/`learn_pictures`, which update the chat list, avatars, profile
 pages and the store together. Every drawn avatar (`App::avatar_ready`) and unnamed mid
 queues one `resolve_names` lookup per run (`App::looked_up`), so stored names and

@@ -2820,9 +2820,32 @@ impl App {
             return;
         }
         match self.open.clone() {
-            Some(open) if self.focused => self.note_read(&open, None),
+            Some(open) if self.focused => {
+                self.mark_seen(&open);
+                self.note_read(&open, None);
+            }
             _ => self.flush_receipts(),
         }
+    }
+
+    /// Clear `chat`'s unread count and divider position up to its newest
+    /// message — only with read receipts on. With them off a chat stays
+    /// unread, here as on the server, until it is read with them on or on
+    /// another device (op 40, [`OpEvent::ChatChecked`]).
+    fn mark_seen(&mut self, chat: &str) {
+        if !self.read_receipts() {
+            return;
+        }
+        let Some(c) = self.chats.iter_mut().find(|c| c.mid == chat) else {
+            return;
+        };
+        if c.unread == 0 && c.last_seen == c.last_id {
+            return;
+        }
+        c.unread = 0;
+        c.last_seen = c.last_id.clone();
+        self.persist_chat(chat);
+        self.sort_chats(self.selected_mid());
     }
 
     /// The user read `chat` (they are in it) up to `id`, or saw nothing new
@@ -2916,9 +2939,7 @@ impl App {
         let last = c.last_id.clone();
         let new = last.is_some() && c.last_seen != last;
         if new && on {
-            c.last_seen = last.clone();
-            c.unread = 0;
-            self.persist_chat(&open);
+            self.mark_seen(&open);
         }
         self.note_read(&open, if new { last.as_deref() } else { None });
     }
@@ -3009,6 +3030,7 @@ impl App {
         }
         let mut mark = None;
         let mut has_unread = false;
+        let on = self.read_receipts();
         if let Some(c) = self.chats.iter_mut().find(|c| c.mid == mid) {
             has_unread = c.unread > 0 || c.last_seen != c.last_id;
             if has_unread {
@@ -3023,8 +3045,11 @@ impl App {
             } else if self.open.as_deref() != Some(mid.as_str()) {
                 self.unread_divider = None;
             }
-            c.unread = 0;
-            c.last_seen = c.last_id.clone();
+            // With receipts off the chat stays unread, as it does on the server.
+            if on {
+                c.unread = 0;
+                c.last_seen = c.last_id.clone();
+            }
         } else if self.open.as_deref() != Some(mid.as_str()) {
             self.unread_divider = None;
         }
@@ -3053,7 +3078,7 @@ impl App {
         }
         self.note_read(&mid, mark.as_deref());
         self.persist_chat(&mid);
-        if has_unread {
+        if has_unread && on {
             // A pinned chat that floated while unread returns to its pin position.
             self.sort_chats(self.selected_mid());
         }
@@ -3594,7 +3619,11 @@ impl App {
                         *n += 1;
                     }
                     if mine {
-                        if let Some(c) = self.chats.iter_mut().find(|c| c.mid == chat) {
+                        // With receipts off, only when it hides nothing unread.
+                        let on = self.read_receipts();
+                        if let Some(c) = self.chats.iter_mut().find(|c| c.mid == chat)
+                            && (on || c.unread == 0)
+                        {
                             c.unread = 0;
                             c.last_seen = Some(m.id.clone());
                         }
@@ -4015,6 +4044,8 @@ impl App {
             }
         }
         let selected = self.selected_mid();
+        // The open chat counts too while receipts are off: nothing there is marked read.
+        let counted = unread && (self.open.as_deref() != Some(chat) || !self.read_receipts());
         match self.chats.iter_mut().find(|c| c.mid == chat) {
             Some(c) => {
                 if time >= c.last_time {
@@ -4022,7 +4053,7 @@ impl App {
                     c.last_time = time;
                     c.last_id = id.or(c.last_id.take());
                 }
-                if unread && self.open.as_deref() != Some(chat) {
+                if counted {
                     c.unread += 1;
                 }
             }
@@ -4031,7 +4062,7 @@ impl App {
                     mid: chat.to_owned(),
                     preview,
                     last_time: time,
-                    unread: u32::from(unread && self.open.as_deref() != Some(chat)),
+                    unread: u32::from(counted),
                     last_id: id,
                     ..Default::default()
                 });
@@ -4495,7 +4526,11 @@ impl App {
                     self.saved(self.store.put_message(&chat, &m, None));
                 }
                 self.push_message(&chat, *msg, false);
-                if let Some(c) = self.chats.iter_mut().find(|c| c.mid == chat) {
+                // With receipts off, only when it hides nothing unread.
+                let on = self.read_receipts();
+                if let Some(c) = self.chats.iter_mut().find(|c| c.mid == chat)
+                    && (on || c.unread == 0)
+                {
                     c.unread = 0;
                     c.last_seen = c.last_id.clone();
                 }
@@ -4797,7 +4832,7 @@ impl App {
             } else {
                 self.stale.remove(&s.mid);
             }
-            if self.open.as_deref() == Some(s.mid.as_str()) {
+            if self.read_receipts() && self.open.as_deref() == Some(s.mid.as_str()) {
                 s.unread = 0;
             }
             match self.chats.iter_mut().find(|c| c.mid == s.mid) {
@@ -8416,6 +8451,47 @@ mod tests {
         assert!(a.prefs.read_receipts && !a.read_receipts());
     }
 
+    #[tokio::test]
+    async fn with_receipts_off_nothing_clears_unread() {
+        let mut a = receipts_app(false);
+        let chat = |a: &App| {
+            let c = a.chats.iter().find(|c| c.mid == "Ua").unwrap();
+            (c.unread, c.last_seen.clone())
+        };
+        let still = (2, Some("1".to_owned()));
+        a.open_chat("Ua".into());
+        assert_eq!(chat(&a), still, "opening does not read it");
+        assert!(
+            a.unread_divider.is_some(),
+            "the divider still shows where unread starts"
+        );
+        a.on_focus(false);
+        a.on_focus(true);
+        assert_eq!(chat(&a), still, "nor does coming back to it");
+        // A message arriving in the open chat counts as unread too.
+        a.on_operation(op(serde_json::json!({
+            "revision": 1, "type": 26, "message": sent("4", "Ua", "Ume", "more")
+        })));
+        assert_eq!(chat(&a).0, 3);
+        // Neither our own reply nor the server's chat list clears it.
+        a.on_operation(op(serde_json::json!({
+            "revision": 2, "type": 25, "message": sent("5", "Ume", "Ua", "reply")
+        })));
+        a.on_event(AppEvent::Chats(vec![ChatEntry {
+            mid: "Ua".into(),
+            last_id: Some("5".into()),
+            unread: 3,
+            last_seen: Some("1".into()),
+            ..Default::default()
+        }]));
+        assert_eq!(chat(&a), (3, Some("1".to_owned())));
+        assert_eq!(a.store.chat("Ua").unwrap().unwrap().unread, 3, "nor in the store");
+        assert!(take_sent(&mut a).is_empty(), "nothing marked read");
+        // Turned on while in the chat: read now.
+        toggle_receipts(&mut a);
+        assert_eq!(chat(&a), (0, Some("5".to_owned())));
+    }
+
     /// `unread_app` with read receipts allowed for this run and set to `on`;
     /// `Ua` (messages 1–3, read up to 1) is not open yet.
     fn receipts_app(on: bool) -> App {
@@ -9316,6 +9392,8 @@ mod tests {
     #[tokio::test]
     async fn unread_pinned_chats_float_to_the_top_until_read() {
         let mut a = app();
+        a.no_read_receipts_flag = false;
+        a.prefs.read_receipts = true;
         // Opening a chat fetches history: LINE is a closed local port.
         a.client = Client::new(Config {
             gateway: "http://127.0.0.1:9".into(),
@@ -10053,8 +10131,8 @@ mod tests {
         assert!(a.loading.is_empty(), "no server request for a fresh chat");
         assert_eq!(
             store.chat("Cg").unwrap().unwrap().unread,
-            0,
-            "read state persisted"
+            2,
+            "read receipts off: still unread"
         );
 
         // The server's list says there is a newer message we do not have.
@@ -10069,7 +10147,7 @@ mod tests {
         assert!(a.stale.contains("Cg"));
         assert!(a.loading.contains("Cg"), "the open stale chat is refetched");
         assert!(a.chats[0].muted, "mute survives the merge");
-        assert_eq!(a.chats[0].unread, 0, "the open chat stays read");
+        assert_eq!(a.chats[0].unread, 1, "receipts off: the server's count stands");
     }
 
     #[tokio::test]
