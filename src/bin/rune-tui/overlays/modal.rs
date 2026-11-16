@@ -281,17 +281,7 @@ impl Pick {
     }
 }
 
-/// A centred box of at most `w`×`h` inside `area`.
-pub fn popup(area: Rect, w: u16, h: u16) -> Rect {
-    let w = w.min(area.width.saturating_sub(2)).max(10.min(area.width));
-    let h = h.min(area.height.saturating_sub(2)).max(3.min(area.height));
-    Rect::new(
-        area.x + (area.width - w) / 2,
-        area.y + (area.height - h) / 2,
-        w,
-        h,
-    )
-}
+pub use crate::layout::popup;
 
 /// Parse "13.75, 100.50" (as copied from a map) into a coordinate pair.
 pub fn parse_lat_lon(s: &str) -> Option<(f64, f64)> {

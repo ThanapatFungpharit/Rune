@@ -510,8 +510,12 @@ impl App {
             .title_bottom(frame_hint(&hint, r));
         let inner = block.inner(r);
         f.render_widget(block, r);
-        let [list_area, preview_area] =
-            Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(inner);
+        // Side by side when wide enough, else the preview (and send dialog) under the list.
+        let [list_area, preview_area] = if inner.width < crate::layout::SIDE_BY_SIDE_MIN_W {
+            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(inner)
+        } else {
+            Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(inner)
+        };
         let [path_row, filter_row, rows] =
             Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)])
                 .areas(list_area);

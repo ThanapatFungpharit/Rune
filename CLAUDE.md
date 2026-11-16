@@ -234,7 +234,7 @@ key always kept — `main::status_line`, `frame_hint` for overlay frames), and
 the keymap tests pin one meaning per key and no redundant alternatives. `keymap::COMMANDS`
 lists the message line's `/` commands for its help screen — keep it in step with `App::submit`.
 `Ctrl-x` (main menu) is hinted first in every main view.
-`input.rs` is the cursor-editing field (multi-line on the message line: word-wrapped
+Geometry lives in `layout.rs` (`panes` — one pane at a time below `SPLIT_MIN_W`, the focused one —, `popup`/`sheet` for every overlay box with shared margins, `bubble_width`, the too-small guard); never size a view by hand-picked percentages. `input.rs` is the cursor-editing field (multi-line on the message line: word-wrapped
 rows, `↑`/`↓` between them; Shift/Alt-Enter or Ctrl-j insert a line break); every text field (message line, forms,
 chat search, people picker, file filter) edits through `TextInput::edit` with the
 shared `TEXT_EDIT` keys (the file browser switches to `Ctx::AttachFilter` while a

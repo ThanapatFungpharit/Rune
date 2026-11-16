@@ -118,6 +118,7 @@ mod clipboard;
 mod graphics;
 mod input;
 mod keymap;
+mod layout;
 mod links;
 mod notice;
 mod overlays;
@@ -754,6 +755,26 @@ struct HitAreas {
     modal_rows: Vec<(u16, usize)>,
     /// A confirmation's buttons: area and whether it is the "yes" one.
     confirm_buttons: Vec<(Rect, bool)>,
+}
+
+impl HitAreas {
+    /// Forget the chat list's areas (it is not drawn).
+    fn clear_list(&mut self) {
+        self.chats = Rect::default();
+        self.unread_above = None;
+        self.unread_below = None;
+    }
+
+    /// Forget the conversation's and the message line's areas (not drawn).
+    fn clear_chat(&mut self) {
+        self.conv = Rect::default();
+        self.conv_title = Rect::default();
+        self.input = Rect::default();
+        self.msgs.clear();
+        self.heads.clear();
+        self.links.clear();
+        self.reactions.clear();
+    }
 }
 
 /// One row of the conversation pane.
@@ -5962,17 +5983,37 @@ impl App {
     /// an overlay is open (see [`picture::compose`]).
     fn draw_layers(&mut self, f: &mut Frame) {
         picture::layer(Layer::Base);
+        if layout::too_small(f.area()) {
+            self.hit = HitAreas::default();
+            let msg = format!("Window too small — at least {}×{}", layout::MIN_W, layout::MIN_H);
+            f.render_widget(
+                Paragraph::new(msg)
+                    .style(theme::muted())
+                    .wrap(ratatui::widgets::Wrap { trim: true }),
+                f.area(),
+            );
+            return;
+        }
         let [main, status] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(f.area());
-        // The chat list gives up some width on narrow terminals so messages keep room.
-        let list_w = (main.width * 2 / 5).clamp(CHAT_LIST_MIN_W, CHAT_LIST_W);
-        let [left, right] = Layout::horizontal([Constraint::Length(list_w), Constraint::Min(20)]).areas(main);
-        self.draw_chats(f, left);
-        let rows = self.input.rows(right.width.saturating_sub(2) as usize).len();
-        let max_rows = (right.height / 3).clamp(1, INPUT_MAX_ROWS);
-        let input_h = (rows as u16).clamp(1, max_rows) + 2;
-        let [conv, input] = Layout::vertical([Constraint::Min(3), Constraint::Length(input_h)]).areas(right);
-        self.draw_conversation(f, conv);
-        self.draw_input(f, input);
+        // Side by side when there is room, else the pane that has the keys.
+        let chat_first = self.open.is_some() && self.focus != Focus::Chats;
+        let panes = layout::panes(main, chat_first);
+        match panes.list {
+            Some(left) => self.draw_chats(f, left),
+            None => self.hit.clear_list(),
+        }
+        match panes.chat {
+            Some(right) => {
+                let rows = self.input.rows(right.width.saturating_sub(2) as usize).len();
+                let max_rows = (right.height / 3).clamp(1, INPUT_MAX_ROWS);
+                let input_h = (rows as u16).clamp(1, max_rows) + 2;
+                let [conv, input] =
+                    Layout::vertical([Constraint::Min(3), Constraint::Length(input_h)]).areas(right);
+                self.draw_conversation(f, conv);
+                self.draw_input(f, input);
+            }
+            None => self.hit.clear_chat(),
+        }
         // Overlays show their own keys on their frame; the status line then
         // only says how to get help, so nothing is listed twice.
         let overlay = self.overlay_open();
@@ -6017,12 +6058,7 @@ impl App {
 
     fn draw_viewer(&mut self, f: &mut Frame, area: Rect) {
         let Some(id) = self.viewer.clone() else { return };
-        let [area] = Layout::horizontal([Constraint::Percentage(94)])
-            .flex(Flex::Center)
-            .areas(area);
-        let [area] = Layout::vertical([Constraint::Percentage(94)])
-            .flex(Flex::Center)
-            .areas(area);
+        let area = layout::sheet(area, u16::MAX);
         picture::cover(f, area);
         self.hit.viewer = Some(area);
         // Links behind the viewer are covered now.
@@ -6655,10 +6691,7 @@ impl App {
             }
             heads.push((rows.len(), m.from.clone()));
             rows.push(Row::Text(place(Line::from(head))));
-            let quote_w = (width * 3 / 4)
-                .max(24)
-                .min(width.saturating_sub(1))
-                .saturating_sub(4);
+            let quote_w = layout::bubble_width(width).saturating_sub(4);
             let quote = match &m.reply_to {
                 Some(id) => Some(format!(
                     "↩ {}",
@@ -6693,8 +6726,7 @@ impl App {
                 body_style = body_style.bg(theme::t().surface_hi);
                 border = Style::new().fg(theme::t().text).bold();
             }
-            // Bubbles take at most three quarters of the pane (but stay readable when narrow).
-            let bubble_w = (width * 3 / 4).max(24).min(width.saturating_sub(1));
+            let bubble_w = layout::bubble_width(width);
             let mut thumb = None;
             if m.is_visual() && (self.prefs.auto_pictures || self.thumbs.contains_key(&m.id)) {
                 match self.thumbs.get(&m.id) {
@@ -7222,10 +7254,6 @@ fn spawn_signal_watch(tx: mpsc::UnboundedSender<AppEvent>) {
     #[cfg(not(unix))]
     drop(tx);
 }
-
-/// Columns of the chat list (narrower on small terminals, down to the minimum).
-const CHAT_LIST_W: u16 = 38;
-const CHAT_LIST_MIN_W: u16 = 26;
 
 /// Events read in one go, at most (a long paste takes several reads).
 const MAX_BATCH: usize = 4096;
@@ -7760,7 +7788,7 @@ mod tests {
         assert_eq!(a.store.user("Ua").unwrap().unwrap().name, "Alice");
     }
 
-    fn app() -> App {
+    pub(super) fn app() -> App {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut a = App::new(
             Client::new(Config::default()).unwrap(),
@@ -12684,5 +12712,62 @@ mod tests {
             panic!("chat menu")
         };
         assert!(m.items.iter().any(|(l, _)| l.contains("Search in chat")));
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    fn draw_at(a: &mut App, w: u16, h: u16) -> String {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| a.draw(f)).unwrap();
+        term.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn every_window_size_draws() {
+        let mut a = tests::app();
+        a.open_chat("Ua".into());
+        for focus in [Focus::Chats, Focus::Input] {
+            a.focus = focus;
+            for w in [1, 10, 19, 20, 40, 63, 64, 80, 109, 110, 200] {
+                for h in [1, 5, 6, 10, 30, 60] {
+                    draw_at(&mut a, w, h);
+                    // Hit areas never point outside the window.
+                    for r in [a.hit.chats, a.hit.conv, a.hit.input] {
+                        assert!(r.right() <= w && r.bottom() <= h, "{w}×{h}: {r:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn narrow_windows_show_the_focused_pane() {
+        let mut a = tests::app();
+        a.open_chat("Ua".into());
+        a.focus = Focus::Input;
+        draw_at(&mut a, 50, 20);
+        assert_eq!(a.hit.chats, Rect::default());
+        assert!(a.hit.conv.width > 40, "conversation takes the width");
+        a.focus = Focus::Chats;
+        draw_at(&mut a, 50, 20);
+        assert_eq!(a.hit.conv, Rect::default());
+        assert!(a.hit.chats.width > 40);
+        // Wide enough: both.
+        draw_at(&mut a, 100, 20);
+        assert!(a.hit.chats.width > 0 && a.hit.conv.width > 0);
+    }
+
+    #[tokio::test]
+    async fn tiny_windows_say_so() {
+        let mut a = tests::app();
+        assert!(draw_at(&mut a, 19, 10).contains("small"));
     }
 }

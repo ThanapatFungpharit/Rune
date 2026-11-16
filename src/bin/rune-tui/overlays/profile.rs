@@ -638,13 +638,7 @@ impl App {
         let Some(mid) = self.profile.last().cloned() else {
             return;
         };
-        let w = (area.width * 94 / 100).min(76);
-        let [area] = Layout::horizontal([Constraint::Length(w)])
-            .flex(Flex::Center)
-            .areas(area);
-        let [area] = Layout::vertical([Constraint::Percentage(94)])
-            .flex(Flex::Center)
-            .areas(area);
+        let area = crate::layout::sheet(area, 76);
         crate::picture::cover(f, area);
         self.hit.profile = Some(area);
         let kind = if mid == self.me {
