@@ -29,7 +29,7 @@ make install [PREFIX=~/.local] [DESTDIR=]      # rune-tui + man page + desktop e
 
 `packaging/rune-tui.1` is the man page: a test (`cli::tests::man_page_lists_every_option`) fails when
 an option in `cli::USAGE` is missing from it. The default session is `cli::session_path`:
-`$XDG_DATA_HOME/rune/session.json` (dir created 0700), falling back to `./session.json` while only that exists.
+`$XDG_DATA_HOME/rune/session.json` (the dir is created 0700 at every start, before the `ltsm.wasm` check), falling back to `./session.json` while only that exists.
 
 Opt-in (`#[ignore]`) tests need a real logged-in `session.json` (never committed)
 because `ltsm.wasm` rejects made-up mids — real-format mids are MAC-protected:

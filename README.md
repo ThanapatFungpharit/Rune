@@ -135,7 +135,7 @@ or `make uninstall`:
 | `~/.cache/rune/view/`                  | media you opened (pruned at start)                      |
 
 (`$XDG_DATA_HOME`, `$XDG_CONFIG_HOME` and `$XDG_CACHE_HOME` move them; the
-`rune` folder in the data directory is created owner-only.) A session path
+`rune` folder in the data directory is created owner-only at the first start.) A session path
 given on the command line overrides the default, and a `./session.json` in
 the current directory is still used while the default does not exist, so
 setups from before rune could be installed keep their login.

@@ -7214,6 +7214,18 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(log) = &opts.log {
         init_log(log).map_err(|e| format!("cannot open the log file {}: {e}", log.display()))?;
     }
+    // rune's data directory (`~/.local/share/rune`): the default session, the
+    // message store and plugins live there, and it is where `ltsm.wasm` goes, so it
+    // exists from the first start on. It will hold keys and messages: owner-only.
+    let data_dir = cli::data_home().map(|h| h.join("rune"));
+    let data_dir_error = data_dir.as_deref().and_then(|d| {
+        make_private_dir(d)
+            .err()
+            .map(|e| format!("cannot create {}: {e}", d.display()))
+    });
+    if let Some(e) = &data_dir_error {
+        tracing::warn!("{e}");
+    }
     // LINE's secure module is the user's own copy; without it nothing can be signed.
     if let Err(problem) = rune::ltsm::load_wasm() {
         show_missing_wasm(&problem);
@@ -7224,13 +7236,9 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
     let session = match read_session(&path)? {
         Some(s) => s,
         None => {
-            // The default lives in rune's data directory, which may not exist yet;
-            // it will hold keys and messages, so only its owner may look inside.
-            // (A directory the user named is theirs: left as it is.)
-            if opts.session.is_none()
-                && let Some(dir) = session_path.parent().filter(|d| !d.as_os_str().is_empty())
-            {
-                make_private_dir(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+            // A login is written to the data directory unless a path was given.
+            if let Some(e) = data_dir_error.filter(|_| data_dir.as_deref() == session_path.parent()) {
+                return Err(e.into());
             }
             login(&path).await?
         }
