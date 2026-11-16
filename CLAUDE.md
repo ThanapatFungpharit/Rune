@@ -255,7 +255,10 @@ from the stored revision. Each chat keeps its own draft (`App::drafts`, stored a
 `cache.draft.<mid>`); `run` reads all ready terminal events in one batch and
 marks a batch of ≥ 8 key presses as a paste (`App::pasting`: Enter inserts a
 line break instead of sending). `ratatui-image` is built without its default
-`chafa` feature (needs a system C library).
+`chafa` feature (needs a system C library). Thai/Lao SARA AM (`ำ`) joins its letter into one two-column ratatui cell that
+WezTerm and other grapheme-aware terminals draw one column wide, shifting the row's marks: `App::draw`
+ends with `split_spacing_marks`, which re-lays such cells as `cell_safe` text (NIKHAHIT + SARA AA, one
+column per cell), and `wrap`/`TextInput::rows` never break before it (`joins_previous`).
 
 **Plugins (`src/bin/rune-tui/plugins/`, `overlays/plugin_ui.rs`, `plugin-sdk/`;
 contract in `docs/PLUGINS.md`).** WebAssembly modules run by their own wasmtime

@@ -222,7 +222,14 @@ impl TextInput {
                 let at = line_start + i;
                 let w = c.width().unwrap_or(0);
                 if used + w > room && at > start {
-                    let cut = brk.filter(|&b| b > start).unwrap_or(at);
+                    // After the last space; else here, but never between a
+                    // letter and its SARA AM.
+                    let letter = || {
+                        crate::letter_start(&self.text[start..at])
+                            .map(|i| start + i)
+                            .filter(|&i| i > start && crate::joins_previous(c))
+                    };
+                    let cut = brk.filter(|&b| b > start).or_else(letter).unwrap_or(at);
                     rows.push((start, cut));
                     start = cut;
                     used = self.text[start..at].width();

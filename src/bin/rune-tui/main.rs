@@ -941,6 +941,64 @@ fn cell_safe(s: &str) -> std::borrow::Cow<'_, str> {
         .into()
 }
 
+/// Where the last letter of `s` (with any zero-width marks after it) starts.
+pub fn letter_start(s: &str) -> Option<usize> {
+    s.char_indices()
+        .rev()
+        .find(|&(_, c)| c.width().unwrap_or(0) > 0)
+        .map(|(i, _)| i)
+}
+
+/// Whether `c` is a SARA AM (Thai or Lao), which belongs to the letter before it:
+/// text is never wrapped between the two.
+pub fn joins_previous(c: char) -> bool {
+    matches!(c, '\u{0E33}' | '\u{0EB3}')
+}
+
+/// Lay every cell holding a SARA AM out as [`cell_safe`] text, one column per
+/// cell, whatever drew it (messages, the message line, menus, plugin views).
+/// ratatui keeps `กำ` in one two-column cell, which WezTerm and other
+/// grapheme-aware terminals draw one column wide: the rest of the row then
+/// shifts left and its vowels and tone marks land on the wrong letters.
+fn split_spacing_marks(buf: &mut ratatui::buffer::Buffer) {
+    let area = buf.area;
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let sym = buf[(x, y)].symbol();
+            if sym.len() < 3 || !sym.contains(['\u{0E33}', '\u{0EB3}']) {
+                continue;
+            }
+            let safe = cell_safe(sym).into_owned();
+            // One part per column: a letter with its zero-width marks.
+            let mut parts: Vec<(String, usize)> = Vec::new();
+            for ch in safe.chars() {
+                let w = ch.width().unwrap_or(0);
+                match parts.last_mut() {
+                    Some((p, pw)) if w == 0 || *pw == 0 => {
+                        p.push(ch);
+                        *pw += w;
+                    }
+                    _ => parts.push((ch.to_string(), w)),
+                }
+            }
+            // Only into the columns the cell already covers.
+            let fits = parts.iter().all(|&(_, w)| w == 1)
+                && parts.len() == sym.width()
+                && x + parts.len() as u16 <= area.right();
+            if !fits {
+                buf[(x, y)].set_symbol(&safe);
+                continue;
+            }
+            let cell = buf[(x, y)].clone();
+            for (i, (part, _)) in parts.into_iter().enumerate() {
+                let mut c = cell.clone();
+                c.set_symbol(&part);
+                buf[(x + i as u16, y)] = c;
+            }
+        }
+    }
+}
+
 /// `s` cut to `max` columns with a trailing `…`, made safe to draw (`cell_safe`).
 fn ellipsize(s: &str, max: usize) -> String {
     let s = cell_safe(s);
@@ -1161,14 +1219,21 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
                     w = 0;
                     continue;
                 }
-                // Break after the last space, if any; long words split anywhere.
+                // Break after the last space, if any; long words split anywhere
+                // but between a letter and its SARA AM.
                 match line.rfind(' ') {
                     Some(i) if i > 0 => {
                         let rest = line.split_off(i + 1);
                         line.pop();
                         out.push(std::mem::replace(&mut line, rest));
                     }
-                    _ => out.push(std::mem::take(&mut line)),
+                    _ => match letter_start(&line).filter(|&i| i > 0 && joins_previous(ch)) {
+                        Some(i) => {
+                            let rest = line.split_off(i);
+                            out.push(std::mem::replace(&mut line, rest));
+                        }
+                        None => out.push(std::mem::take(&mut line)),
+                    },
                 }
                 w = line.width();
             }
@@ -5886,6 +5951,7 @@ impl App {
         // they are drawn (only graphics care: text cells stack by themselves).
         let layered = self.picker.is_some() && self.overlay_open();
         picture::compose(f, layered, |f| self.draw_layers(f));
+        split_spacing_marks(f.buffer_mut());
     }
 
     fn overlay_open(&self) -> bool {
@@ -7808,6 +7874,69 @@ mod tests {
         // Search highlights still find words typed with SARA AM.
         let spans = highlighted(&ellipsize("ทำนา", 10), &["ทำ".into()], Style::new());
         assert_eq!(spans[0].content, "ท\u{0E4D}า");
+    }
+
+    /// Every cell of the screen one column wide with no SARA AM left, and no
+    /// vowel or tone mark alone at the start of a cell (where a terminal would
+    /// put it on whatever came before).
+    fn assert_thai_cells(a: &mut App, w: u16, h: u16) -> String {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| a.draw(f)).unwrap();
+        let cells = term.backend().buffer().content();
+        for (i, c) in cells.iter().enumerate() {
+            let s = c.symbol();
+            assert!(!s.contains(['\u{0E33}', '\u{0EB3}']), "cell {i}: {s:?}");
+            assert!(
+                s.chars().next().is_none_or(|ch| ch.width().unwrap_or(0) > 0),
+                "cell {i} starts with a mark: {s:?}"
+            );
+        }
+        let s: String = cells.iter().map(|c| c.symbol()).collect();
+        assert_eq!(s.width(), usize::from(w) * usize::from(h), "{s}");
+        s
+    }
+
+    #[test]
+    fn thai_messages_and_drafts_keep_every_cell_one_column() {
+        let mut a = app();
+        a.open = Some("Ua".into());
+        let text = "น้ำท่วมบ้านกำนันแล้ว ทำงานส่งนะ กำลังทำอยู่ ญี่ปุ่น ขอบคุณครับ";
+        let thai: Vec<UiMsg> = (0..3)
+            .map(|j| UiMsg {
+                id: format!("{j}"),
+                text: text.repeat(j + 1),
+                ..a.messages["Ua"][0].clone()
+            })
+            .collect();
+        a.messages.insert("Ua".into(), thai);
+        a.focus = Focus::Input;
+        type_text(&mut a, "ทำไมน้ำถึงท่วมบ้านกำนันทุกปี");
+        for (w, h) in [(100, 30), (63, 20), (41, 20), (120, 40)] {
+            let s = assert_thai_cells(&mut a, w, h);
+            assert!(s.contains("น\u{0E49}\u{0E4D}าท\u{0E48}วม"), "{s}");
+        }
+        // A profile page draws the name as it is.
+        a.names.insert("Ub".into(), "คุณน้ำ".into());
+        a.profile.push("Ub".into());
+        assert_thai_cells(&mut a, 100, 30);
+    }
+
+    #[test]
+    fn wrapping_keeps_sara_am_with_its_letter() {
+        // `ทำ` is two columns: it moves to the next row whole.
+        assert_eq!(wrap("กทำ", 2), vec!["ก", "ทำ"]);
+        assert_eq!(wrap("กน้ำ", 2), vec!["ก", "น้ำ"]);
+        for width in 2..12 {
+            for row in wrap("กำนันทำนาน้ำท่วมบ้านทำงาน", width)
+            {
+                assert!(!row.starts_with('\u{0E33}'), "{width}: {row}");
+                assert!(row.width() <= width, "{width}: {row}");
+            }
+            let input = input::TextInput::from("กำนันทำนาน้ำท่วมบ้านทำงาน");
+            for (s, e) in input.rows(width + 1) {
+                assert!(!input.as_str()[s..e].starts_with('\u{0E33}'), "{width}");
+            }
+        }
     }
 
     #[test]
