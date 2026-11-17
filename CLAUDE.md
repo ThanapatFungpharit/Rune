@@ -143,7 +143,8 @@ pin methods act on the bound account's active list; pins are ordered per list.
 Account profiles and pin lists are separate concepts.
 `apply(op)` folds an operation in and advances
 the stream position (never backwards) in one transaction: internal `*_in(&Connection, …)` helpers
-let it combine the per-table writes. Writes are idempotent by message id. File-backed stores run
+let it combine the per-table writes. Writes are idempotent by message id. Store calls block (SQLite, one shared connection): code inside a tokio task goes through
+`Store::run` (the blocking pool), as session file I/O there goes through `Session::{load,save}_async`. File-backed stores run
 with `secure_delete`; `clear` and an account switch checkpoint the WAL so deleted messages leave
 no copy.
 

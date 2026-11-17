@@ -339,7 +339,10 @@ async fn icon_file(client: &Client, store: &Store, path: &str) -> Option<PathBuf
     let dir = view_dir();
     for ext in ["jpg", "png", "gif", "webp"] {
         let p = dir.join(format!("icon-{hex}.{ext}"));
-        if std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file() && m.len() > 0) {
+        if tokio::fs::symlink_metadata(&p)
+            .await
+            .is_ok_and(|m| m.is_file() && m.len() > 0)
+        {
             return Some(p);
         }
     }

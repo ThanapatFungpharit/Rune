@@ -27,15 +27,17 @@ fn session_path() -> String {
     std::env::var("RUNE_SESSION").unwrap_or_else(|_| "session.json".into())
 }
 
-fn load() -> Result<(Client, Session), Box<dyn std::error::Error>> {
-    let s = Session::load(session_path()).map_err(|e| format!("{e} (run `login` first)"))?;
+async fn load() -> Result<(Client, Session), Box<dyn std::error::Error>> {
+    let s = Session::load_async(session_path())
+        .await
+        .map_err(|e| format!("{e} (run `login` first)"))?;
     let client = s.clone().into_client(Config::default())?;
     // Persist refreshed tokens automatically.
     let mut rx = client.subscribe_tokens();
     let saver = client.clone();
     tokio::spawn(async move {
         while rx.changed().await.is_ok() {
-            if let Err(e) = Session::from_client(&saver).save(session_path()) {
+            if let Err(e) = Session::from_client(&saver).save_async(session_path()).await {
                 eprintln!("failed to save session: {e}");
             }
         }
@@ -96,7 +98,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tokens: client.tokens(),
                 e2ee_keys: res.e2ee_keys,
             }
-            .save(session_path())?;
+            .save_async(session_path())
+            .await?;
             println!(
                 "logged in as {} — session saved to {}",
                 res.mid.unwrap_or_default(),
@@ -104,20 +107,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         Some("refresh") => {
-            let (c, s) = load()?;
+            let (c, s) = load().await?;
             c.refresh_token().await?;
-            // Save synchronously too; the background saver may not have run yet.
+            // Save here too (awaited); the background saver may not have run yet.
             Session {
                 tokens: c.tokens(),
                 e2ee_keys: s.e2ee_keys,
             }
-            .save(session_path())?;
+            .save_async(session_path())
+            .await?;
             let due = c.tokens().refresh_due_epoch_sec().unwrap_or(0);
             println!("token refreshed; next refresh due at epoch {due}");
         }
         Some("download") => {
             // download CHAT MESSAGE_ID OUT [preview]
-            let (c, _) = load()?;
+            let (c, _) = load().await?;
             let (chat, id, out) = (arg(1)?, arg(2)?, arg(3)?);
             let msgs = c.recent_messages(chat, 200).await?;
             let m = msgs
@@ -127,19 +131,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let data = c
                 .download_media(m, args.get(4).is_some_and(|a| a == "preview"))
                 .await?;
-            std::fs::write(out, &data)?;
+            tokio::fs::write(out, &data).await?;
             println!("saved {} bytes to {out}", data.len());
         }
         Some(cmd @ ("send-image" | "send-file" | "send-video" | "send-audio")) => {
             // send-image MID PATH | send-video MID PATH DURATION_MS
-            let (c, _) = load()?;
+            let (c, _) = load().await?;
             let path = std::path::Path::new(arg(2)?);
             let name = path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("file")
                 .to_owned();
-            let data = std::fs::read(path)?;
+            let data = tokio::fs::read(path).await?;
             let dur = || {
                 args.get(3)
                     .and_then(|d| d.parse().ok())
@@ -163,7 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some("picture") => {
             // picture MID OUT  (profile picture of a contact, or of yourself with "me")
-            let (c, _) = load()?;
+            let (c, _) = load().await?;
             let path = match arg(1)? {
                 "me" => c.profile().await?.picture_path.unwrap_or_default(),
                 mid => c
@@ -174,12 +178,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or_default(),
             };
             let data = c.download_picture(&path, rune::PictureSize::Full).await?;
-            std::fs::write(arg(2)?, &data)?;
+            tokio::fs::write(arg(2)?, &data).await?;
             println!("saved {} bytes", data.len());
         }
         Some("cover") => {
             // cover MID|me [OUT]  (profile cover; saves the picture when OUT is given)
-            let (c, _) = load()?;
+            let (c, _) = load().await?;
             let mid = match arg(1)? {
                 "me" => c.my_mid().ok_or("not logged in")?,
                 mid => mid.to_owned(),
@@ -195,7 +199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(out) = args.get(2) {
                 match c.download_cover(&cover).await? {
                     Some(data) => {
-                        std::fs::write(out, &data)?;
+                        tokio::fs::write(out, &data).await?;
                         println!("saved {} bytes to {out}", data.len());
                     }
                     None => println!("nothing to save (default cover)"),
@@ -204,16 +208,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some("set-cover") => {
             // set-cover PATH  (replaces YOUR profile cover; everyone sees it)
-            let (c, _) = load()?;
+            let (c, _) = load().await?;
             let path = std::path::Path::new(arg(1)?);
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("cover.jpg");
-            let o = c.set_profile_cover(&std::fs::read(path)?, name).await?;
+            let o = c.set_profile_cover(&tokio::fs::read(path).await?, name).await?;
             println!("cover set: {}", o.path());
         }
         Some("albums") => {
             // albums CHAT [COUNT] [DIR]  (albums seen in the chat's recent history;
             // with DIR, saves every photo they show)
-            let (c, _) = load()?;
+            let (c, _) = load().await?;
             let chat = arg(1)?;
             let count = args.get(2).and_then(|n| n.parse().ok()).unwrap_or(200);
             // (album id, name, [(post, sender)])
@@ -280,13 +284,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some("sticker") => {
             // sticker STKID OUT
-            let (c, _) = load()?;
+            let (c, _) = load().await?;
             let data = c.download_sticker(arg(1)?, rune::StickerImage::Static2x).await?;
-            std::fs::write(arg(2)?, &data)?;
+            tokio::fs::write(arg(2)?, &data).await?;
             println!("saved {} bytes", data.len());
         }
         Some("e2ee-status") => {
-            let (c, _) = load()?;
+            let (c, _) = load().await?;
             let st = c.e2ee_status().await?;
             println!(
                 "local keys {:?}, server keys {:?}, current: {}",
@@ -296,7 +300,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         Some("whoami") => {
-            let (c, s) = load()?;
+            let (c, s) = load().await?;
             let p = c.profile().await?;
             println!(
                 "{} ({}) — {} E2EE key(s) stored",
@@ -306,7 +310,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         Some("chats") => {
-            let (c, _) = load()?;
+            let (c, _) = load().await?;
             let (member, invited) = c.chat_mids().await?;
             for chat in c.chats(&member).await? {
                 println!(
@@ -321,7 +325,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Some("invites") => {
-            let (c, _) = load()?;
+            let (c, _) = load().await?;
             let chats = c.invited_chats().await?;
             if chats.is_empty() {
                 println!("no pending invitations");
@@ -336,28 +340,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Some("accept") => {
-            let (c, _) = load()?;
+            let (c, _) = load().await?;
             c.accept_chat_invitation(arg(1)?).await?;
             println!("joined {}", arg(1)?);
         }
         Some("decline") => {
-            let (c, _) = load()?;
+            let (c, _) = load().await?;
             c.reject_chat_invitation(arg(1)?).await?;
             println!("declined {}", arg(1)?);
         }
         Some("send") => {
-            let (c, _) = load()?;
+            let (c, _) = load().await?;
             let m = c.send_text(arg(1)?, arg(2)?).await?;
             println!("sent message {}", m.id);
         }
         Some("reply") => {
             // reply CHAT MESSAGE_ID TEXT (ids: see `recent`)
-            let (c, _) = load()?;
+            let (c, _) = load().await?;
             let m = c.send_reply(arg(1)?, arg(3)?, arg(2)?).await?;
             println!("sent reply {}", m.id);
         }
         Some("recent") => {
-            let (c, _) = load()?;
+            let (c, _) = load().await?;
             let n = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20);
             let mut msgs = c.recent_messages(arg(1)?, n).await?;
             msgs.reverse();
@@ -372,7 +376,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Some("watch") => {
-            let (c, _) = load()?;
+            let (c, _) = load().await?;
             let from_rev = args.get(1).and_then(|s| s.parse().ok());
             let mut ops = c.operations(from_rev);
             loop {
@@ -400,7 +404,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some("emojis") => {
             // LINE emoji packages usable as reactions.
-            let (c, _) = load()?;
+            let (c, _) = load().await?;
             for p in c.owned_emoji_packages().await? {
                 let sample: Vec<_> = p
                     .emojis
@@ -420,7 +424,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Some("call") => {
-            let (c, _) = load()?;
+            let (c, _) = load().await?;
             let params: serde_json::Value = serde_json::from_str(args.get(2).map_or("[]", String::as_str))?;
             println!(
                 "{}",

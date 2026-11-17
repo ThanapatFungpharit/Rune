@@ -32,6 +32,7 @@
 
 pub mod album;
 pub mod auth;
+mod blocking;
 pub mod client;
 pub mod e2ee;
 pub mod endpoints;

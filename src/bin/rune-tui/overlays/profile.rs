@@ -232,17 +232,33 @@ pub fn spawn_profile(
     shown: bool,
 ) {
     tokio::spawn(async move {
-        let stored = |key: String| store.image(&key).ok().flatten();
-        let cached = store.user(&mid).ok().flatten().filter(|u| !u.name.is_empty());
+        // Store reads run on the blocking pool, not on this task's thread.
+        let stored = |key: String| {
+            let store = store.clone();
+            async move { store.run(move |s| s.image(&key)).await.ok().flatten() }
+        };
+        let m = mid.clone();
+        let cached = store
+            .run(move |s| s.user(&m))
+            .await
+            .ok()
+            .flatten()
+            .filter(|u| !u.name.is_empty());
         let shown = shown || (show_cached && cached.is_some());
         if show_cached && let Some(u) = &cached {
             let pic = u.picture.as_deref();
-            let photo = pic.and_then(|p| stored(picture_key(p, PictureSize::Full)));
-            let small = match photo {
-                Some(_) => None,
-                None => pic.and_then(|p| stored(picture_key(p, PictureSize::Small))),
+            let photo = match pic {
+                Some(p) => stored(picture_key(p, PictureSize::Full)).await,
+                None => None,
             };
-            let cover = u.cover.as_deref().and_then(|c| stored(cover_key(c)));
+            let small = match (&photo, pic) {
+                (None, Some(p)) => stored(picture_key(p, PictureSize::Small)).await,
+                _ => None,
+            };
+            let cover = match u.cover.as_deref() {
+                Some(c) => stored(cover_key(c)).await,
+                None => None,
+            };
             let loaded = decode_profile(
                 u.name.clone(),
                 u.status.clone(),
@@ -322,11 +338,11 @@ pub fn spawn_profile(
                 Ok(Some(c)) => match c.custom_image().map(|o| o.path()) {
                     Some(cp) => {
                         let key = cover_key(&cp);
-                        let (bytes, new) = match stored(key.clone()) {
+                        let (bytes, new) = match stored(key.clone()).await {
                             Some(b) => (Some(b), false),
                             None => match client.download_cover(&c).await {
                                 Ok(Some(b)) => {
-                                    let _ = store.put_image(&key, &b);
+                                    let (_, b) = store.run(move |s| (s.put_image(&key, &b), b)).await;
                                     (Some(b), true)
                                 }
                                 Ok(None) => (None, false),
@@ -343,7 +359,10 @@ pub fn spawn_profile(
                 Ok(None) => (None, None, false),
                 Err(()) => {
                     let cp = cached.as_ref().and_then(|u| u.cover.clone());
-                    let bytes = cp.as_deref().and_then(|c| stored(cover_key(c)));
+                    let bytes = match cp.as_deref() {
+                        Some(c) => stored(cover_key(c)).await,
+                        None => None,
+                    };
                     (cp, bytes, false)
                 }
             }
@@ -374,7 +393,7 @@ pub fn spawn_profile(
             } == row
         });
         if !unchanged {
-            let _ = store.upsert_user(&row);
+            let _ = store.run(move |s| s.upsert_user(&row)).await;
         }
         if unchanged && !fresh && shown {
             return;
@@ -545,13 +564,20 @@ impl App {
                     ""
                 };
                 let name = format!("{stem}{suffix}.{}", sniff_ext(&bytes));
-                self.status = match store_for_viewing(&name, &bytes).and_then(|path| {
-                    open_external(&path)?;
-                    Ok(path)
-                }) {
-                    Ok(path) => format!("opened {}", path.display()),
-                    Err(e) => format!("could not open: {e}"),
-                };
+                // Writing (synced to disk, compared with an earlier copy) runs
+                // off the UI thread and reports on the status line.
+                self.status = format!("opening {}…", safe_file_name(&name));
+                let tx = self.tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let status = match store_for_viewing(&name, &bytes).and_then(|path| {
+                        open_external(&path)?;
+                        Ok(path)
+                    }) {
+                        Ok(path) => format!("opened {}", path.display()),
+                        Err(e) => format!("could not open: {e}"),
+                    };
+                    let _ = tx.send(AppEvent::Status(status));
+                });
             }
         }
     }

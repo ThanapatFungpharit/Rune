@@ -295,6 +295,19 @@ fn now_ms() -> i64 {
 }
 
 impl Store {
+    /// Run `f` with this store on tokio's blocking pool: SQLite calls block
+    /// (on the disk, and on the connection's lock while another thread uses
+    /// it), so async tasks go through here instead of calling the store
+    /// directly. Once started, `f` finishes even if the future is dropped.
+    pub async fn run<T, F>(&self, f: F) -> T
+    where
+        F: FnOnce(&Store) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let store = self.clone();
+        crate::blocking::run(move || f(&store)).await
+    }
+
     /// Open (or create) the database at `path`, created with mode 0600.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();

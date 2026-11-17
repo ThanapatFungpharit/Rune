@@ -27,6 +27,20 @@ impl Session {
         Ok(serde_json::from_slice(&std::fs::read(path)?)?)
     }
 
+    /// [`Session::load`] on the blocking pool, for async callers.
+    pub async fn load_async(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_owned();
+        crate::blocking::run(move || Self::load(path)).await
+    }
+
+    /// [`Session::save`] on the blocking pool, for async callers (it waits
+    /// for the disk: the file is synced before the rename). Once started, the
+    /// write finishes even if the returned future is dropped.
+    pub async fn save_async(&self, path: impl AsRef<Path>) -> Result<()> {
+        let (s, path) = (self.clone(), path.as_ref().to_owned());
+        crate::blocking::run(move || s.save(path)).await
+    }
+
     /// Write atomically (temp file + rename), mode 0600 on Unix.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
@@ -76,6 +90,26 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn async_save_and_load_round_trip() {
+        let dir = std::env::temp_dir().join(format!("rune-session-async-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.json");
+        let mut s = Session::default();
+        s.tokens.mid = Some("u1".into());
+        s.save_async(&path).await.unwrap();
+        assert_eq!(Session::load_async(&path).await.unwrap(), s);
+        let missing = Session::load_async(dir.join("missing.json")).await.unwrap_err();
+        assert!(matches!(missing, crate::Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "from the blocking pool")]
+    async fn a_panic_on_the_blocking_pool_reaches_the_caller() {
+        crate::blocking::run(|| panic!("from the blocking pool")).await
+    }
 
     #[test]
     fn concurrent_saves_do_not_collide() {

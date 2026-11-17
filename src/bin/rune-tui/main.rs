@@ -1995,7 +1995,8 @@ fn spawn_contacts(client: Client, tx: mpsc::UnboundedSender<AppEvent>, store: St
         .await;
         match res {
             Ok(map) => {
-                let _ = store.set("cache.contacts_at", &now_ms().to_string());
+                let at = now_ms().to_string();
+                let _ = store.run(move |s| s.set("cache.contacts_at", &at)).await;
                 let _ = tx.send(AppEvent::Contacts(map.into_values().collect()));
             }
             Err(e) => drop(tx.send(AppEvent::Failed(
@@ -2052,7 +2053,8 @@ async fn cached_picture(
     size: PictureSize,
 ) -> Option<(Vec<u8>, bool)> {
     let key = picture_key(path, size);
-    if let Ok(Some(b)) = store.image(&key) {
+    let k = key.clone();
+    if let Ok(Some(b)) = store.run(move |s| s.image(&k)).await {
         return Some((b, false));
     }
     let b = match client.download_picture(path, size).await {
@@ -2062,7 +2064,7 @@ async fn cached_picture(
             return None;
         }
     };
-    let _ = store.put_image(&key, &b);
+    let (_, b) = store.run(move |s| (s.put_image(&key, &b), b)).await;
     Some((b, true))
 }
 
@@ -2311,7 +2313,8 @@ fn spawn_history(client: Client, tx: mpsc::UnboundedSender<AppEvent>, store: Sto
         let res = async {
             let mut msgs = client.recent_messages(&chat, 60).await?;
             msgs.reverse();
-            let newest_stored = store.newest_message(&chat).ok().flatten();
+            let c = chat.clone();
+            let newest_stored = store.run(move |s| s.newest_message(&c)).await.ok().flatten();
             if let Some(stored) = newest_stored.map(|s| s.message) {
                 let mut joined = msgs.iter().any(|m| message_id_cmp(&m.id, &stored.id).is_le());
                 let mut pages = 0;
@@ -2334,7 +2337,8 @@ fn spawn_history(client: Client, tx: mpsc::UnboundedSender<AppEvent>, store: Sto
                 }
                 if !joined {
                     tracing::info!(%chat, "history gap too large; dropping stored messages");
-                    let _ = store.clear_messages(&chat);
+                    let c = chat.clone();
+                    let _ = store.run(move |s| s.clear_messages(&c)).await;
                 }
             }
             let mut out = Vec::with_capacity(msgs.len());
@@ -7146,7 +7150,7 @@ async fn login(path: &str) -> Result<Session, Box<dyn std::error::Error>> {
         tokens: client.tokens(),
         e2ee_keys: res.e2ee_keys,
     };
-    s.save(path)?;
+    s.save_async(path).await?;
     Ok(s)
 }
 
@@ -7205,8 +7209,8 @@ fn show_missing_wasm(problem: &rune::ltsm::WasmProblem) {
 /// The saved session at `path`, or `None` when there is none yet (log in).
 /// An unreadable or damaged file is an error, never replaced by a new login:
 /// it holds the device certificate and the Letter Sealing keys.
-fn read_session(path: &str) -> Result<Option<Session>, String> {
-    match Session::load(path) {
+async fn read_session(path: &str) -> Result<Option<Session>, String> {
+    match Session::load_async(path).await {
         Ok(s) => Ok(Some(s)),
         Err(rune::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!(
@@ -7436,7 +7440,7 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
     }
     let session_path = cli::session_path(opts.session.as_deref(), cli::data_home());
     let path = session_path.to_string_lossy().into_owned();
-    let session = match read_session(&path)? {
+    let session = match read_session(&path).await? {
         Some(s) => s,
         None => {
             // A login is written to the data directory unless a path was given.
@@ -7455,7 +7459,7 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
     let mut token_rx = client.subscribe_tokens();
     tokio::spawn(async move {
         while token_rx.changed().await.is_ok() {
-            if let Err(e) = Session::from_client(&saver).save(&save_path) {
+            if let Err(e) = Session::from_client(&saver).save_async(&save_path).await {
                 tracing::error!("saving the session to {save_path} failed: {e}");
                 let _ = save_tx.send(AppEvent::Status(format!(
                     "could not save the renewed login to {save_path}: {e}"
@@ -7485,12 +7489,18 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
     let _ = store.remove("cache.user_names");
     let _ = store.prune_images(IMAGE_CACHE_BYTES);
     // Files written for the system viewer and mpv; they are copies of (decrypted) media.
-    match prune_dir(
-        &view_dir(),
-        VIEW_CACHE_MAX_AGE,
-        VIEW_CACHE_BYTES,
-        std::time::SystemTime::now(),
-    ) {
+    let pruned = tokio::task::spawn_blocking(|| {
+        prune_dir(
+            &view_dir(),
+            VIEW_CACHE_MAX_AGE,
+            VIEW_CACHE_BYTES,
+            std::time::SystemTime::now(),
+        )
+    })
+    .await
+    .map_err(std::io::Error::other)
+    .and_then(|r| r);
+    match pruned {
         Ok(n) if n > 0 => tracing::info!("removed {n} old files from {}", view_dir().display()),
         Ok(_) => {}
         Err(e) => tracing::warn!("pruning {} failed: {e}", view_dir().display()),
@@ -10647,19 +10657,19 @@ mod tests {
         assert_eq!(chat(&a).last_seen.as_deref(), Some("901"));
     }
 
-    #[test]
-    fn only_a_missing_session_leads_to_a_new_login() {
+    #[tokio::test]
+    async fn only_a_missing_session_leads_to_a_new_login() {
         let dir = std::env::temp_dir().join(format!("rune-session-read-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("session.json");
         let p = path.to_str().unwrap();
-        assert!(read_session(p).unwrap().is_none(), "missing: log in");
+        assert!(read_session(p).await.unwrap().is_none(), "missing: log in");
         std::fs::write(&path, b"{ truncated").unwrap();
-        let err = read_session(p).unwrap_err();
+        let err = read_session(p).await.unwrap_err();
         assert!(err.contains("cannot read the session"), "{err}");
         assert_eq!(std::fs::read(&path).unwrap(), b"{ truncated", "left as it was");
         Session::default().save(&path).unwrap();
-        assert!(read_session(p).unwrap().is_some());
+        assert!(read_session(p).await.unwrap().is_some());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
