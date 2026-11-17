@@ -318,10 +318,10 @@ fn read_value_from_pointer(caller: &mut Caller<'_, Host>, ty: u32, ptr: u32) -> 
         }
         TypeInfo::Float { size } => {
             let b = read_bytes(caller, ptr, size)?;
-            EmVal::Number(if size == 4 {
-                f32::from_le_bytes(b[..4].try_into().unwrap()) as f64
-            } else {
-                f64::from_le_bytes(b[..8].try_into().unwrap())
+            EmVal::Number(match size {
+                4 => f32::from_le_bytes(b[..4].try_into().unwrap()) as f64,
+                8 => f64::from_le_bytes(b[..8].try_into().unwrap()),
+                _ => return Err(err(format!("unsupported float size {size}"))),
             })
         }
         TypeInfo::Bool => EmVal::Bool(read_bytes(caller, ptr, 1)?[0] != 0),
