@@ -15,8 +15,8 @@ pub enum NotifyMode {
     Off,
     /// Ring the terminal bell.
     Bell,
-    /// A desktop notification (`notify-send` / `osascript`, else the
-    /// terminal's OSC 777 notification).
+    /// A desktop notification (`notify-send` / `osascript` / a PowerShell
+    /// toast on Windows, else the terminal's OSC 777 notification).
     Desktop,
 }
 

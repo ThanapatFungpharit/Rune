@@ -483,7 +483,7 @@ possible: the Chrome gateway does not serve the ticket methods.
 computer (desktop notification, terminal bell
 or off; message text; groups; muted chats never notify; a test button; a 1:1 chat
 is titled with the sender, a group with the group and `Sender: text` / `Sender sent a photo`,
-with the sender's profile picture as the icon under `notify-send`), then LINE's own notification
+with the sender's profile picture as the icon under `notify-send`; a Windows toast through `powershell.exe` on Windows), then LINE's own notification
 switches (they apply to your phone too); *Chats* (read receipts, automatic pictures, inline picture size,
 colour theme: automatic, dark or light, pin lists); *Shortcuts* (every screen's keys, each
 changeable; see above); *Account* (display name, status message,

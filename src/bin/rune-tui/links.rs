@@ -62,12 +62,20 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
             "not a web link",
         ));
     }
-    let opener = if cfg!(target_os = "macos") {
-        "open"
+    crate::system_open(std::ffi::OsStr::new(&opener_arg(url)))
+}
+
+/// The link as handed to the opener. `explorer.exe` splits its command line
+/// by rules of its own, so on Windows a `"` (never valid in a URL; the
+/// argument quoting escapes it in a way explorer may not honour) is sent
+/// percent-encoded, as a browser would send it anyway.
+fn opener_arg(url: &str) -> String {
+    let url = url.trim();
+    if cfg!(windows) {
+        url.replace('"', "%22")
     } else {
-        "xdg-open"
-    };
-    crate::spawn_reaped(std::process::Command::new(opener).arg(url.trim()))
+        url.to_owned()
+    }
 }
 
 /// Contents of every QR code found in a picture (blocking; run off the UI
@@ -130,6 +138,18 @@ mod tests {
         assert!(!is_web_link("file:///etc/passwd"));
         assert!(!is_web_link("/home/me/evil.desktop"));
         assert!(open_url("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn the_opener_gets_the_link_as_one_argument() {
+        let url = "https://a.b/x?q=1&r=%41^b";
+        assert_eq!(opener_arg(&format!(" {url}\n")), url, "no shell reads & ^ %");
+        let quoted = opener_arg("https://a.b/\"x");
+        if cfg!(windows) {
+            assert_eq!(quoted, "https://a.b/%22x");
+        } else {
+            assert_eq!(quoted, "https://a.b/\"x");
+        }
     }
 
     #[test]

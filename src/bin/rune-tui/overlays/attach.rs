@@ -422,9 +422,12 @@ impl App {
             Some(keymap::Cmd::End) => a.sel = vis.len().saturating_sub(1),
             Some(keymap::Cmd::ParentDir) => a.up(),
             Some(keymap::Cmd::Confirm | keymap::Cmd::Right) => {
-                // A typed path ("~/Pictures", "/tmp/a.png") goes there.
+                // A typed path ("~/Pictures", "/tmp/a.png", on Windows also
+                // "C:\Users", "\\server\share") goes there.
                 let typed = a.filter.as_str();
-                let typed = (typed.starts_with('/') || typed.starts_with('~')).then(|| expand_home(typed));
+                let typed =
+                    (typed.starts_with('/') || typed.starts_with('~') || Path::new(typed).is_absolute())
+                        .then(|| expand_home(typed));
                 if let Some(p) = typed {
                     if p.is_dir() {
                         a.cd(p);

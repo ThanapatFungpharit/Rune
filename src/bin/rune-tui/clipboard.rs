@@ -1,7 +1,7 @@
 //! Copying text to the clipboard: through the desktop's clipboard program
 //! when there is one (`wl-copy`, `xclip`, `xsel`, `pbcopy`), else through
 //! the terminal (OSC 52, which also reaches the local clipboard over SSH
-//! where the terminal allows it).
+//! where the terminal allows it; always on Windows).
 //!
 //! Under `cfg(test)` nothing is copied; the text lands in [`COPIED`].
 
@@ -48,10 +48,16 @@ pub fn copy(text: &str, tx: &mpsc::UnboundedSender<AppEvent>) -> Via {
     }
 }
 
-/// The clipboard programs worth trying here, best first.
+/// The clipboard programs worth trying here, best first. None on Windows:
+/// `clip.exe` reads its input in the console's code page and garbles text
+/// outside it (Thai, emoji), so the terminal's OSC 52 (Windows Terminal has
+/// it) does the copying there.
 #[cfg_attr(test, allow(dead_code))]
 fn programs() -> Vec<(&'static str, &'static [&'static str])> {
     let mut found: Vec<(&'static str, &'static [&'static str])> = Vec::new();
+    if cfg!(windows) {
+        return found;
+    }
     if cfg!(target_os = "macos") {
         found.push(("pbcopy", &[]));
     }
@@ -128,5 +134,8 @@ mod tests {
         // Only what the environment offers is tried (none in a bare test run
         // is fine): never an empty program name.
         assert!(programs().iter().all(|(p, _)| !p.is_empty()));
+        if cfg!(windows) {
+            assert!(programs().is_empty(), "clip.exe garbles Thai: OSC 52 instead");
+        }
     }
 }

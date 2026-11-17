@@ -1389,8 +1389,68 @@ const MAX_FILE_NAME: usize = 200;
 /// A sender-chosen file name made safe to create in a directory: no path
 /// separators or control characters (which would also garble the status
 /// line), no leading dots (hidden files, `..`), at most [`MAX_FILE_NAME`]
-/// bytes with the extension kept.
+/// bytes with the extension kept. On Windows also what Windows refuses or
+/// reads otherwise ([`windows_file_name`]).
 fn safe_file_name(name: &str) -> String {
+    let safe = portable_file_name(name);
+    if cfg!(windows) {
+        windows_file_name(&safe)
+    } else {
+        safe
+    }
+}
+
+/// Characters Windows does not allow in a file name (`:` would also name
+/// an NTFS alternate data stream), besides `/`, `\` and control characters.
+const WINDOWS_FORBIDDEN: &[char] = &['<', '>', ':', '"', '|', '?', '*'];
+
+/// Device names Windows reserves in every folder, also with an extension
+/// (`nul.txt` is the null device). The superscript digits count too.
+fn windows_reserved(stem: &str) -> bool {
+    let stem = stem.trim_end_matches(' ').to_ascii_uppercase();
+    if matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    let (Some(port), Some(digit)) = (stem.get(..3), stem.get(3..)) else {
+        return false;
+    };
+    matches!(port, "COM" | "LPT")
+        && matches!(
+            digit,
+            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+        )
+}
+
+/// A [`safe_file_name`] made safe for Windows too: no
+/// [`WINDOWS_FORBIDDEN`] characters, no trailing dots or spaces (Windows
+/// drops them, so `x.exe.` would be `x.exe`), no reserved device name.
+fn windows_file_name(safe: &str) -> String {
+    let name: String = safe
+        .chars()
+        .map(|c| {
+            if WINDOWS_FORBIDDEN.contains(&c) || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let name = name.trim_end_matches(['.', ' ']);
+    if name.is_empty() {
+        return "file".to_owned();
+    }
+    let stem = name.split('.').next().unwrap_or(name);
+    if windows_reserved(stem) {
+        return format!("_{name}");
+    }
+    name.to_owned()
+}
+
+/// The platform-independent part of [`safe_file_name`].
+fn portable_file_name(name: &str) -> String {
     let safe: String = name
         .chars()
         .map(|c| {
@@ -1425,9 +1485,13 @@ fn safe_file_name(name: &str) -> String {
 fn write_new(p: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(p)?;
-    f.write_all(data).and_then(|()| f.sync_all()).inspect_err(|_| {
+    let written = f.write_all(data).and_then(|()| f.sync_all());
+    // Closed first: Windows keeps an open file's name taken.
+    drop(f);
+    if written.is_err() {
         let _ = std::fs::remove_file(p);
-    })
+    }
+    written
 }
 
 fn store_download_in(dir: &std::path::Path, name: &str, data: &[u8]) -> std::io::Result<PathBuf> {
@@ -1471,8 +1535,9 @@ fn store_download_in(dir: &std::path::Path, name: &str, data: &[u8]) -> std::io:
 /// written to disk ([`safe_file_name`]).
 fn runs_programs(name: &str) -> bool {
     let safe = safe_file_name(name);
+    // Windows drops trailing dots and spaces: `x.exe. .` is `x.exe` there.
     let ext = safe
-        .trim_end_matches('.')
+        .trim_end_matches(['.', ' '])
         .rsplit_once('.')
         .map(|(_, e)| e.to_ascii_lowercase())
         .unwrap_or_default();
@@ -1487,8 +1552,11 @@ fn runs_programs(name: &str) -> bool {
             | "app" | "command" | "tool" | "pkg" | "mpkg" | "dmg" | "scpt" | "applescript"
             | "workflow" | "terminal" | "webloc" | "dylib"
             // Windows (run by Wine where it is installed)
-            | "exe" | "msi" | "com" | "bat" | "cmd" | "scr" | "pif" | "lnk" | "ps1" | "vbs"
-            | "vbe" | "wsf" | "hta" | "reg" | "cpl" | "dll" | "inf" | "url"
+            | "exe" | "msi" | "msp" | "mst" | "com" | "bat" | "cmd" | "scr" | "pif" | "lnk" | "ps1"
+            | "psm1" | "psd1" | "vb" | "vbs" | "vbe" | "jse" | "ws" | "wsf" | "wsh" | "hta" | "reg"
+            | "cpl" | "msc" | "dll" | "ocx" | "sys" | "inf" | "url" | "scf" | "chm" | "gadget"
+            | "application" | "appref-ms" | "settingcontent-ms" | "library-ms" | "search-ms"
+            | "appx" | "appxbundle" | "msix" | "msixbundle" | "appinstaller"
             // browser extensions
             | "xpi" | "crx"
     )
@@ -1572,12 +1640,25 @@ fn play_media(tx: &mpsc::UnboundedSender<AppEvent>, path: &std::path::Path) -> S
 }
 
 fn open_external(path: &std::path::Path) -> std::io::Result<()> {
-    let opener = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    spawn_reaped(std::process::Command::new(opener).arg(path))
+    system_open(path.as_os_str())
+}
+
+/// The desktop's own opener for a file or a web link: `open` on macOS,
+/// `explorer.exe` on Windows (run directly, never through `cmd /c start`,
+/// whose shell would read `&`, `^` and `%` in a link), else `xdg-open`.
+const SYSTEM_OPENER: &str = if cfg!(target_os = "macos") {
+    "open"
+} else if cfg!(windows) {
+    "explorer.exe"
+} else {
+    "xdg-open"
+};
+
+/// Hand `target` (a file path or a checked web link) to [`SYSTEM_OPENER`],
+/// detached. (`explorer.exe` exits with 1 even when it opened the target;
+/// the status is not looked at.)
+pub fn system_open(target: &std::ffi::OsStr) -> std::io::Result<()> {
+    spawn_reaped(std::process::Command::new(SYSTEM_OPENER).arg(target))
 }
 
 /// Start a program that goes its own way (an opener, a notifier), detached
@@ -7356,7 +7437,39 @@ fn spawn_signal_watch(tx: mpsc::UnboundedSender<AppEvent>) {
         tracing::warn!("second signal: exiting at once");
         std::process::exit(1);
     });
-    #[cfg(not(unix))]
+    // Windows: the console window closed, the user logging off, a shutdown,
+    // or Ctrl-Break (Ctrl-C is a key in raw mode). Windows ends the process
+    // a few seconds after a close, logoff or shutdown event, so the draft is
+    // saved only if quitting gets that far.
+    #[cfg(windows)]
+    tokio::spawn(async move {
+        use tokio::signal::windows::{ctrl_break, ctrl_close, ctrl_logoff, ctrl_shutdown};
+        let (Ok(mut close), Ok(mut logoff), Ok(mut shutdown), Ok(mut brk)) =
+            (ctrl_close(), ctrl_logoff(), ctrl_shutdown(), ctrl_break())
+        else {
+            tracing::warn!(
+                "cannot watch for console close/logoff/shutdown; they end rune-tui without saving the draft"
+            );
+            return;
+        };
+        let mut first = true;
+        loop {
+            let why = tokio::select! {
+                _ = close.recv() => "console closed",
+                _ = logoff.recv() => "logoff",
+                _ = shutdown.recv() => "shutdown",
+                _ = brk.recv() => "Ctrl-Break",
+            };
+            if !first {
+                tracing::warn!("second {why}: exiting at once");
+                std::process::exit(1);
+            }
+            first = false;
+            tracing::info!("{why}: quitting");
+            let _ = tx.send(AppEvent::Terminate);
+        }
+    });
+    #[cfg(not(any(unix, windows)))]
     drop(tx);
 }
 
@@ -7545,7 +7658,10 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
         set_modify_other_keys(true);
     }
     // modifyOtherKeys gave a Shift-Enter in this terminal before: it will again.
-    keymap::set_shift_enter(keyboard_enhancement || store.get(&shift_enter_key()).ok().flatten().is_some());
+    // On Windows the console API reports Shift with Enter.
+    keymap::set_shift_enter(
+        keyboard_enhancement || cfg!(windows) || store.get(&shift_enter_key()).ok().flatten().is_some(),
+    );
     keymap::set_lone_modifiers(keyboard_enhancement);
     let mouse = opts.mouse && crossterm::execute!(std::io::stdout(), EnableMouseCapture).is_ok();
     let _ = crossterm::execute!(std::io::stdout(), EnableBracketedPaste, EnableFocusChange);
@@ -7629,8 +7745,14 @@ fn shift_enter_key() -> String {
 
 /// Turn xterm's modifyOtherKeys on (level 1: only keys that otherwise send the
 /// same bytes as another, such as Shift-Enter) or back to the terminal's default.
+/// Not on Windows: crossterm reads keys from the console API there, which
+/// reports Shift-Enter by itself and would never parse the escape sequences
+/// (and a console without VT processing would print the request).
 fn set_modify_other_keys(on: bool) {
     use std::io::Write;
+    if cfg!(windows) {
+        return;
+    }
     let mut out = std::io::stdout();
     let _ = out.write_all(if on { b"\x1b[>4;1m" } else { b"\x1b[>4m" });
     let _ = out.flush();
@@ -10299,6 +10421,42 @@ mod tests {
         assert!(s.len() <= MAX_FILE_NAME && s.ends_with(".jpeg"), "{s}");
         let no_ext = "x".repeat(400);
         assert_eq!(safe_file_name(&no_ext).len(), MAX_FILE_NAME);
+        // What Windows refuses or reads otherwise is made safe there only.
+        let windows = |s: &str| windows_file_name(&portable_file_name(s));
+        let expect = |s: &str, on_windows: &str| {
+            assert_eq!(windows(s), on_windows, "{s:?}");
+            let here = if cfg!(windows) { on_windows } else { s };
+            assert_eq!(safe_file_name(s), here, "{s:?}");
+        };
+        expect("a<b>c:d\"e|f?g*h.txt", "a_b_c_d_e_f_g_h.txt");
+        expect("report.pdf:evil.exe", "report.pdf_evil.exe");
+        expect("x.exe.", "x.exe");
+        expect("notes. .", "notes");
+        for reserved in [
+            "CON",
+            "con.txt",
+            "Nul.tar.gz",
+            "aux",
+            "PRN.jpg",
+            "COM1",
+            "lpt9.log",
+            "COM¹.txt",
+        ] {
+            expect(reserved, &format!("_{reserved}"));
+        }
+        for fine in [
+            "console.txt",
+            "COM0",
+            "LPT10",
+            "nullify.png",
+            "com1x.txt",
+            "สวัสดี.jpg",
+        ] {
+            expect(fine, fine);
+        }
+        assert_eq!(windows("..."), "file");
+        assert_eq!(windows(" ."), "file");
+        assert_eq!(windows("con ."), "_con");
     }
 
     #[test]
@@ -12107,6 +12265,21 @@ mod tests {
             "..hidden.sh",
         ] {
             assert!(runs_programs(risky), "{risky}");
+        }
+        // Windows' own, in any case and with the trailing dots and spaces
+        // Windows drops.
+        for ext in [
+            "exe", "com", "bat", "cmd", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "msi", "msp",
+            "scr", "pif", "lnk", "hta", "cpl", "reg", "jar", "appx", "msix",
+        ] {
+            for name in [
+                format!("a.{ext}"),
+                format!("a.{}", ext.to_ascii_uppercase()),
+                format!("photo.jpg.{ext}. ."),
+                format!("a.{ext} . "),
+            ] {
+                assert!(runs_programs(&name), "{name:?}");
+            }
         }
         for safe in [
             "photo.jpg",

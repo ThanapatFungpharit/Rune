@@ -1,6 +1,6 @@
 //! Notifications: what they say (pure, tested) and how they are shown
 //! (terminal bell, `notify-send` with the sender's picture as the icon,
-//! `osascript`, else the terminal's OSC 777).
+//! `osascript`, a PowerShell toast on Windows, else the terminal's OSC 777).
 //!
 //! Wording rules, the same for every event:
 //! - a 1:1 chat is titled with the sender, a group with the group, and the
@@ -277,8 +277,54 @@ fn osc_text(s: &str) -> String {
         .collect()
 }
 
+/// The Windows toast, shown by Windows PowerShell (5.1, `powershell.exe`:
+/// PowerShell 7 cannot load WinRT types). The script is fixed text: the
+/// title and body reach it only as environment variables, and go into the
+/// toast's XML as text nodes, so nothing in a message is read as script or
+/// markup. Toasts need a registered app id; PowerShell's own is used.
+const WINDOWS_TOAST: &str = r#"$ErrorActionPreference = 'Stop'
+$null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+$null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
+$xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+$text = $xml.GetElementsByTagName('text')
+$null = $text.Item(0).AppendChild($xml.CreateTextNode([string]$env:RUNE_NOTICE_TITLE))
+$null = $text.Item(1).AppendChild($xml.CreateTextNode([string]$env:RUNE_NOTICE_BODY))
+$app = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show([Windows.UI.Notifications.ToastNotification]::new($xml))
+"#;
+
+/// The command that shows `n` as a Windows toast ([`WINDOWS_TOAST`], passed
+/// as `-EncodedCommand`; the text in `RUNE_NOTICE_TITLE`/`_BODY`). It gets
+/// no console of its own (`CREATE_NO_WINDOW`), so nothing flashes up and
+/// nothing reaches rune's terminal; `-WindowStyle Hidden` would hide the
+/// console rune runs in.
+fn windows_toast(n: &Notice) -> std::process::Command {
+    use base64::Engine;
+    let script: Vec<u8> = WINDOWS_TOAST.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    // No NUL (the environment cannot hold it) or other control character
+    // (XML text cannot), line breaks kept.
+    let env_text = |s: &str| -> String {
+        s.chars()
+            .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
+            .collect()
+    };
+    let mut cmd = std::process::Command::new("powershell.exe");
+    cmd.args(["-NoProfile", "-NonInteractive", "-EncodedCommand"])
+        .arg(base64::engine::general_purpose::STANDARD.encode(script))
+        .env("RUNE_NOTICE_TITLE", env_text(&n.title))
+        .env("RUNE_NOTICE_BODY", env_text(&n.body));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 /// Show a notification now (external programs run detached). `icon` is a
-/// picture file, shown where the desktop supports it.
+/// picture file, shown where the desktop supports it (not by macOS's or
+/// Windows' notifier).
 pub fn show(mode: NotifyMode, n: &Notice, icon: Option<&std::path::Path>) {
     use std::io::Write;
     if cfg!(test) {
@@ -299,6 +345,8 @@ pub fn show(mode: NotifyMode, n: &Notice, icon: Option<&std::path::Path>) {
                     esc(&n.body),
                     esc(&n.title)
                 )))
+            } else if cfg!(windows) {
+                crate::spawn_reaped(&mut windows_toast(n))
             } else {
                 let mut cmd = std::process::Command::new("notify-send");
                 cmd.arg("--app-name=rune");
@@ -453,7 +501,7 @@ pub fn spawn(client: Client, tx: mpsc::UnboundedSender<AppEvent>, store: Store, 
             return;
         };
         let mut icon = None;
-        if mode == NotifyMode::Desktop && !cfg!(target_os = "macos") {
+        if mode == NotifyMode::Desktop && !cfg!(target_os = "macos") && !cfg!(windows) {
             for path in icon_from.iter().filter_map(|mid| pictures.get(mid)) {
                 icon = icon_file(&client, &store, path).await;
                 if icon.is_some() {
@@ -629,5 +677,44 @@ mod tests {
         let clean = osc_text(hostile);
         assert!(!clean.chars().any(|c| c.is_control() || c == ';'), "{clean:?}");
         assert_eq!(osc_text("สวัสดี 👋"), "สวัสดี 👋");
+    }
+
+    #[test]
+    fn the_windows_toast_never_reads_message_text_as_script() {
+        use base64::Engine;
+        let hostile = "'; Remove-Item -Recurse C:\\ #\"$(calc)`<b>&amp;\0\x1b";
+        let n = Notice {
+            title: "สวัสดี 👋 $env:X".into(),
+            body: format!("line one\n{hostile}"),
+            category: Category::Received,
+        };
+        let cmd = windows_toast(&n);
+        assert_eq!(cmd.get_program(), "powershell.exe");
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args[..3], ["-NoProfile", "-NonInteractive", "-EncodedCommand"]);
+        assert_eq!(args.len(), 4, "{args:?}");
+        // The script is the fixed one, whatever the message says.
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&args[3])
+            .unwrap();
+        let units: Vec<u16> = bytes
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(String::from_utf16(&units).unwrap(), WINDOWS_TOAST);
+        // The text travels in the environment, without NUL or escapes.
+        let env: std::collections::HashMap<_, _> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.unwrap().to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(env["RUNE_NOTICE_TITLE"], "สวัสดี 👋 $env:X");
+        let body = &env["RUNE_NOTICE_BODY"];
+        assert!(body.starts_with("line one\n'; Remove-Item"), "{body:?}");
+        assert!(!body.chars().any(|c| c.is_control() && c != '\n'), "{body:?}");
     }
 }
