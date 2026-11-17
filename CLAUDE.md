@@ -26,7 +26,25 @@ cargo test --features tui plugins::            # plugin host: discovery, lifecyc
 (cd vendor/crossterm && cargo test --lib --features event-stream --target-dir ../../target/vendor modify_other_keys)  # rune's crossterm patch
 scripts/plugin.sh build plugins/snippets       # rebuild snippets.wasm (host tests use it; needs wasm32-unknown-unknown)
 make install [PREFIX=~/.local] [DESTDIR=]      # rune-tui + man page + desktop entry + icon (packaging/); make uninstall
+make dist                                      # scripts/dist.sh: dist/rune-tui-<target>.tar.gz + .sha256 (stripped)
+./install.sh --archive dist/rune-tui-<target>.tar.gz --prefix /tmp/p   # the prebuilt installer, offline; --uninstall
 ```
+
+Releases: a pushed tag `vX.Y.Z` (must equal `Cargo.toml`'s version) runs `.github/workflows/release.yml`:
+native builds for x86_64/aarch64 Linux (Ubuntu 22.04: glibc 2.35) and macOS (11.0+), each test-installed
+with `install.sh`, published with `SHA256SUMS` and `install.sh`. Archive names carry no version (so
+`releases/latest/download/` works); their folder is a prefix tree made by `make install PREFIX= DESTDIR=…`,
+so `install.sh` (POSIX sh, also BSD tools — keep it so; `shellcheck -s sh`) and `make install`/`uninstall`
+install the same files. `install.sh` checks the checksum, member paths and `--version` before touching
+the prefix, renames files into place, and never touches the data dirs (`~/.local/share/rune` is also
+`$PREFIX/share/rune` for the default prefix: never install there). Windows (x86_64-pc-windows-msvc,
+`+crt-static`) is built on `windows-latest`: `scripts/dist.sh` packs `rune-tui-<target>.zip` (no `make
+install` there; `packaging/README-windows.txt` goes in it) and `install.ps1` (Windows PowerShell 5.1, ASCII
+only) is its installer — same checks as `install.sh`, prefix `%LOCALAPPDATA%\Programs\rune`, adds `bin` to the
+user PATH via `HKCU\Environment`, refuses a prefix inside the data dirs. Windows has no 0600/0700: secret
+files rely on the profile folders' ACLs (the user accepted that); `cfg(unix)` permission code stays
+Unix-only. Check Windows from Linux with `cargo check --target x86_64-pc-windows-gnu` (a cross C compiler
+is needed for aws-lc-sys/SQLite, e.g. `zig cc`; set `AWS_LC_SYS_NO_JITTER_ENTROPY=1` there).
 
 `packaging/rune-tui.1` is the man page: a test (`cli::tests::man_page_lists_every_option`) fails when
 an option in `cli::USAGE` is missing from it. The default session is `cli::session_path`:

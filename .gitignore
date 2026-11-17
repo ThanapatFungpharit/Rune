@@ -11,3 +11,4 @@ plugins/*/target
 plugin-sdk/target
 
 assets/ltsm.wasm
+/dist

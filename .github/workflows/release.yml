@@ -1,0 +1,201 @@
+# Prebuilt rune-tui for every supported platform.
+#
+# Push a tag vX.Y.Z (matching Cargo.toml's version) to build, test-install and
+# publish a release with one rune-tui-<target>.tar.gz per Unix target, a
+# rune-tui-<target>.zip for Windows, SHA256SUMS, install.sh and install.ps1.
+# Run it by hand (Actions › release › Run workflow) to build and test-install
+# without publishing; the archives are kept as artifacts.
+name: release
+
+on:
+  push:
+    tags: ["v[0-9]*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built on the oldest supported Ubuntu: the binary needs this glibc (2.35) or newer.
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-15-intel }
+          - { target: aarch64-apple-darwin, os: macos-15 }
+          # Static C runtime (scripts/dist.sh): runs without the Visual C++ Redistributable.
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    env:
+      # Oldest macOS the binaries run on (install.sh says so when it is older).
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      # Windows: aws-lc-sys uses its prebuilt assembly objects instead of needing NASM.
+      AWS_LC_SYS_PREBUILT_NASM: "1"
+    steps:
+      # Windows runners check out with CRLF line endings, which bash scripts cannot run with.
+      - name: Keep line endings as committed
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check the tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+      - name: Build and pack
+        shell: bash
+        run: |
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          [ "$host" = "${{ matrix.target }}" ] || { echo "::error::runner builds $host, not ${{ matrix.target }}"; exit 1; }
+          scripts/dist.sh dist
+
+      - name: Report what the binary needs
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          bin=target/release/rune-tui
+          if [ "$RUNNER_OS" = Linux ]; then
+            echo "newest glibc symbol: $(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -n 1)"
+            ldd "$bin"
+          else
+            otool -L "$bin"
+            vtool -show-build "$bin" | grep -E 'minos|platform' || otool -l "$bin" | grep -A3 LC_BUILD_VERSION
+            codesign --verify --verbose "$bin"
+          fi
+
+      - name: Report what the binary needs (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          bin=target/release/rune-tui.exe
+          ls -l "$bin"
+          # DLL names in the import table (and any other strings that look like one).
+          dlls=$(grep -aoiE '[a-z0-9_.-]+\.dll' "$bin" | sort -uf)
+          echo "$dlls"
+          if echo "$dlls" | grep -qiE '^(vcruntime|msvcp)[0-9]'; then
+            echo "::error::rune-tui.exe needs the Visual C++ runtime DLLs (not linked statically)"; exit 1
+          fi
+
+      - name: Test-install with install.sh
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -x
+          prefix=$RUNNER_TEMP/prefix
+          ./install.sh --archive dist/rune-tui-${{ matrix.target }}.tar.gz --prefix "$prefix"
+          "$prefix/bin/rune-tui" --version
+          "$prefix/bin/rune-tui" --help >/dev/null
+          test -f "$prefix/share/man/man1/rune-tui.1"
+          # Again over the top: an update in place.
+          ./install.sh --archive dist/rune-tui-${{ matrix.target }}.tar.gz --prefix "$prefix"
+          ./install.sh --uninstall --prefix "$prefix"
+          left=$(find "$prefix" -type f ! -name '*.cache')
+          [ -z "$left" ] || { echo "::error::left behind after uninstall: $left"; exit 1; }
+          # A damaged download must be refused before anything is installed.
+          cp dist/rune-tui-${{ matrix.target }}.tar.gz* "$RUNNER_TEMP/"
+          printf x >>"$RUNNER_TEMP/rune-tui-${{ matrix.target }}.tar.gz"
+          if ./install.sh --archive "$RUNNER_TEMP/rune-tui-${{ matrix.target }}.tar.gz" --prefix "$prefix"; then
+            echo "::error::a corrupted archive was installed"; exit 1
+          fi
+          test ! -e "$prefix/bin/rune-tui"
+
+      # Windows PowerShell 5.1 (the one every Windows has), not pwsh.
+      - name: Test-install with install.ps1
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          function Installer { powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 @args | Out-Host; $LASTEXITCODE }
+          function Fail([string]$m) { Write-Host "::error::$m"; exit 1 }
+          # The user PATH's entries, as stored (empty ones dropped).
+          function UserPath { ([string][Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment').GetValue('Path', '', 'DoNotExpandEnvironmentNames') -split ';' | Where-Object { $_ }) -join ';' }
+          $zip = "dist\rune-tui-${{ matrix.target }}.zip"
+          $prefix = Join-Path $env:RUNNER_TEMP 'prefix'
+          $bin = Join-Path $prefix 'bin'
+          $exe = Join-Path $bin 'rune-tui.exe'
+          $pathBefore = UserPath
+
+          if ((Installer -Archive $zip -Prefix $prefix) -ne 0) { Fail 'install failed' }
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { Fail 'installed rune-tui.exe does not run' }
+          & $exe --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { Fail 'rune-tui.exe --help failed' }
+          foreach ($f in 'LICENSE.txt', 'README-windows.txt') { if (-not (Test-Path (Join-Path $prefix $f))) { Fail "$f not installed" } }
+          if ((UserPath) -notlike "*$bin*") { Fail "$bin was not added to the user PATH" }
+          # Again over the top: an update in place (PATH not added twice).
+          if ((Installer -Archive $zip -Prefix $prefix) -ne 0) { Fail 'reinstall failed' }
+          if (@((UserPath) -split ';' | Where-Object { $_ -eq $bin }).Count -ne 1) { Fail "$bin is on the user PATH more than once" }
+          if ((Installer -Uninstall -Prefix $prefix) -ne 0) { Fail 'uninstall failed' }
+          if (Test-Path $prefix) { Fail "left behind after uninstall: $(Get-ChildItem -Recurse -Force $prefix | Out-String)" }
+          if ((UserPath) -ne $pathBefore) { Fail "the user PATH was not restored: $(UserPath)" }
+
+          # -NoModifyPath leaves PATH alone.
+          if ((Installer -Archive $zip -Prefix $prefix -NoModifyPath) -ne 0) { Fail 'install -NoModifyPath failed' }
+          if ((UserPath) -ne $pathBefore) { Fail '-NoModifyPath changed the user PATH' }
+          if ((Installer -Uninstall -Prefix $prefix) -ne 0) { Fail 'uninstall failed' }
+
+          # A damaged download must be refused before anything is installed.
+          Copy-Item "$zip*" $env:RUNNER_TEMP
+          $bad = Join-Path $env:RUNNER_TEMP 'rune-tui-${{ matrix.target }}.zip'
+          [IO.File]::AppendAllText($bad, 'x')
+          if ((Installer -Archive $bad -Prefix $prefix) -eq 0) { Fail 'a corrupted archive was installed' }
+          if (Test-Path $exe) { Fail 'a corrupted archive left rune-tui.exe behind' }
+
+          # rune-tui's data folders are never an install prefix.
+          $data = Join-Path $env:LOCALAPPDATA 'rune\bin-test'
+          if ((Installer -Archive $zip -Prefix $data) -eq 0) { Fail 'installed into the data folder' }
+          if (Test-Path $data) { Fail 'the refused install created a folder in the data folder' }
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rune-tui-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          cat ./*.tar.gz.sha256 ./*.zip.sha256 >SHA256SUMS
+          rm ./*.tar.gz.sha256 ./*.zip.sha256
+          sha256sum -c SHA256SUMS
+          cp ../install.sh ../install.ps1 .
+          ls -l
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "rune $GITHUB_REF_NAME" \
+            --generate-notes dist/*

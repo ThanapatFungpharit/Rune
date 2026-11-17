@@ -76,6 +76,8 @@ browser. Its output matches the reference implementation byte for byte (see
 | Placing or answering voice/video calls                                                                                                                                                                                                      | ❌ not possible: the extension protocol has no call methods and LINE's call media stack is proprietary (TUI points incoming calls at the phone)                                                                                       |
 | TUI plugins: sandboxed WebAssembly plugins add commands, `Alt` keys, views, forms, settings and storage; permissions approved per module (SHA-256); managed in Settings › Plugins ([docs/PLUGINS.md](docs/PLUGINS.md)) | ✅ unit- and UI-tested with the sample plugin and hand-written failing modules; not yet used in a live session |
 | TUI plugins from Git (install, follow a branch or release range, pin a version, check for updates, uninstall) and hot reload of changed plugin files | ✅ tested against local repositories (needs `git`) and on-disk changes; not yet tried against a hosted repository or in a live session |
+| Prebuilt binaries and `install.sh` (Linux and macOS, x86_64 and arm64: checksum check, test run, install/update/uninstall, cleanup) | 🧪 installer tested on Linux x86_64 with a locally built archive (checksum, layout, traversal, version, interrupt and unwritable-prefix failures); the release workflow (all four targets, macOS paths) has not run yet |
+| Windows 10/11 (x86_64): `rune::dirs` folders, ltsm lookup in Windows browser profiles, opener, signals, Windows file names; prebuilt zip and `install.ps1` | 🧪 cross-checked with `cargo check --target x86_64-pc-windows-gnu` and unit-tested on Linux; not yet built, installed or run on Windows (the release workflow's Windows job has not run) |
 | E-mail/password login                                                                                                                                                                                                                       | ❌ not planned                                                                                                                                                                                                                        |
 
 "Shapes from reference" means the request and response formats come from
@@ -85,27 +87,73 @@ itself yet. The first live run (2026-11-13) is summarized in
 
 ## Install
 
-`rune-tui`, the terminal chat app, installs like any other command-line
-program. You need a Rust toolchain (1.97 or newer; `rustup update`) and a C
-compiler (SQLite is compiled in); Linux and macOS are supported.
+`rune-tui`, the terminal chat app, runs on Linux (x86_64, arm64; glibc 2.35
+or newer), macOS 11 or newer (Intel, Apple silicon) and Windows 10/11 (x86_64;
+use Windows Terminal, which draws pictures with Sixel).
+
+### Prebuilt
+
+Each [release](https://github.com/ThanapatFungpharit/Rune/releases) has a
+binary for every one of those, and `install.sh` picks the right one, checks it
+against the release's `SHA256SUMS`, runs it once and only then installs it:
+
+```sh
+# the repository is private: sign in once with the GitHub CLI (`gh auth login`)
+gh release download --repo ThanapatFungpharit/Rune --pattern install.sh
+sh install.sh                         # newest release into ~/.local (root: /usr/local)
+```
+
+| Option                 | What                                                                  |
+|------------------------|-----------------------------------------------------------------------|
+| `--version v0.2.0`     | a given release instead of the newest                                 |
+| `--prefix DIR`         | install under `DIR/bin`, `DIR/share` (`sudo sh install.sh` for `/usr/local`) |
+| `--archive FILE`       | install a `rune-tui-<target>.tar.gz` you already have (no download; checked against `SHA256SUMS` or `FILE.sha256` beside it) |
+| `--uninstall`          | remove it again (same `--prefix`); your data stays                     |
+
+Running it again updates in place (even while rune-tui is running). It downloads
+with `gh` when that is signed in, else `curl` or `wget`; nothing is left in a
+temporary directory, whether it succeeds, fails or is interrupted. It says when
+the install folder is not on your `PATH` or another `rune-tui` comes first, and
+which optional programs (mpv, git, notify-send, a clipboard tool) are missing.
+On a system the prebuilt binary does not run on (older glibc, musl), it says so
+and installs nothing: build from source instead.
+
+On Windows, `install.ps1` does the same with the release's
+`rune-tui-x86_64-pc-windows-msvc.zip` (checksum, member names, a test run, then
+the install), into `%LOCALAPPDATA%\Programs\rune\bin` and onto your user `PATH`:
+
+```powershell
+gh release download --repo ThanapatFungpharit/Rune --pattern install.ps1
+powershell -ExecutionPolicy Bypass -File install.ps1   # -Version v0.2.0, -Prefix DIR, -Archive ZIP, -NoModifyPath, -Uninstall
+```
+
+The program is statically linked against the C runtime (no Visual C++
+Redistributable needed). Windows on ARM runs the x86_64 build under emulation.
+
+### From source
+
+You need a Rust toolchain (1.97 or newer; `rustup update`) and a C compiler
+(SQLite is compiled in).
 
 ```sh
 git clone https://github.com/ThanapatFungpharit/Rune.git && cd Rune
 make install                          # into ~/.local: no root needed
 ```
 
-That installs
+Either way, that installs
 
 | File                                                  | What                                      |
 |-------------------------------------------------------|-------------------------------------------|
 | `~/.local/bin/rune-tui`                               | the program                               |
 | `~/.local/share/man/man1/rune-tui.1`                  | `man rune-tui`                            |
-| `~/.local/share/applications/rune-tui.desktop`        | *Rune* in your desktop's app launcher (opens in a terminal) |
-| `~/.local/share/icons/hicolor/scalable/apps/rune-tui.svg` | its icon                              |
+| `~/.local/share/applications/rune-tui.desktop`        | *Rune* in your desktop's app launcher (opens in a terminal; not on macOS with `install.sh`) |
+| `~/.local/share/icons/hicolor/scalable/apps/rune-tui.svg` | its icon (likewise)                   |
+| `~/.local/share/licenses/rune/LICENSE`                | the license                               |
 
 Then run `rune-tui` from any directory (if `~/.local/bin` is not on your
 `PATH`, `make install` says so). The first start shows a QR code to scan
-with the LINE app on your phone.
+with the LINE app on your phone. `install.sh --uninstall` and `make uninstall`
+each remove what the other installed.
 
 Other ways:
 
@@ -115,6 +163,12 @@ make uninstall                        # with the same PREFIX as the install
 cargo install --locked --path . --features tui --bin rune-tui   # just the binary, into ~/.cargo/bin
 ```
 
+Releases: push a tag `vX.Y.Z` matching `Cargo.toml`'s version;
+`.github/workflows/release.yml` builds on each platform with `scripts/dist.sh`
+(`make dist` locally), test-installs every archive with `install.sh` (the
+Windows zip with `install.ps1`) and publishes them with `SHA256SUMS`,
+`install.sh` and `install.ps1`.
+
 Packagers: `make build`, then `make install PREFIX=/usr DESTDIR="$pkgdir"`
 (installs the license to `share/licenses/rune/`; desktop and icon caches are
 refreshed only when `DESTDIR` is empty).
@@ -123,8 +177,8 @@ rune-tui needs LINE's `ltsm.wasm`, which is not distributed with it: when the
 LINE Chrome extension is installed in Chrome, Chromium, Brave, Edge or Vivaldi
 it is found there; otherwise see [Getting `ltsm.wasm`](#getting-ltsmwasm).
 
-Your data lives outside the install and is never touched by `make install`
-or `make uninstall`:
+Your data lives outside the install and is never touched by installing,
+updating or uninstalling:
 
 | Path                                   | What                                                    |
 |----------------------------------------|---------------------------------------------------------|
@@ -398,7 +452,7 @@ cannot be changed, so a mistake can always be undone.
 | messages: `p`                                                                    | the sender's profile                                                                                                                                            |
 | messages: `x`                                                                    | unsend one of your messages (asks first)                                                                                                                        |
 | messages: `/`, chat menu › *Search in chat…*                                     | search the chat's messages stored on this computer (text, without case; newest first, as you type); `Enter` shows the message in the chat (`/` again: the same query) |
-| messages: `c`                                                                    | copy the message's text (through `wl-copy`, `xclip`, `xsel` or `pbcopy`, else the terminal's OSC 52 — which also works over SSH where the terminal allows it)  |
+| messages: `c`                                                                    | copy the message's text (through `wl-copy`, `xclip`, `xsel` or `pbcopy`, else the terminal's OSC 52 — which also works over SSH where the terminal allows it; always OSC 52 on Windows)  |
 | messages / viewer: `m`                                                           | every action for the message: reply, react, reactions, read by, unsend, view, save, open, copy, go to the quoted message, sender's profile                      |
 | viewer: `←` `→` / `h` `l`, wheel                                                 | previous / next media in the chat                                                                                                                               |
 | viewer: `Space`                                                                  | play a video or audio clip in mpv; pause / resume a GIF or animated sticker                                                                                     |
