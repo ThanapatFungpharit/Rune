@@ -343,8 +343,11 @@ umask 022
 put() { # put REL MODE: copy beside the target, then rename over it
     dest=$PREFIX/$1
     mkdir -p "$(dirname "$dest")" || die "cannot create $(dirname "$dest")"
-    cp "$src/$1" "$dest.rune-new.$$" && chmod "$2" "$dest.rune-new.$$" &&
-        mv -f "$dest.rune-new.$$" "$dest" || die "cannot install $dest"
+    if ! { cp "$src/$1" "$dest.rune-new.$$" && chmod "$2" "$dest.rune-new.$$" &&
+        mv -f "$dest.rune-new.$$" "$dest"; }; then
+        rm -f "$dest.rune-new.$$"
+        die "cannot install $dest"
+    fi
 }
 # The program last, so it never runs beside an older man page or license; the
 # rename replaces it even while an older rune-tui is running.

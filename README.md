@@ -519,7 +519,10 @@ such method).
 friends, read marks, settings and the event-stream position in a SQLite
 file next to the session (`session.db`, mode 0600; `--db PATH` to move it,
 `--no-store` for none). If a write to it fails (a full disk, say), the status
-line says so. Start-up shows the stored chat list immediately,
+line says so. If the file is damaged, `rune-tui` refuses to start and names
+it; quit and move it (with its `-wal`/`-shm` files) away to start afresh:
+chats and history load from LINE again, but pins, settings, drafts, plugin
+approvals and messages LINE no longer serves are lost. Start-up shows the stored chat list immediately,
 then refreshes it from LINE and replays every operation since the stored
 position, so messages, reads, reactions and unsends that happened while it
 was closed are caught up. Opening a chat reads the store and only asks

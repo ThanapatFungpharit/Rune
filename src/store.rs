@@ -2172,6 +2172,17 @@ mod tests {
     }
 
     #[test]
+    fn a_damaged_file_is_refused_and_left_alone() {
+        let path = temp_db("damaged");
+        let junk = b"this is not a SQLite database, just some damaged bytes".repeat(100);
+        std::fs::write(&path, &junk).unwrap();
+        assert!(Store::open(&path).is_err());
+        // Nothing was overwritten: the user can still inspect or move it away.
+        assert_eq!(std::fs::read(&path).unwrap(), junk);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn an_interrupted_apply_leaves_nothing_behind_and_replays_in_full() {
         let s = Store::open_in_memory().unwrap();
         s.bind_account("Ume").unwrap();
