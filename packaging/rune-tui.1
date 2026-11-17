@@ -87,6 +87,11 @@ emptied of old files at start).
 .TP
 .I ~/Downloads/rune/
 Media saved from chats.
+.PP
+On Windows, \fI$XDG_DATA_HOME/rune\fR is \fI%LOCALAPPDATA%\\rune\fR, the
+cache is \fI%LOCALAPPDATA%\\rune\\cache\fR, \fIkeys.json\fR is in
+\fI%APPDATA%\\rune\fR and \fI~\fR is \fI%USERPROFILE%\fR (an absolute
+\fBXDG_*\fR variable still wins).
 .SH ENVIRONMENT
 .TP
 .B RUNE_LTSM

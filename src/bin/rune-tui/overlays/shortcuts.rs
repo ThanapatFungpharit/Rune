@@ -19,13 +19,11 @@ use keymap::{Cmd, Key, Keymap, Table};
 const SETTING: &str = "setting.keys";
 
 /// Where the shortcuts are also kept as a file:
-/// `$XDG_CONFIG_HOME/rune/keys.json`, else `~/.config/rune/keys.json`.
+/// `keys.json` in rune's configuration directory ([`rune::dirs::config`]):
+/// `$XDG_CONFIG_HOME/rune/keys.json`, else `~/.config/rune/keys.json`; on
+/// Windows `%APPDATA%\rune\keys.json`.
 pub fn default_file() -> Option<PathBuf> {
-    let config = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(config.join("rune").join("keys.json"))
+    Some(rune::dirs::config()?.join("keys.json"))
 }
 
 /// The file the shortcuts are also kept in.
@@ -38,9 +36,10 @@ pub struct KeysFile {
 
 /// `path` with the home directory written `~`.
 fn shown(path: &std::path::Path) -> String {
-    match std::env::var_os("HOME").map(PathBuf::from) {
+    match rune::dirs::home() {
         Some(home) if path.starts_with(&home) && home.as_os_str().len() > 1 => {
-            format!("~/{}", path.strip_prefix(&home).unwrap_or(path).display())
+            let rest = path.strip_prefix(&home).unwrap_or(path);
+            std::path::Path::new("~").join(rest).display().to_string()
         }
         _ => path.display().to_string(),
     }

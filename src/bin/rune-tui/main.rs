@@ -1367,11 +1367,11 @@ fn sniff_ext(b: &[u8]) -> &'static str {
     }
 }
 
+/// Where `s` saves: `~/Downloads/rune` (Windows: `%USERPROFILE%\Downloads\rune`).
 fn download_dir() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join("Downloads").join("rune")
+    rune::dirs::downloads()
+        .unwrap_or_else(|| PathBuf::from(".").join("Downloads"))
+        .join("rune")
 }
 
 /// Write `data` to the download directory as `name` (adds " (n)" on clashes)
@@ -2069,18 +2069,13 @@ async fn cached_picture(
 }
 
 /// Where pictures are written for the system viewer to open (not the
-/// download folder, which is for what you save): `$XDG_CACHE_HOME/rune/view`.
+/// download folder, which is for what you save): `view` in rune's cache
+/// directory ([`rune::dirs::cache`]: `$XDG_CACHE_HOME/rune/view`, Windows
+/// `%LOCALAPPDATA%\rune\cache\view`), else under the temporary directory.
 fn view_dir() -> PathBuf {
-    let cache = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(std::env::temp_dir)
-                .join(".cache")
-        });
-    cache.join("rune").join("view")
+    rune::dirs::cache()
+        .unwrap_or_else(|| std::env::temp_dir().join("rune"))
+        .join("view")
 }
 
 /// Files in [`view_dir`] older than this are removed at start-up.

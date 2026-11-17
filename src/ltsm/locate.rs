@@ -83,26 +83,15 @@ impl WasmProblem {
     }
 }
 
-/// Where rune looks for the module by default: `$XDG_DATA_HOME/rune/ltsm.wasm`
-/// (`~/.local/share/rune/ltsm.wasm`).
+/// Where rune looks for the module by default: `ltsm.wasm` in rune's data
+/// directory (`~/.local/share/rune/ltsm.wasm`; Windows:
+/// `%LOCALAPPDATA%\rune\ltsm.wasm`, see [`crate::dirs::data`]).
 pub fn default_install_path() -> Option<PathBuf> {
-    data_dir().map(|d| d.join("rune").join("ltsm.wasm"))
+    crate::dirs::data().map(|d| d.join("ltsm.wasm"))
 }
 
-fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(PathBuf::from)
-}
-
-fn data_dir() -> Option<PathBuf> {
-    std::env::var_os("XDG_DATA_HOME")
-        .filter(|d| !d.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| home().map(|h| h.join(".local/share")))
-}
-
-/// Browser profile roots that may hold the extension, relative to `$HOME`.
+/// Browser profile roots that may hold the extension on Linux and macOS,
+/// relative to `$HOME`.
 const BROWSER_DIRS: &[&str] = &[
     ".config/google-chrome",
     ".config/google-chrome-beta",
@@ -121,11 +110,54 @@ const BROWSER_DIRS: &[&str] = &[
     "Library/Application Support/Microsoft Edge",
 ];
 
-/// Installed copies of the extension: `<browser>/<profile>/Extensions/<id>/<version>`.
-fn extension_dirs(home: &Path) -> Vec<PathBuf> {
+/// Browser profile roots on Windows, relative to `%LOCALAPPDATA%`.
+const WINDOWS_BROWSER_DIRS: &[&[&str]] = &[
+    &["Google", "Chrome", "User Data"],
+    &["Google", "Chrome Beta", "User Data"],
+    &["Google", "Chrome SxS", "User Data"],
+    &["Chromium", "User Data"],
+    &["BraveSoftware", "Brave-Browser", "User Data"],
+    &["Microsoft", "Edge", "User Data"],
+    &["Vivaldi", "User Data"],
+];
+
+/// The Unix profile roots under `home`.
+fn unix_browser_roots(home: &Path) -> Vec<PathBuf> {
+    BROWSER_DIRS.iter().map(|b| home.join(b)).collect()
+}
+
+/// The Windows profile roots under `local_app_data` (`%LOCALAPPDATA%`).
+fn windows_browser_roots(local_app_data: &Path) -> Vec<PathBuf> {
+    WINDOWS_BROWSER_DIRS
+        .iter()
+        .map(|parts| {
+            parts
+                .iter()
+                .fold(local_app_data.to_path_buf(), |p, part| p.join(part))
+        })
+        .collect()
+}
+
+/// The profile roots of this platform's browsers.
+fn browser_roots() -> Vec<PathBuf> {
+    let home = crate::dirs::home();
+    if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA")
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| home.map(|h| h.join("AppData").join("Local")))
+            .map(|d| windows_browser_roots(&d))
+            .unwrap_or_default()
+    } else {
+        home.map(|h| unix_browser_roots(&h)).unwrap_or_default()
+    }
+}
+
+/// Installed copies of the extension: `<root>/<profile>/Extensions/<id>/<version>`.
+fn extension_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for b in BROWSER_DIRS {
-        let Ok(profiles) = std::fs::read_dir(home.join(b)) else {
+    for root in roots {
+        let Ok(profiles) = std::fs::read_dir(root) else {
             continue;
         };
         for p in profiles.flatten() {
@@ -172,18 +204,16 @@ fn candidates() -> (Vec<PathBuf>, Vec<(PathBuf, bool)>) {
         searched.push(p.clone());
         files.push((p, true));
     }
-    if let Some(h) = home() {
-        let mut found = Vec::new();
-        for d in extension_dirs(&h) {
-            wasm_files(&d, 3, &mut found);
-        }
-        files.extend(found.into_iter().map(|p| {
-            let named = p
-                .file_name()
-                .is_some_and(|n| n.to_string_lossy().contains("ltsm"));
-            (p, named)
-        }));
+    let mut found = Vec::new();
+    for d in extension_dirs(&browser_roots()) {
+        wasm_files(&d, 3, &mut found);
     }
+    files.extend(found.into_iter().map(|p| {
+        let named = p
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().contains("ltsm"));
+        (p, named)
+    }));
     (searched, files)
 }
 
@@ -256,12 +286,32 @@ mod tests {
         std::fs::create_dir_all(v.join("static/wasm")).unwrap();
         std::fs::write(v.join("static/wasm/ltsm.wasm"), b"x").unwrap();
         std::fs::write(v.join("manifest.json"), b"{}").unwrap();
-        let dirs = extension_dirs(&home);
+        let dirs = extension_dirs(&unix_browser_roots(&home));
         assert_eq!(dirs, vec![v.clone()]);
         let mut files = Vec::new();
         wasm_files(&dirs[0], 3, &mut files);
         assert_eq!(files, vec![v.join("static/wasm/ltsm.wasm")]);
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn finds_extension_under_windows_roots() {
+        let local = temp_home("win");
+        let roots = windows_browser_roots(&local);
+        assert_eq!(roots.len(), WINDOWS_BROWSER_DIRS.len());
+        assert!(roots.contains(&local.join("Microsoft").join("Edge").join("User Data")));
+        assert!(roots.contains(&local.join("Google").join("Chrome SxS").join("User Data")));
+        let v = local
+            .join("Google")
+            .join("Chrome")
+            .join("User Data")
+            .join("Default")
+            .join("Extensions")
+            .join(EXTENSION_ID)
+            .join("3.7.2_0");
+        std::fs::create_dir_all(&v).unwrap();
+        assert_eq!(extension_dirs(&roots), vec![v]);
+        std::fs::remove_dir_all(local).unwrap();
     }
 
     #[test]

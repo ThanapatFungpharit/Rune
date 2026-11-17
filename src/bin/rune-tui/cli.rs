@@ -12,9 +12,9 @@ Usage: rune-tui [OPTIONS] [SESSION]
 
 A terminal chat client for LINE. SESSION is the saved login (default:
 $XDG_DATA_HOME/rune/session.json, else ~/.local/share/rune/session.json;
-./session.json when only that one exists); when it does not exist, rune-tui
-logs in by QR code and writes it (mode 0600). It holds your tokens and
-Letter Sealing keys.
+Windows: %LOCALAPPDATA%\\rune\\session.json; ./session.json when only that
+one exists); when it does not exist, rune-tui logs in by QR code and writes
+it (mode 0600). It holds your tokens and Letter Sealing keys.
 
 Options:
   --no-read-receipts  never mark chats as read (others see no read receipt)
@@ -28,7 +28,8 @@ Options:
   --log PATH          append diagnostics to PATH (mode 0600; RUST_LOG sets
                       the level, default info); never tokens or messages
   --plugins DIR       where plugins are installed (default:
-                      $XDG_DATA_HOME/rune/plugins, else ~/.local/share/rune/plugins)
+                      $XDG_DATA_HOME/rune/plugins, else ~/.local/share/rune/plugins;
+                      Windows: %LOCALAPPDATA%\\rune\\plugins)
   --no-plugins        start no plugin this run (they stay enabled)
   --default-keys      use the default keyboard shortcuts this run (yours
                       stay saved; change them in Settings › Shortcuts)
@@ -162,17 +163,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
 /// The old default session path, relative to the working directory.
 pub const LEGACY_SESSION: &str = "session.json";
 
-/// `$XDG_DATA_HOME` (only when absolute, as the spec requires), else
-/// `~/.local/share`.
+/// The folder holding rune's data directory ([`rune::dirs::data`], which always
+/// ends in `rune`): `$XDG_DATA_HOME` (only when absolute, as the spec requires),
+/// else `~/.local/share`; on Windows `%LOCALAPPDATA%`.
 pub fn data_home() -> Option<PathBuf> {
-    std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|h| !h.is_empty())
-                .map(|h| PathBuf::from(h).join(".local/share"))
-        })
+    rune::dirs::data().and_then(|d| d.parent().map(PathBuf::from))
 }
 
 /// The session to use: the one given, else `<data home>/rune/session.json`,

@@ -140,6 +140,12 @@ given on the command line overrides the default, and a `./session.json` in
 the current directory is still used while the default does not exist, so
 setups from before rune could be installed keep their login.
 
+On Windows the same files live in `%LOCALAPPDATA%\rune\` (session, store,
+`plugins\`, `ltsm.wasm`), `%LOCALAPPDATA%\rune\cache\view\` and
+`%APPDATA%\rune\keys.json`; downloads go to `%USERPROFILE%\Downloads\rune`.
+Windows has no `0600`: the session and store are protected by your profile
+folder's permissions (you, SYSTEM and administrators), so keep them there.
+
 ## Usage
 
 ```rust

@@ -42,12 +42,15 @@ const MAX_SEND: u64 = 1 << 30;
 /// crops covers in the browser; LINE's own limit is not known).
 const MAX_COVER: u64 = 20 * 1024 * 1024;
 
+/// `p` with a leading `~/` (on Windows also `~\`), or a lone `~`, replaced by
+/// the home directory.
 pub fn expand_home(p: &str) -> PathBuf {
-    match p.strip_prefix("~/").or_else(|| (p == "~").then_some("")) {
-        Some(rest) => std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default()
-            .join(rest),
+    let rest = p
+        .strip_prefix("~/")
+        .or_else(|| p.strip_prefix("~\\").filter(|_| cfg!(windows)))
+        .or_else(|| (p == "~").then_some(""));
+    match rest {
+        Some(rest) => rune::dirs::home().unwrap_or_default().join(rest),
         None => PathBuf::from(p),
     }
 }
@@ -349,7 +352,7 @@ impl App {
                     .map(PathBuf::from)
             })
             .filter(|d| d.is_dir())
-            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+            .or_else(rune::dirs::home)
             .unwrap_or_else(|| PathBuf::from("."))
     }
 

@@ -434,10 +434,11 @@ pub fn clean(s: &str, max: usize, newlines: bool) -> String {
     out
 }
 
-/// The default plugin directory: `$XDG_DATA_HOME/rune/plugins`, else
-/// `~/.local/share/rune/plugins`.
+/// The default plugin directory: `plugins` in rune's data directory
+/// ([`rune::dirs::data`]): `$XDG_DATA_HOME/rune/plugins`, else
+/// `~/.local/share/rune/plugins`; on Windows `%LOCALAPPDATA%\rune\plugins`.
 pub fn default_dir() -> Option<PathBuf> {
-    Some(crate::cli::data_home()?.join("rune/plugins"))
+    Some(rune::dirs::data()?.join("plugins"))
 }
 
 /// One directory found in the plugin directory.
