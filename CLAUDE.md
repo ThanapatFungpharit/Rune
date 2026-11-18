@@ -30,7 +30,7 @@ make dist                                      # scripts/dist.sh: dist/rune-tui-
 ./install.sh --archive dist/rune-tui-<target>.tar.gz --prefix /tmp/p   # the prebuilt installer, offline; --uninstall
 ```
 
-Releases: a pushed tag `vX.Y.Z` (must equal `Cargo.toml`'s version) runs `.github/workflows/release.yml`:
+Releases: a pushed tag `vX.Y.Z` (must equal `Cargo.toml`'s version; a `-suffix` makes it a pre-release) runs `.github/workflows/release.yml`:
 native builds for x86_64/aarch64 Linux (Ubuntu 22.04: glibc 2.35) and macOS (11.0+), each test-installed
 with `install.sh`, published with `SHA256SUMS` and `install.sh`. Archive names carry no version (so
 `releases/latest/download/` works); their folder is a prefix tree made by `make install PREFIX= DESTDIR=…`,

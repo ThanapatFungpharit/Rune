@@ -197,5 +197,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # A tag with a pre-release suffix (v0.1.0-alpha.1) publishes a pre-release,
+          # which releases/latest (install.sh's default) skips.
+          pre=
+          case $GITHUB_REF_NAME in *-*) pre=--prerelease ;; esac
           gh release create "$GITHUB_REF_NAME" --verify-tag --title "rune $GITHUB_REF_NAME" \
-            --generate-notes dist/*
+            $pre --generate-notes dist/*

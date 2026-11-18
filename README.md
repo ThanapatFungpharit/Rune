@@ -163,7 +163,8 @@ make uninstall                        # with the same PREFIX as the install
 cargo install --locked --path . --features tui --bin rune-tui   # just the binary, into ~/.cargo/bin
 ```
 
-Releases: push a tag `vX.Y.Z` matching `Cargo.toml`'s version;
+Releases: push a tag `vX.Y.Z` matching `Cargo.toml`'s version (`vX.Y.Z-alpha.N` and other
+suffixes publish a pre-release, which `install.sh` installs only with `--version`);
 `.github/workflows/release.yml` builds on each platform with `scripts/dist.sh`
 (`make dist` locally), test-installs every archive with `install.sh` (the
 Windows zip with `install.ps1`) and publishes them with `SHA256SUMS`,
